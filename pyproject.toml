@@ -9,12 +9,21 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Fitting an embedding needs torch; serving one does not. Training writes a
+# checkpoint of plain arrays that strategies.Embedding reads with numpy alone,
+# so a deployment installs the base package and only a trainer needs this.
+torch = [
+    "torch>=2.5",
+]
 api = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
 ]
 dev = [
     "pytest>=8.0",
+]
+all = [
+    "jerboas[torch,api,dev]",
 ]
 
 [build-system]

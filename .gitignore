@@ -7,8 +7,11 @@ dist/
 .venv/
 venv/
 
-# datasets are fetched, not versioned (scripts/fetch_movielens.py)
-data/
+# data/movielens is versioned on purpose: it carries manual, unscripted edits
+# (the title/year split, the removal of the empty id=267 row) that re-running
+# the generators would undo, so the repo is its only record.
+# ml.ui_train is not -- benchmark/run.py regenerates it on every run.
+data/movielens/ml.ui_train
 
 # trained model checkpoints
 *.npz

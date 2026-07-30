@@ -1,0 +1,3 @@
+# Keep the datasets byte-for-byte as they are. Some carry CRLF endings, and
+# letting git normalize them would rewrite files nobody generated from a script.
+data/** -text

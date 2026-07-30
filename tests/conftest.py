@@ -61,6 +61,15 @@ def _write_tsv(path, rows):
 
 
 @pytest.fixture
+def graph_rows():
+    """The fixture's raw rows, for tests that need to build a second graph from
+    the same data in a different order. A fixture rather than a module import:
+    `tests` is a package name other installed projects also use."""
+    return {"kg": KG_ROWS, "ui": UI_ROWS, "movie": MOVIE_ATTRS,
+            "person": PERSON_ATTRS, "genre": GENRE_ATTRS}
+
+
+@pytest.fixture
 def small_graph(tmp_path):
     kg_path = tmp_path / "test.kg"
     ui_path = tmp_path / "test.ui"

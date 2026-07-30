@@ -6,7 +6,8 @@ Public surface, grouped by the four object families (see core.py):
     conditions   Like, In, Has, Match,       -> where(...)
                  And, Or, Not
     strategies   Score, Alphabetical, PageRank, Connectivity,   -> rank(...)
-                 MatrixFactorization, DiffusedMatrixFactorization
+                 MatrixFactorization, DiffusedMatrixFactorization,
+                 Embedding
     engines      Default, Greedy             -> using(...)
 
 Plus Graph (the data + `select`), the values a query returns (Key, Rel), and the
@@ -31,6 +32,7 @@ from .strategies import (
     DiffusedMatrixFactorization,
     Connectivity,
     PageRank,
+    Embedding,
 )
 from .engine import Default, Greedy
 
@@ -48,6 +50,7 @@ __all__ = [
     # strategies
     "Score", "ExprStrategy", "Alphabetical",
     "MatrixFactorization", "DiffusedMatrixFactorization", "Connectivity", "PageRank",
+    "Embedding",
     # engines
     "Default", "Greedy",
 ]
