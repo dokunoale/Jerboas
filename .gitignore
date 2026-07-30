@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# datasets are fetched, not versioned (scripts/fetch_movielens.py)
+data/
+
+# trained model checkpoints
+*.npz
