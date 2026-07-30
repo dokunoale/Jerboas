@@ -390,6 +390,7 @@ class _Compiler(Compiler):
         self._nodes = {}          # var -> NodeSpec
         self._edges = []          # [EdgeSpec]
         self._var_of = {}         # id(Node) -> var
+        self._node_of = {}        # var -> Node, for diagnostics only
         self._counter = 0
         self._negate = negate
         # results the Query reads back after build()
@@ -416,7 +417,67 @@ class _Compiler(Compiler):
         for source, _relations, target, _reverse in self.antijoins:
             for node in (source, target):
                 self._ensure_column(node)
+        self._reject_disconnected()
         return SearchSpec(self._nodes, self._edges, self._build_outputs())
+
+    def _reject_disconnected(self):
+        """Refuse a variable that never joins the selected pattern.
+
+        Such a variable does not filter the result -- it multiplies it, once per
+        binding, or empties it when it has none. That is an existential
+        quantifier, and it is almost never what was meant. What was meant, nearly
+        every time, is that two identical-looking Nodes were the same variable:
+
+            g.select(Node("person")).where(Node("person").name == "Ada")
+
+        Refs have identity semantics on purpose, so those are two variables and
+        the constraint lands on the one nobody selected -- silently returning
+        every person. Failing here is the difference between a typo and a wrong
+        answer that looks plausible.
+        """
+        projected = set()
+        for var in self.query.nodes:
+            if isinstance(var, Node):
+                projected.add(self.var(var))
+            else:                                   # a Path: its sequence variables
+                sequence, _edges = self.paths.get(id(var), ([], []))
+                projected.update(sequence)
+        if not projected:
+            return
+
+        joined = {}
+        def link(one, other):
+            joined.setdefault(one, set()).add(other)
+            joined.setdefault(other, set()).add(one)
+        for edge in self._edges:
+            link(edge.source, edge.target)
+        for source, _relations, target, _reverse in self.antijoins:
+            # an anti-join is a join too: it constrains a pair, so an endpoint
+            # reached only this way is connected, not orphaned
+            link(self.var(source), self.var(target))
+
+        reached, queue = set(projected), list(projected)
+        while queue:
+            for other in joined.get(queue.pop(), ()):
+                if other not in reached:
+                    reached.add(other)
+                    queue.append(other)
+
+        orphans = [var for var in self._nodes if var not in reached]
+        if orphans:
+            described = ", ".join(sorted(self._describe(var) for var in orphans))
+            raise ValueError(
+                f"{described} is constrained but never joined to the selected pattern, "
+                f"so it would multiply the results rather than filter them. Two "
+                f"identical-looking Nodes are two different variables: reuse the same "
+                f"object in select() and where(), or relate them with an edge."
+            )
+
+    def _describe(self, var):
+        node = self._node_of.get(var)
+        if node is None or node.type is None:
+            return "Node()"
+        return f'Node("{node.type}")'
 
     # -- Compiler surface the Condition family calls --
 
@@ -536,7 +597,8 @@ class _Compiler(Compiler):
 
     def var(self, node):
         if id(node) not in self._var_of:
-            self._var_of[id(node)] = self._fresh()
+            var = self._var_of[id(node)] = self._fresh()
+            self._node_of[var] = node        # so a diagnostic can name what was written
         return self._var_of[id(node)]
 
     def spec(self, node):

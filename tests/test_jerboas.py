@@ -2,6 +2,8 @@
 Like (fuzzy + soft-where), path/OR, ranking, grouping, strategies -- plus the
 values a query returns (Key, Rel) and the directed-relation model."""
 
+import pytest
+
 from jerboas import Node, Edge, Path, Score, Like, Has, Key, Rel
 from jerboas import Connectivity, DiffusedMatrixFactorization, MatrixFactorization, PageRank
 from jerboas.strategies import Alphabetical
@@ -59,10 +61,11 @@ def test_label_resolves_per_type_on_an_untyped_node(small_graph):
 
 
 def test_label_matches_what_the_key_reports(small_graph):
-    movie = Node("movie")
-    for key in small_graph.select(movie):
-        found = list(small_graph.select(Node("movie")).where(Node("movie").label == key.label))
-        assert found == [] or key.label in [k.label for k in found]
+    # querying a key's own label finds exactly that key back
+    for key in list(small_graph.select(Node("movie"))):
+        movie = Node("movie")
+        found = list(small_graph.select(movie).where(movie.label == key.label))
+        assert [str(k) for k in found] == [str(key)]
 
 
 def test_label_drives_fuzzy_seed_resolution(small_graph):
@@ -347,6 +350,45 @@ def test_pagerank_ranks_and_limits(small_graph):
     result = list(small_graph.select(movie, Score()).rank(PageRank(to={"person.1"})).top(2))
     scores = [s for _, s in result]
     assert len(result) == 2 and scores == sorted(scores, reverse=True)
+
+
+# --- a constraint must reach the selected pattern ---------------------------
+
+def test_disconnected_variable_is_refused(small_graph):
+    """The failure this exists to turn from a wrong answer into an error: two
+    identical-looking Nodes are two variables, so the constraint below lands on
+    one nobody selected and every movie comes back."""
+    with pytest.raises(ValueError, match=r'Node\("movie"\).*never joined'):
+        list(small_graph.select(Node("movie")).where(Node("movie").title == "Alpha"))
+
+
+def test_the_same_object_is_the_fix(small_graph):
+    movie = Node("movie")
+    assert names(list(small_graph.select(movie).where(movie.title == "Alpha"))) == ["movie.1"]
+
+
+def test_an_edge_is_the_other_fix(small_graph):
+    # a second variable is fine as soon as something joins it to the pattern
+    movie, person = Node("movie"), Node("person")
+    rows = names(list(small_graph.select(movie).where(
+        movie.directed_by == person, person.name == "Yara Director")))
+    assert rows == ["movie.3"]
+
+
+def test_anti_join_endpoint_counts_as_joined(small_graph):
+    # `user` is neither projected nor positively related, but the anti-join
+    # constrains the pair, so it is connected and the query stands
+    user, movie = Node("user"), Node("movie")
+    rows = names(list(small_graph.select(movie).where(
+        user.id == 1, ~Has(user, "has_interact", movie))))
+    assert rows == ["movie.3"]
+
+
+def test_unrelated_projected_nodes_are_still_a_cross_product(small_graph):
+    # both are selected, so the caller asked for this and it is not refused
+    movie, genre = Node("movie"), Node("genre")
+    rows = list(small_graph.select(movie, genre))
+    assert len(rows) == 3 * 2
 
 
 # --- engines ----------------------------------------------------------------
