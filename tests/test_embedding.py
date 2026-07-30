@@ -15,17 +15,39 @@ from jerboas.strategies.embedding import SCORERS
 
 torch = pytest.importorskip("torch", reason="training path needs the [torch] extra")
 
-from jerboas.models import TransD, train                      # noqa: E402
+from jerboas.models import MODELS, TransD, TransE, train       # noqa: E402
 from jerboas.models.train import triples, type_bounds          # noqa: E402
 
 
-@pytest.fixture
-def fitted(small_graph, tmp_path):
-    model = train(TransD(factors=8, seed=1), small_graph,
+@pytest.fixture(params=sorted(MODELS))
+def fitted(request, small_graph, tmp_path):
+    """Every registered model, trained briefly and written to a checkpoint.
+
+    Parameterized rather than fixed to TransD so that adding a model puts it
+    through the whole seam -- training, round-trip, scorer agreement, ranking --
+    without anyone remembering to extend the suite."""
+    model = train(MODELS[request.param](factors=8, seed=1), small_graph,
                   epochs=3, batch_size=8, device="cpu", report=None)
     path = str(tmp_path / "m.npz")
     model.save(path)
     return model, path
+
+
+# --- the train/serve seam must be covered on both sides ---------------------
+
+def test_every_model_has_a_scorer():
+    """The invariant that the orphaned TransE scorer violated: a model with no
+    scorer trains into an unreadable checkpoint, and a scorer with no model is
+    maths nothing compares against its torch original."""
+    assert set(MODELS) == set(SCORERS), (
+        f"models without a scorer: {set(MODELS) - set(SCORERS)}; "
+        f"scorers without a model: {set(SCORERS) - set(MODELS)}"
+    )
+
+
+def test_model_names_match_their_registry_key():
+    for key, model in MODELS.items():
+        assert model.name == key
 
 
 # --- the triple store is the CSR --------------------------------------------
@@ -61,10 +83,11 @@ def test_corruptions_stay_inside_the_type(small_graph):
 def test_checkpoint_round_trip(small_graph, fitted):
     model, path = fitted
     restored = load(path, small_graph)
-    assert restored.model == "transd" and restored.factors == 8
+    assert restored.model == model.name and restored.factors == 8
     assert restored.missing == []
-    trained = model.entity.weight.detach().numpy()
-    assert np.allclose(restored.tensors["entity"], trained, atol=1e-6)
+    for name in model.tables:
+        trained = getattr(model, name).weight.detach().numpy()
+        assert np.allclose(restored.tensors[name], trained, atol=1e-6), name
 
 
 def test_checkpoint_rebinds_by_name_not_position(small_graph, fitted, tmp_path, graph_rows):
@@ -141,7 +164,7 @@ def test_torch_and_numpy_score_agree(small_graph, fitted):
         expected = model.score(torch.as_tensor(head),
                                torch.full((len(head),), code),
                                torch.as_tensor(tail)).numpy()
-    actual = SCORERS["transd"](restored.tensors, row, head, tail)
+    actual = SCORERS[model.name](restored.tensors, row, head, tail)
     assert np.allclose(expected, actual, atol=1e-4), f"{expected} != {actual}"
 
 

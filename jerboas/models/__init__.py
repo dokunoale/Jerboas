@@ -34,7 +34,16 @@ except ModuleNotFoundError as exc:      # pragma: no cover - depends on the inst
 
 del _torch
 
+from .base import Translational     # noqa: E402
 from .transd import TransD          # noqa: E402
+from .transe import TransE          # noqa: E402
 from .train import train            # noqa: E402
 
-__all__ = ["TransD", "train"]
+# Every trainable model, by the name its checkpoints carry. This must stay in
+# step with strategies.embedding.SCORERS: a model with no scorer trains into a
+# checkpoint nothing can read, and a scorer with no model is serving maths that
+# no test ever compares against its torch original. test_every_model_has_a_scorer
+# holds the two together.
+MODELS = {model.name: model for model in (TransD, TransE)}
+
+__all__ = ["Translational", "TransD", "TransE", "train", "MODELS"]

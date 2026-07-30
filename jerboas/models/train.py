@@ -43,7 +43,7 @@ def train(model, graph, epochs=50, batch_size=4096, lr=0.01, device="cpu",
     A batch job, not a pipeline verb: far too slow to sit inside a query's
     fit(), and run once ahead of them all.
     """
-    if model.entity is None:
+    if not model.built:
         model.build(graph)
     device = torch.device(device)
     model.to(device)
