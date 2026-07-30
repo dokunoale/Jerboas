@@ -7,11 +7,10 @@ dist/
 .venv/
 venv/
 
-# data/movielens is versioned on purpose: it carries manual, unscripted edits
-# (the title/year split, the removal of the empty id=267 row) that re-running
-# the generators would undo, so the repo is its only record.
-# ml.ui_train is not -- benchmark/run.py regenerates it on every run.
-data/movielens/ml.ui_train
+# MovieLens may not be redistributed: "The user may not redistribute the data
+# without separate permission" (GroupLens usage licence), and the IMDb-derived
+# files are non-commercial-use only. data/example/ is synthetic and ships.
+data/movielens/
 
 # trained model checkpoints
 *.npz

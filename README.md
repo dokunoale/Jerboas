@@ -6,14 +6,14 @@ A non-deterministic-first, ORM-like graph query library.
 import jerboas as jb
 from jerboas import Node, Edge, Path, Score, Like, PageRank
 
-g = jb.Graph(kg="data/movielens/ml.kg", ui="data/movielens/ml.ui",
-             attrs=["data/movielens/ml.movie", "data/movielens/ml.person"])
+g = jb.Graph(kg="data/example/example.kg", ui="data/example/example.ui")
 
-rec, seed, path = Node("movie"), Node(), Path()
+song, seed, path = Node("song"), Node(), Path()
+seeds = set(g.select(Node("genre")).where(Node("genre").id == "reggae"))
 
-g.select(rec, Score()).where(
-    path == [rec, Edge(), Node(), Edge(), seed],
-    Like(seed.label.is_in(["Quentin Tarantino"])),
+g.select(song, Score()).where(
+    path == [song, Edge(), seed],
+    seed.is_in(seeds),
 ).rank(PageRank(to=seeds)).top(10)
 ```
 
@@ -91,6 +91,26 @@ entities.
 
 On MovieLens (15369 nodes, 110k edges) TransD at `factors=64` is 1.97M
 parameters, 7.9 MB, and trains in about a second per epoch on Apple MPS.
+
+## Data
+
+`data/example/` is a small synthetic graph (songs, artists, genres) and ships
+with the repo, so everything above runs on a fresh clone.
+
+The MovieLens graph the benchmarks and `example.py` use is **not** included:
+GroupLens' usage licence states that "the user may not redistribute the data
+without separate permission", and the IMDb-derived files are non-commercial-use
+only. Obtain [ml-100k](https://grouplens.org/datasets/movielens/100k/) and the
+[IMDb non-commercial datasets](https://developer.imdb.com/non-commercial-datasets/)
+yourself, then build `data/movielens/` with the loader's expected layout:
+
+```
+ml.kg          head <TAB> relation <TAB> tail        (`movie.1  has_genre  genre.4`)
+ml.ui          user <TAB> item [<TAB> rating]
+ml.<type>      a header row of column names, first column the id
+```
+
+Any graph in that layout works -- nothing in the library is MovieLens-specific.
 
 ## Install
 
