@@ -126,3 +126,9 @@ pytest
 ```
 
 The torch-dependent tests skip when the extra is not installed.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE), and [NOTICE](NOTICE) for the third-party
+attributions — the TransD and TransE formulations were adapted from
+[hopwise](https://github.com/tail-unica/hopwise) (MIT).
