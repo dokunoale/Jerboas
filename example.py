@@ -46,11 +46,13 @@ def explain(path):
 
 def resolve(g, type_, names):
     # seed resolution: fuzzy-match against the type's label column, whichever it
-    # happens to be -- so this knows nothing about types
-    if not names:
+    # happens to be -- so this knows nothing about types. Blank entries are the
+    # caller's, not the graph's, so they are dropped here rather than in Like.
+    wanted = [name.strip() for name in (names or []) if name and name.strip()]
+    if not wanted:
         return set()
     node = Node(type_)
-    return set(g.select(node).where(Like(node.label.is_in(names))))
+    return set(g.select(node).where(Like(node.label.is_in(wanted))))
 
 
 def recommend(g, model, people, genres, titles, k):
@@ -155,10 +157,12 @@ app = FastAPI(title="Jerboas cold-start recommender", lifespan=lifespan)
 
 
 class RecommendRequest(BaseModel):
-    people: list[str] = Field(default_factory=list)
-    genres: list[str] = Field(default_factory=list)
-    titles: list[str] = Field(default_factory=list)
-    k: int = 10
+    # null and an omitted field mean the same thing: nothing to seed from.
+    # Blank entries inside a list are stripped in resolve().
+    people: list[str] | None = None
+    genres: list[str] | None = None
+    titles: list[str] | None = None
+    k: int = Field(default=10, ge=1, le=100)
 
 
 class Recommendation(BaseModel):

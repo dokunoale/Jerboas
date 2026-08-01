@@ -187,6 +187,16 @@ class Compiler(ABC):
         Called by In."""
 
     @abstractmethod
+    def best_match(self, ref, needles, k, cutoff):
+        """Admit the `k` stored values closest to each needle, above `cutoff`.
+        Called by Like when it softens a set of strings.
+
+        This is a genuinely different kind of constraint from the rest: not a
+        predicate each candidate answers on its own, but a ranking across the
+        whole column, of which only the top few are kept. A Condition cannot
+        express that -- it would have to read the data -- so it is said here."""
+
+    @abstractmethod
     def edge(self, source, relation, target, reverse=False):
         """A relation edge between two Node refs, walked forwards or (reverse=True)
         backwards. Called by Has (and by path())."""

@@ -1,9 +1,11 @@
 **/__pycache__
 **/*.pyc
 .pytest_cache
+.git
 tests
 benchmark
-legacy
+checkpoints
 data/movielens/imdb
+data/movielens/ml.ui_train
 *.md
-.git
+!README.md

@@ -83,12 +83,13 @@ class Like(Condition, Strategy):
       * in rank(...): the weight only (everything is already admitted).
     """
 
-    def __init__(self, condition, *, mode="auto", t=1.0, width=None, eps=0.05):
+    def __init__(self, condition, *, mode="auto", t=1.0, width=None, eps=0.6, k=1):
         self.condition = condition  # the crisp Condition being softened (always a Condition)
         self.mode = mode            # "auto" | "gaussian" | "sigmoid" | "linear" | "leaky"
         self.t = t                  # temperature: how far membership diffuses past the edge
         self.width = width          # explicit spread for equality/range softening
-        self.eps = eps              # support cutoff: below this membership, drop the row
+        self.eps = eps              # similarity below which a match is not a match
+        self.k = k                  # how many best matches each needle admits
 
     # -- Condition side: the widened crisp admission --
 
@@ -122,6 +123,13 @@ class Like(Condition, Strategy):
         return self.condition                            # already crisp-broad (e.g. contains)
 
     def compile(self, ctx):
+        attr, op, needles = self._operand()
+        if op == "in" and needles and all(isinstance(n, str) for n in needles):
+            # a set of strings is a search box, not a filter: admit the k values
+            # closest to each needle rather than a region around them, judged by
+            # the same measure the graded weight uses, so the two cannot disagree
+            ctx.best_match(attr, needles, self.k, self.eps, self.closeness)
+            return
         self.support().compile(ctx)
 
     # -- Strategy side: the graded weight --
@@ -153,16 +161,21 @@ class Like(Condition, Strategy):
             return max(0.05 * max(0.0, 1.0 - r / 6.0), math.exp(-0.5 * r * r))
         return math.exp(-0.5 * r * r)                    # gaussian (also "auto")
 
+    def closeness(self, needle, text):
+        """How close one stored value is to one needle, in [0, 1].
+
+        Containment counts as a perfect match, so "tarantino" finds "Quentin
+        Tarantino" the way a search box would -- except when the needle is empty,
+        which is contained in everything and would make a blank search the
+        broadest one possible instead of the narrowest."""
+        n = str(needle).lower()
+        return 1.0 if n and n in text else SequenceMatcher(None, n, text).ratio()
+
     def _similarity(self, raw, needles):
         if raw is None:
             return 0.0
         text = str(raw).lower()
-        best = 0.0
-        for needle in needles:
-            n = str(needle).lower()
-            score = 1.0 if n in text else SequenceMatcher(None, n, text).ratio()
-            best = max(best, score)
-        return best
+        return max((self.closeness(n, text) for n in needles), default=0.0)
 
     def score(self, query, rows):
         attr, op, value = self._operand()

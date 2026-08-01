@@ -22,6 +22,8 @@ Rows carry integer node ids the whole way through -- search, anti-joins,
 ranking, grouping -- and become Key/Rel values only in _render, at the edge.
 """
 
+import heapq
+
 import numpy as np
 
 from .core import Compiler, Strategy
@@ -374,6 +376,20 @@ def _rel(graph, code):
     return Rel(graph.relations[~code], True) if code < 0 else Rel(graph.relations[code], False)
 
 
+def _closest(needle, texts, k, cutoff, closeness):
+    """The k rows closest to one needle.
+
+    A needle that is literally present is already as close as anything can be, so
+    the expensive comparison only runs when plain containment cannot fill k --
+    which is the difference between a millisecond and a fifth of a second on a
+    column of twelve thousand names."""
+    contained = [local for local, text in texts if needle and needle in text]
+    if len(contained) >= k:
+        return contained[:k]
+    scored = ((closeness(needle, text), local) for local, text in texts)
+    return [local for score, local in heapq.nlargest(k, scored) if score >= cutoff]
+
+
 class _Compiler(Compiler):
     """The Query-owned implementation of core.Compiler.
 
@@ -502,6 +518,31 @@ class _Compiler(Compiler):
             return
         spec = self.spec(ref.node)                 # attribute membership
         self._restrict(spec, self._attr_mask(spec, ref.name, "in", set(values)))
+
+    def best_match(self, ref, needles, k, cutoff, closeness):
+        """The k stored values closest to each needle, and nothing else.
+
+        Softening a set of strings used to widen it into a substring test, which
+        failed in both directions: a typo admitted nothing, and the empty string
+        admitted the whole column. Someone typing a name wants the value they
+        meant, so that is what is admitted -- `closeness` is the Condition's own
+        measure, passed in rather than reinvented here, and `cutoff` is where a
+        match stops being one."""
+        graph = self.graph
+        spec = self.spec(ref.node)
+        mask = np.zeros(graph.n_nodes, dtype=bool)
+        types = [spec.type] if spec.type is not None else graph.types
+        for type_ in types:
+            column = graph.column(type_, ref.name)
+            if column is None or column.values.dtype != object:
+                continue                         # only text is matched this way
+            low, _high = graph.block(type_)
+            texts = [(local, str(column.get(local)).lower())
+                     for local in range(len(column)) if column.get(local) is not None]
+            for needle in needles:
+                for local in _closest(str(needle).lower(), texts, k, cutoff, closeness):
+                    mask[low + local] = True
+        self._restrict(spec, mask)
 
     def edge(self, source, relation, target, reverse=False):
         relations = self._relation_tuple(relation)

@@ -15,7 +15,7 @@ from jerboas import Node, Edge, Path, Score, Like, PageRank
 g = jb.Graph(kg="data/example/example.kg", ui="data/example/example.ui")
 
 artist = Node("artist")
-seeds = set(g.select(artist).where(Like(artist.id.is_in(["Golden"]))))
+seeds = set(g.select(artist).where(Like(artist.id.is_in(["Golden"]), k=3)))
 
 song, seed, path = Node("song"), Node(), Path()
 g.select(song, Score()).where(
@@ -39,10 +39,18 @@ A crisp `Condition` answers *yes* or *no*. `Like` answers *how much*, in `[0, 1]
 and that single idea is what the library is built around.
 
 ```python
-Like(person.label.is_in(["Quentin Tarantino"]))   # fuzzy string match
+Like(person.label.is_in(["Quentin Tarantino"]))   # the person you meant
+Like(person.label.is_in(["tarantino"]), k=3)      # the three closest
 Like(movie.year < 1990, t=0.8)                    # a threshold that leaks
 Like(movie.year == 1994, width=5)                 # equality with a tolerance
 ```
+
+A set of strings is a **search box, not a filter**: `Like` admits the `k` values
+closest to each needle rather than a region around them. So a fragment finds the
+whole (`"tarantino"` → *Quentin Tarantino*), a typo still lands (`"George Lukas"`
+→ *George Lucas*), and asking for nothing returns nothing. Admission and weight
+share one measure, so the rows that come back are exactly the ones the ranking
+would have put on top.
 
 A `Like` in `where(...)` does **two jobs at once**. It admits a widened crisp
 region — so the engine never chases a gaussian across the graph — and it

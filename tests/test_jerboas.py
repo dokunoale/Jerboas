@@ -291,6 +291,52 @@ def test_like_soft_where_widens_and_weights(small_graph):
     assert rows[0][0] == "Alpha"                     # exact/substring match ranks top
 
 
+def test_like_admits_the_best_match_not_a_region(small_graph):
+    """A set of strings is a search box: the value meant, not everything nearby.
+    Containment counts as a perfect match, and a typo still lands."""
+    for needles, expected in ((["Xavier"], ["person.1"]),            # a fragment
+                              (["Xavier Directr"], ["person.1"]),    # a typo
+                              (["Xavier Director"], ["person.1"]),   # exact
+                              (["Nobody At All"], []),               # below the cutoff
+                              ([""], [])):                           # nothing asked
+        person = Node("person")
+        rows = names(list(small_graph.select(person)
+                          .where(Like(person.label.is_in(needles)))))
+        assert rows == expected, needles
+
+
+def test_like_admits_k_matches_per_needle(small_graph):
+    """k is how many candidates a needle is allowed to mean; both people here
+    are Directors, so one needle reaches both only when asked to."""
+    for k, expected in ((1, ["person.1"]), (2, ["person.1", "person.2"])):
+        person = Node("person")
+        rows = names(list(small_graph.select(person)
+                          .where(Like(person.label.is_in(["Director"]), k=k))))
+        assert sorted(rows) == expected, k
+
+
+def test_a_blank_needle_does_not_poison_the_others(small_graph):
+    person = Node("person")
+    rows = names(list(small_graph.select(person)
+                      .where(Like(person.label.is_in(["", "Xavier"])))))
+    assert rows == ["person.1"]
+
+
+def test_like_on_a_numeric_set_is_not_string_matched(small_graph):
+    movie = Node("movie")
+    rows = names(list(small_graph.select(movie).where(Like(movie.year.is_in([1994])))))
+    assert sorted(rows) == ["movie.1", "movie.2"]
+
+
+def test_admission_and_weight_use_one_measure(small_graph):
+    """Like's contract is that the crisp support is the region where membership
+    exceeds eps; the two now share `closeness` rather than each having its own."""
+    like = Like(Node("person").label.is_in(["Xavier"]))
+    assert like.closeness("xavier", "xavier director") == 1.0
+    assert like.closeness("", "xavier director") == 0.0
+    assert 0.5 < like.closeness("xavier directr", "xavier director") < 1.0
+
+
 def test_like_is_condition_and_strategy():
     from jerboas import Condition, Strategy
     like = Like(Node("movie").year < 3)
