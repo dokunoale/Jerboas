@@ -15,7 +15,13 @@ is an explicit batch job, run once, outside any query:
     from jerboas.models import TransD, train
 
     model = train(TransD(factors=64), graph, epochs=50, device="mps")
-    model.save("ml.transd.npz")
+    model.save("checkpoints/ml.transd.npz")
+
+and it comes back as a ranking strategy, needing no wrapper:
+
+    g.select(rec, Score()).rank(
+        TransD.load("checkpoints/ml.transd.npz", g, to=seeds)
+    ).top(10)
 
 `train` is a free function rather than a method because `nn.Module.train()`
 already means something else in torch -- switching to training mode -- and a
@@ -39,9 +45,9 @@ from .transd import TransD          # noqa: E402
 from .transe import TransE          # noqa: E402
 from .train import train            # noqa: E402
 
-# Every trainable model, by the name its checkpoints carry. Nothing has to be
-# kept in step here: a trainer and the ranking path reach the same kge.Model, so
-# a model cannot exist without its arithmetic or vice versa.
-MODELS = {model.spec.name: model for model in (TransD, TransE)}
+# Every model, by the name its checkpoints carry. A model is one class -- tables,
+# arithmetic, fitting and ranking -- so there is nothing here to keep in step
+# with anything else.
+MODELS = {model.name: model for model in (TransD, TransE)}
 
 __all__ = ["Translational", "TransD", "TransE", "train", "MODELS"]

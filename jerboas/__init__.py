@@ -7,7 +7,7 @@ Public surface, grouped by the four object families (see core.py):
                  And, Or, Not
     strategies   Score, Alphabetical, PageRank, Connectivity,   -> rank(...)
                  MatrixFactorization, DiffusedMatrixFactorization,
-                 Embedding
+                 TransD, TransE
     engines      Default, Greedy             -> using(...)
 
 Plus Graph (the data + `select`), the values a query returns (Key, Rel), and the
@@ -17,7 +17,22 @@ build conditions implicitly; everything else is an explicit object.
 
 A relation has one name and two directions: `person.directed_by.inverse` walks
 it backwards, and the wildcard `Edge()` walks both.
+
+The embedding models (TransD, TransE) are strategies like the rest, but they are
+imported on demand: fitting one needs torch, which is an optional extra, and the
+base install must stay importable without it.
 """
+
+_LAZY = {"TransD": "models", "TransE": "models", "Translational": "models",
+         "train": "models"}
+
+
+def __getattr__(name):
+    """Reach jerboas.models only when something in it is actually asked for."""
+    if name in _LAZY:
+        import importlib
+        return getattr(importlib.import_module(f".{_LAZY[name]}", __name__), name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 from .core import Ref, Expr, Condition, Strategy, Engine
 from .graph import Graph
@@ -32,7 +47,6 @@ from .strategies import (
     DiffusedMatrixFactorization,
     Connectivity,
     PageRank,
-    Embedding,
 )
 from .engine import Default, Greedy
 
@@ -50,7 +64,7 @@ __all__ = [
     # strategies
     "Score", "ExprStrategy", "Alphabetical",
     "MatrixFactorization", "DiffusedMatrixFactorization", "Connectivity", "PageRank",
-    "Embedding",
+    "TransD", "TransE",
     # engines
     "Default", "Greedy",
 ]

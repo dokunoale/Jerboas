@@ -107,7 +107,7 @@ memory to fake it.
 |---|---|---|---|
 | **Reference** | `Ref` / `Expr` | `Node`, `Attr`, `Edge`, `Path`, `Degree` | `select(...)` |
 | **Condition** | `Condition` | `Compare`, `Like`, `In`, `Has`, `Match`, `And`/`Or`/`Not` | `where(...)` |
-| **Strategy** | `Strategy` | `PageRank`, `Connectivity`, `MatrixFactorization`, `Embedding`, … | `rank(...)` |
+| **Strategy** | `Strategy` | `PageRank`, `Connectivity`, `MatrixFactorization`, `TransD`, … | `rank(...)` |
 | **Engine** | `Engine` | `Default`, `Greedy` | `using(...)` |
 
 Adding a matcher is a new `Condition`. Adding a ranker is a new `Strategy`.
@@ -125,31 +125,43 @@ different pattern variables — so reuse the same object across `select` and
 `where`. Get it wrong and the query says so rather than quietly returning
 everything.
 
-## Embeddings: train with torch, serve without it
+## Embeddings are strategies
 
-Scoring a translational embedding is a projection and a norm, so a checkpoint
-holds plain arrays and the ranking path needs numpy alone. **Only training needs
-torch**, which means the machine answering queries never has to install it.
+Fitting one needs torch, so the models are an optional extra and are imported on
+demand — a base install stays importable without it.
 
 ```python
-from jerboas.models import TransD, train        # pip install jerboas[torch]
+from jerboas import TransD, train               # pip install jerboas[torch]
 
 model = train(TransD(factors=64), g, epochs=15, device="mps")
 model.save("checkpoints/ml.transd.npz")
 ```
 
 ```python
-from jerboas import Embedding                   # base install
-
 g.select(rec, Score()).rank(
-    Embedding.load("checkpoints/ml.transd.npz", g, to=seeds)
+    TransD.load("checkpoints/ml.transd.npz", g, to=seeds)
 ).top(10)
 ```
 
-One strategy, every model. A model *is* its entry in `jerboas/kge.py` — a name,
-the tables it allocates, and the arithmetic over them — so the trainer and the
-ranking path reach the same definition rather than two that a test has to keep
-agreeing. Adding TransH is an entry there plus three lines in `models/`.
+**A model is a strategy you can train.** There is no wrapper and no registry:
+`TransD` subclasses `Strategy` exactly as `PageRank` does, so a fitted model goes
+straight into `rank(...)`. One class holds the tables, the arithmetic, the
+training and the ranking, and adding a model means writing that one class:
+
+```python
+class TransE(Translational):
+    name = "transe"
+    tables = (("entity", NODE), ("relation", RELATION))
+
+    def plausibility(self, head, relation, tail):
+        return self.norm(self.get("entity", head)
+                         + self.get("relation", relation)
+                         - self.get("entity", tail))
+```
+
+`plausibility` is written with the operators numpy and torch spell the same way,
+so those three lines serve both the gradient step and the query — `get` returns
+an `nn.Embedding` lookup while fitting and an array row once loaded.
 
 Checkpoints are compressed `.npz` under `checkpoints/`, and they are **inert**:
 every array is a native numpy dtype, so they load with `allow_pickle=False`. A
@@ -222,10 +234,9 @@ jerboas/
   query.py        Query + the compiler that builds admission masks
   ir.py           the neutral IR an Engine consumes
   engine.py       Default, Greedy
-  kge.py          what each embedding model IS: name, tables, arithmetic
-  checkpoint.py   how one is stored and rebound (numpy only, inert)
+  checkpoint.py   storing a trained model, and rebinding it by name
   strategies/     the ranking family
-  models/         trainable models -- the only place torch is imported
+  models/         embeddings: strategies you train -- the only place torch lives
 ```
 
 ## Tests
