@@ -135,17 +135,27 @@ torch**, which means the machine answering queries never has to install it.
 from jerboas.models import TransD, train        # pip install jerboas[torch]
 
 model = train(TransD(factors=64), g, epochs=15, device="mps")
-model.save("kg.npz")
+model.save("checkpoints/ml.transd.npz")
 ```
 
 ```python
 from jerboas import Embedding                   # base install
 
-g.select(rec, Score()).rank(Embedding.load("kg.npz", g, to=seeds)).top(10)
+g.select(rec, Score()).rank(
+    Embedding.load("checkpoints/ml.transd.npz", g, to=seeds)
+).top(10)
 ```
 
-One strategy, many models: `Embedding` reads the model name out of the
-checkpoint, so adding TransE or TransH never touches the ranking layer.
+One strategy, every model. A model *is* its entry in `jerboas/kge.py` — a name,
+the tables it allocates, and the arithmetic over them — so the trainer and the
+ranking path reach the same definition rather than two that a test has to keep
+agreeing. Adding TransH is an entry there plus three lines in `models/`.
+
+Checkpoints are compressed `.npz` under `checkpoints/`, and they are **inert**:
+every array is a native numpy dtype, so they load with `allow_pickle=False`. A
+pickled `.npz` is executable code wearing a data extension; these are not. Each
+one also records its own provenance — when it was fitted, for how long, with
+which hyperparameters, on a graph of what size.
 
 Two details that matter more than they look:
 
@@ -212,7 +222,8 @@ jerboas/
   query.py        Query + the compiler that builds admission masks
   ir.py           the neutral IR an Engine consumes
   engine.py       Default, Greedy
-  checkpoint.py   the trained-embedding format (numpy only)
+  kge.py          what each embedding model IS: name, tables, arithmetic
+  checkpoint.py   how one is stored and rebound (numpy only, inert)
   strategies/     the ranking family
   models/         trainable models -- the only place torch is imported
 ```

@@ -12,5 +12,6 @@ venv/
 # files are non-commercial-use only. data/example/ is synthetic and ships.
 data/movielens/
 
-# trained model checkpoints
+# trained model checkpoints (convention: checkpoints/<dataset>.<model>.npz)
+checkpoints/
 *.npz

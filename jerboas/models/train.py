@@ -45,6 +45,8 @@ def train(model, graph, epochs=50, batch_size=4096, lr=0.01, device="cpu",
     """
     if not model.built:
         model.build(graph)
+    model.meta.update(epochs=epochs, batch_size=batch_size, lr=lr,
+                      device=str(device), sampler="type-aware")
     device = torch.device(device)
     model.to(device)
 

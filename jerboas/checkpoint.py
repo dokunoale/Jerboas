@@ -1,114 +1,173 @@
-"""The on-disk format of a trained embedding, and how it is bound back to a graph.
+"""How a trained embedding is stored, and how it is bound back to a graph.
 
-This module is deliberately torch-free and numpy-only: it is the seam between
-training (jerboas.models, which needs torch) and serving (strategies.Embedding,
-which does not). Installing the library without the `torch` extra still lets you
-load a checkpoint someone else trained and rank with it.
+Torch-free and numpy-only on purpose: this is the seam between training
+(jerboas.models, which needs torch) and serving (strategies.Embedding, which does
+not). A base install can load a checkpoint someone else fitted and rank with it.
 
-Why identity is stored, not just weights
-----------------------------------------
-A node's integer id is an artifact of *how the graph was loaded*: blocks are laid
+The file is a compressed .npz, and it is *inert*: every array is a native numpy
+dtype, strings included, so it loads with `allow_pickle=False`. That matters
+because a pickled .npz is executable code wearing a data extension -- opening one
+from an untrusted source would run it. Nothing here can.
+
+    format        int      this layout's version
+    model         str      a key into kge.REGISTRY: "transd", "transe", ...
+    factors       int      embedding width
+
+    relations     U[R]     relation name per code, in the trained model's order
+    node_type     U[N]     the type of each weight row
+    node_id       U[N]     the raw id of each weight row
+
+    meta_*        scalar   provenance: when, for how long, on what
+
+    w_<table>     f32      one per table the model declares
+
+Why identity is stored
+----------------------
+A node's integer id is an artifact of *how its graph was loaded*: blocks are laid
 out in order of first appearance, so adding one movie, or listing the attribute
-files in a different order, shifts the ids. A checkpoint keyed by position would
-keep working after such a change and silently score the wrong entities -- the
-worst kind of bug, because nothing raises.
+files differently, shifts every id after it. A checkpoint keyed by position would
+still load against the changed graph -- the shapes match -- and would score the
+wrong entities without raising. So each weight row records whose it is, and
+binding resolves those names against whatever ids the graph is using now.
 
-So a checkpoint records the identity of every row: the type names, the raw ids
-within each type, and the relation names in code order. Binding it to a graph
-resolves those names to whatever ids that graph is using now, and reports what it
-could not find. The identity table costs a few hundred KB against several MB of
-weights.
+The same applies to relations, by name. After `load`, every table is indexed in
+the *caller's* space: `tensors["entity"][node]` and `tensors["relation"][code]`
+both take ids from the graph that was passed in, not from the one trained on.
 """
+
+from datetime import datetime, timezone
 
 import numpy as np
 
-FORMAT = 1
+from .kge import NODE, REGISTRY
+
+FORMAT = 2
+META = "meta_"
+WEIGHT = "w_"
 
 
-def save(path, model, factors, graph, tensors):
+def provenance(graph, **details):
+    """The record of a training run: enough to tell two checkpoints apart six
+    months later, when only the files are left."""
+    return {
+        "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "graph_nodes": graph.n_nodes,
+        "graph_edges": int(len(graph.out_indices)),
+        "graph_relations": len(graph.relations),
+        **details,
+    }
+
+
+def save(path, model, factors, graph, weights, meta=None):
     """Write weights plus the identity needed to rebind them.
 
-    `tensors` maps a name to an array whose rows are indexed by node id, except
-    `relation` and `relation_vec`, which are indexed by relation code.
-    """
+    `weights` maps a table name the model declares to its array."""
+    missing = set(model.names) - set(weights)
+    if missing:
+        raise ValueError(f"{model.name} checkpoint is missing tables: {sorted(missing)}")
+
     payload = {
         "format": np.asarray(FORMAT),
-        "model": np.asarray(model),
+        "model": np.asarray(model.name),
         "factors": np.asarray(factors),
-        "relations": np.asarray(graph.relations, dtype=object),
-        "types": np.asarray(graph.types, dtype=object),
-        # one raw id per node, in node order: the identity of every weight row
-        "node_type": np.asarray([graph.type_of(i) for i in range(graph.n_nodes)], dtype=object),
-        "node_id": np.asarray([str(graph.raw_id(i)) for i in range(graph.n_nodes)], dtype=object),
+        "relations": np.asarray(list(graph.relations), dtype="U"),
+        "node_type": np.asarray([graph.type_of(i) for i in range(graph.n_nodes)], dtype="U"),
+        "node_id": np.asarray([str(graph.raw_id(i)) for i in range(graph.n_nodes)], dtype="U"),
     }
-    payload.update({f"w_{name}": np.asarray(value) for name, value in tensors.items()})
+    for key, value in (meta or {}).items():
+        payload[META + key] = np.asarray(value)
+    for name in model.names:
+        payload[WEIGHT + name] = np.asarray(weights[name], dtype=np.float32)
     np.savez_compressed(path, **payload)
+    return path
 
 
 class Checkpoint:
     """A trained embedding, already rebound to a graph's id space."""
 
-    def __init__(self, model, factors, tensors, relations, missing):
-        self.model = model            # "transd", ...
+    def __init__(self, model, factors, tensors, missing_nodes, missing_relations, meta):
+        self.model = model                        # the kge.Model, not just its name
         self.factors = factors
-        self.tensors = tensors        # name -> array, rows in *this* graph's ids
-        self.relations = relations    # relation code in this graph -> row in the weights
-        self.missing = missing        # nodes of this graph the checkpoint never saw
+        self.tensors = tensors                    # name -> array, in *this* graph's ids
+        self.missing_nodes = missing_nodes        # nodes the checkpoint never saw
+        self.missing_relations = missing_relations
+        self.meta = meta
 
-    def relation_row(self, code):
-        """The weight row for a relation code, or None when this graph has a
-        relation the trained model never saw."""
-        return self.relations.get(code)
+    @property
+    def name(self):
+        return self.model.name
+
+    def knows(self, code):
+        """Whether the model was trained on this graph's relation `code`."""
+        return code is not None and code not in self.missing_relations
+
+    def gather(self, table, index):
+        return self.tensors[table][index]
+
+    def score(self, head, relation, tail):
+        """Plausibility of triples, using the model's own arithmetic."""
+        return self.model.score(self.gather, head, relation, tail)
 
 
 def load(path, graph):
     """Read a checkpoint and rebind it to `graph`, by name rather than position.
 
-    Nodes the checkpoint does not cover keep a zero row: no evidence, no signal,
-    the same convention an unobserved item gets in matrix factorization. They are
-    listed in `.missing` so a caller can tell "unknown" from "uninteresting".
+    Rows the checkpoint does not cover stay zero -- no evidence, no signal, the
+    convention an unobserved item already gets in matrix factorization -- and are
+    reported so a caller can tell "unknown" from "uninteresting".
     """
-    with np.load(path, allow_pickle=True) as data:
+    with np.load(path, allow_pickle=False) as data:
         stored = {key: data[key] for key in data.files}
 
-    if int(stored["format"]) != FORMAT:
-        raise ValueError(f"{path}: checkpoint format {int(stored['format'])}, expected {FORMAT}")
+    version = int(stored["format"])
+    if version != FORMAT:
+        raise ValueError(f"{path}: checkpoint format {version}, expected {FORMAT}")
 
+    name = str(stored["model"])
+    if name not in REGISTRY:
+        raise ValueError(f"{path}: unknown model {name!r}; known: {sorted(REGISTRY)}")
+    model = REGISTRY[name]
     factors = int(stored["factors"])
-    row_of_node = _node_rows(stored, graph)
-    covered = row_of_node >= 0
+
+    node_rows, missing_nodes = _node_rows(stored, graph)
+    relation_rows, missing_relations = _relation_rows(stored, graph)
 
     tensors = {}
-    for key, value in stored.items():
-        if not key.startswith("w_"):
-            continue
-        name = key[2:]
-        if name.startswith("relation"):
-            tensors[name] = value          # indexed by relation row, remapped below
-            continue
-        rebound = np.zeros((graph.n_nodes, factors), dtype=value.dtype)
-        rebound[covered] = value[row_of_node[covered]]
-        tensors[name] = rebound
+    for table in model.tables:
+        weights = stored[WEIGHT + table.name]
+        rows, size = ((node_rows, graph.n_nodes) if table.space == NODE
+                      else (relation_rows, len(graph.relations)))
+        rebound = np.zeros((size, factors), dtype=weights.dtype)
+        covered = rows >= 0
+        rebound[covered] = weights[rows[covered]]
+        tensors[table.name] = rebound
 
-    trained = {str(name): row for row, name in enumerate(stored["relations"].tolist())}
-    relations = {code: trained[name]
-                 for code, name in enumerate(graph.relations) if name in trained}
-
-    missing = [int(i) for i in np.flatnonzero(~covered)]
-    return Checkpoint(str(stored["model"]), factors, tensors, relations, missing)
+    meta = {key[len(META):]: stored[key].item() for key in stored if key.startswith(META)}
+    return Checkpoint(model, factors, tensors, missing_nodes, missing_relations, meta)
 
 
 def _node_rows(stored, graph):
-    """For each node of `graph`, the checkpoint row holding its weights (-1 if
-    the checkpoint never saw it). Matching is on (type, raw id)."""
-    row_of_identity = {}
-    for row, (type_, raw) in enumerate(zip(stored["node_type"].tolist(),
-                                           stored["node_id"].tolist())):
-        row_of_identity[(str(type_), str(raw))] = row
-
+    """For each node of `graph`, the checkpoint row holding its weights, matched
+    on (type, raw id); -1 where the checkpoint has none."""
+    trained = {(str(type_), str(raw)): row for row, (type_, raw)
+               in enumerate(zip(stored["node_type"].tolist(), stored["node_id"].tolist()))}
     rows = np.full(graph.n_nodes, -1, dtype=np.int64)
     for index in range(graph.n_nodes):
-        row = row_of_identity.get((graph.type_of(index), str(graph.raw_id(index))))
+        row = trained.get((graph.type_of(index), str(graph.raw_id(index))))
         if row is not None:
             rows[index] = row
-    return rows
+    missing = [int(i) for i in np.flatnonzero(rows < 0)]
+    return rows, missing
+
+
+def _relation_rows(stored, graph):
+    """The same, for relations, matched on name."""
+    trained = {str(name): row for row, name in enumerate(stored["relations"].tolist())}
+    rows = np.full(len(graph.relations), -1, dtype=np.int64)
+    missing = []
+    for code, name in enumerate(graph.relations):
+        if name in trained:
+            rows[code] = trained[name]
+        else:
+            missing.append(code)
+    return rows, missing

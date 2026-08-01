@@ -1,35 +1,38 @@
-"""What every translational embedding shares.
+"""Fitting the models that kge.py defines.
 
-TransE, TransD and their relatives differ in exactly one thing: how a triple is
-scored. The tables they allocate, the margin-ranking objective, and the
-checkpoint they write are the same, so they live here and a model is left as its
-score function plus the list of tables it needs.
+A model class here carries no maths and no shape of its own: both come from its
+`spec`, a kge.Model. This module supplies what only training needs -- allocating
+the tables as nn.Embedding, the margin objective, and writing the checkpoint.
 
-Table naming is a convention rather than a declaration: a table whose name starts
-with `relation` has one row per relation, anything else has one row per node.
-checkpoint.py splits them the same way, which is what lets a checkpoint rebind
-node rows by identity while leaving relation rows to be matched by name.
+So adding a model is adding a kge.Model plus three lines here. There is no torch
+scoring function to keep in step with a numpy one, because there is only one
+scoring function and it lives in kge.py.
 """
 
-import numpy as np
 import torch
 from torch import nn
 
-from ..checkpoint import save as save_checkpoint
+from ..checkpoint import provenance, save as save_checkpoint
+from ..kge import NODE
 
 
 class Translational(nn.Module):
-    """A scoring model of the form -||f(h) + r - f(t)||."""
+    """Fits any kge.Model whose score is a translation to be minimised."""
 
-    name = None          # the key a checkpoint records, and SCORERS looks up
-    tables = ()          # embedding tables to allocate
+    spec = None          # a kge.Model
 
     def __init__(self, factors=64, margin=1.0, seed=42):
         super().__init__()
         self.factors = factors
         self.margin = margin
         self.seed = seed
+        self.tables = nn.ModuleDict()
         self._graph = None
+        self.meta = {}
+
+    @property
+    def name(self):
+        return self.spec.name
 
     @property
     def built(self):
@@ -40,16 +43,20 @@ class Translational(nn.Module):
         described before the data it will be fitted to is loaded."""
         torch.manual_seed(self.seed)
         self._graph = graph
-        for name in self.tables:
-            rows = len(graph.relations) if name.startswith("relation") else graph.n_nodes
-            table = nn.Embedding(rows, self.factors)
-            nn.init.xavier_normal_(table.weight)
-            setattr(self, name, table)
+        for table in self.spec.tables:
+            rows = graph.n_nodes if table.space == NODE else len(graph.relations)
+            embedding = nn.Embedding(rows, self.factors)
+            nn.init.xavier_normal_(embedding.weight)
+            self.tables[table.name] = embedding
         return self
 
+    def gather(self, table, index):
+        return self.tables[table](index)
+
     def score(self, head, relation, tail):
-        """-||...||, higher is more plausible. One line per model."""
-        raise NotImplementedError
+        """The model's own arithmetic, from kge.py -- the same function the numpy
+        serving path calls, differing only in how the vectors are fetched."""
+        return self.spec.score(self.gather, head, relation, tail)
 
     def loss(self, head, relation, tail, corrupt_head, corrupt_tail):
         """Margin ranking: a real triple must outscore its corruption by `margin`.
@@ -64,9 +71,12 @@ class Translational(nn.Module):
         return (torch.relu(self.margin - positive + negative_tail).mean()
                 + torch.relu(self.margin - positive + negative_head).mean())
 
-    def save(self, path):
-        """Write a checkpoint that can be rebound to a graph by name."""
-        tensors = {name: getattr(self, name).weight.detach().cpu().numpy().astype(np.float32)
-                   for name in self.tables}
-        save_checkpoint(path, self.name, self.factors, self._graph, tensors)
-        return path
+    def save(self, path, **details):
+        """Write a checkpoint that can be rebound to any graph, by name."""
+        if not self.built:
+            raise ValueError("nothing to save: the model has not been built or fitted")
+        weights = {name: table.weight.detach().cpu().numpy()
+                   for name, table in self.tables.items()}
+        meta = provenance(self._graph, model=self.name, factors=self.factors,
+                          margin=self.margin, seed=self.seed, **self.meta, **details)
+        return save_checkpoint(path, self.spec, self.factors, self._graph, weights, meta)
