@@ -249,6 +249,60 @@ def test_is_silent_about_an_unknown_relation(small_graph, fitted):
     assert all(s == 0.0 for _, s in rows)
 
 
+# --- link prediction without naming the relation -----------------------------
+
+def test_any_relation_is_the_default(small_graph, fitted):
+    """Left unnamed, the score is the best edge of any kind in either direction:
+    the only thing that works when seeds are of mixed types."""
+    model, path = fitted
+    loaded = model.__class__.load(path, small_graph)
+    loaded.fit(small_graph)
+    assert len(loaded._edges) == 2 * len(small_graph.relations)
+
+
+def test_naming_a_relation_narrows_it(small_graph, fitted):
+    model, path = fitted
+    narrow = model.__class__.load(path, small_graph, relation="has_genre")
+    narrow.fit(small_graph)
+    assert narrow._edges == ((small_graph.relation_code("has_genre"), False),)
+
+
+def test_any_relation_finds_each_seed_type_its_own_edge(small_graph, fitted):
+    """A person is joined to a film by directed_by backwards, a user by
+    has_interact forwards. Neither is named, and both still rank."""
+    model, path = fitted
+    movie = Node("movie")
+    for seed in ({"person.1"}, {"user.1"}, {"genre.1"}):
+        rows = list(small_graph.select(movie, Score())
+                    .rank(model.__class__.load(path, small_graph, to=seed)).top(3))
+        assert len(rows) == 3
+        assert any(s > 0 for _key, s in rows), seed
+
+
+# --- seeds are cheap to change, weights are not ------------------------------
+
+def test_seeded_shares_the_weights(small_graph, fitted):
+    """A service loads once and re-aims per request; rebinding is linear in the
+    graph, so it must not happen again."""
+    model, path = fitted
+    loaded = model.__class__.load(path, small_graph)
+    aimed = loaded.seeded({"user.1"})
+    for table, _space in model.tables:
+        assert aimed.arrays[table] is loaded.arrays[table]
+    assert aimed._to == {"user.1"} and loaded._to is None
+
+
+def test_seeded_ranks_the_same_as_a_fresh_load(small_graph, fitted):
+    model, path = fitted
+    movie = Node("movie")
+    fresh = list(small_graph.select(movie, Score())
+                 .rank(model.__class__.load(path, small_graph, to={"user.1"})))
+    reused = list(small_graph.select(movie, Score())
+                  .rank(model.__class__.load(path, small_graph).seeded({"user.1"})))
+    assert [str(k) for k, _ in fresh] == [str(k) for k, _ in reused]
+    assert np.allclose([s for _, s in fresh], [s for _, s in reused])
+
+
 # --- refusals ----------------------------------------------------------------
 
 def test_training_needs_edges(tmp_path):

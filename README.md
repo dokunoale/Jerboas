@@ -143,6 +143,21 @@ g.select(rec, Score()).rank(
 ).top(10)
 ```
 
+Naming no relation asks for the most plausible edge of *any* kind, in either
+direction — link prediction without specifying what link. That is what a mixed
+seed set needs: a person reaches a film through `directed_by` read backwards, a
+genre through `has_genre`, a user through `has_interact` forwards, and each seed
+finds its own. Pass `relation=` to ask the narrower question.
+
+A service loads a checkpoint once and re-aims it per request, since rebinding is
+linear in the graph and choosing seeds is not:
+
+```python
+model = TransD.load("checkpoints/ml.transd.npz", graph)     # once, at startup
+...
+rank(model.seeded(seed_keys))                                # per request
+```
+
 **A model is a strategy you can train.** There is no wrapper and no registry:
 `TransD` subclasses `Strategy` exactly as `PageRank` does, so a fitted model goes
 straight into `rank(...)`. One class holds the tables, the arithmetic, the
@@ -198,6 +213,11 @@ pip install -e '.[dev]'       # + pytest
 
 `data/example/` is a small synthetic graph — invented songs, artists and
 genres — and ships with the repo, so everything above runs immediately.
+
+`example.py` is a FastAPI cold-start recommender: it fits TransD on first boot,
+reuses the checkpoint after, and answers with an explanation drawn from the path
+that connected each result to your seeds. It needs `pip install -e '.[api,torch]'`
+and the MovieLens graph below.
 
 The MovieLens graph used by `example.py` and the benchmarks is **not** included:
 GroupLens' usage licence states that "the user may not redistribute the data
