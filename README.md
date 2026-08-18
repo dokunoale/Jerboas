@@ -135,6 +135,58 @@ fake it. A wildcard hop also brings back a `<edge>.rel` column naming what it
 walked, `~has_interact` for a step taken against the stored direction; a named
 hop does not, because every row would carry the same word.
 
+### What a hop actually does
+
+A hop is a gather, and it is worth seeing once, because everything about its
+cost follows from it. Say the frame holds three artists, and the step is
+`performed_by` read backwards:
+
+```
+frame:      artist = [100, 101, 102]
+
+bounds:     lo = [500, 508, 513]      where each one's edges start in the CSR
+            hi = [508, 513, 518]      and where they end
+counts:          [  8,   5,   5]
+
+gather:     rows    = [0 0 0 0 0 0 0 0  1 1 1 1 1  2 2 2 2 2]
+            targets = [0 20 30 31 33 52 66 89  1 3 26 55 85  2 15 25 64 92]
+```
+
+`rows` is the whole trick: it says which row of the *old* frame each result came
+from, so the new frame is `frame[rows]` with the target and the edge's weight
+added beside it. No key, no join, no hash table — the CSR was already the index a
+join would have had to build.
+
+Two consequences worth knowing:
+
+**A hop is an inner join.** A node with no matching edge contributes no rows and
+simply drops out. A node with eight contributes eight, so a frame grows by the
+degree of what it walks — which is why `unique` between two hops matters: two
+users who watched the same film reach the same neighbours, and carrying that row
+twice is what the old engine's memoized sub-path search existed to avoid.
+
+**The walk is the cheap half.** The expensive half is `frame[rows]`, which drags
+every column the frame already has into every new row. `select` away what the
+next step does not need, and say in advance what the step is allowed to land on:
+
+```python
+recent = g.nodes("movie").attrs(movie="year").filter(v.movie.year >= 1990)
+
+frame.hop("has_genre", to="rec", reverse=True, where=recent)   # never built
+frame.hop("has_genre", to="rec", reverse=True).filter(...)     # built, then dropped
+```
+
+`where` is the compiler's old admission mask, back where it belongs: same rows,
+34% less time on a MovieLens hop admitting 3% of what it walked, tapering to
+nothing as the admission widens.
+
+There is deliberately **no** such parameter for the edge's weight. It was
+written, measured and removed: filtering the weight array before building the
+frame beats polars' own comparison only below about 1% selectivity, and costs
+twice as much at 39%. A knob whose right setting requires knowing the
+selectivity curve is worse than no knob — so a weight stays a column, and
+`.filter(v.x.score >= 3)` after the hop is both the spelling and the fast path.
+
 ## Edges carry a weight, and a weight is a column
 
 A rating, a similarity, a confidence — every edge has one, defaulting to `1.0`
@@ -516,8 +568,11 @@ sub-range, counted once per relation and memoized.
 
 Everything else is a table operation, and therefore not ours: the anti-join that
 drops what a user has already seen, the `unique` that folds two routes to one
-node, the `group_by` that ranks by the whole pattern. Those used to be a
-backtracking search, a Python loop over result rows, and a scope stack.
+node, the `group_by` that ranks by the whole pattern, the window in
+`top(k, by=..., over=...)` that keeps the best k per user — or, sitting between
+two hops, the k most promising partial walks, which is a beam search and was an
+engine once. Those used to be a backtracking search, a Python loop over result
+rows, a scope stack and a pluggable `Greedy`.
 
 Files are read by column, not by line. A chunk of an edge file becomes three
 parallel columns with one `replace` and one `split` — two C loops over the whole

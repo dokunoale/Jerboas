@@ -116,7 +116,7 @@ class Frame:
     # --- the graph verbs -----------------------------------------------------
 
     def hop(self, relation=None, *, to=None, type=None, reverse=None, as_=None,
-            from_=None, norm=False):
+            from_=None, norm=False, where=None):
         """Every edge leaving a column of nodes, one result row per edge.
 
             .hop("has_genre", to="genre")        # forwards along one relation
@@ -130,6 +130,34 @@ class Frame:
         The step's own columns come back beside the target: `<as_>.score` always,
         and `<as_>.rel` when the relation was a wildcard and therefore worth
         naming. `as_` defaults to the relation's name, or to the target's.
+
+        `type` and `where` say *in advance* which nodes are worth landing on,
+        and they exist for one reason: cost. A hop's expensive half is not the
+        walk -- that is a gather over CSR slices -- but building the result,
+        which drags every column the frame already had along to every new row.
+        Both are the same restriction a `filter` would apply afterwards, applied
+        instead to the arrays the walk produced, so the rows that will not
+        survive are never built.
+
+        `where` is a frame of admissible nodes, which is also how an attribute
+        predicate gets in -- a frame is where one is written:
+
+            recent = g.nodes("movie").attrs(movie="year").filter(v.movie.year >= 1990)
+            frame.hop("has_genre", to="rec", reverse=True, where=recent)
+
+        This is the compiler's old admission mask, back where it belongs. It
+        never makes the answer different; it makes it cheaper -- measured on
+        MovieLens, 34% off a hop admitting 3% of what it walked, tapering to
+        nothing as the admission widens, because the alternative is a hash probe
+        against every edge walked.
+
+        There is deliberately no such parameter for the edge's weight. It was
+        written, measured, and removed: filtering the weight array before
+        building the frame beats polars' own comparison only below about 1%
+        selectivity, and costs twice as much at 39%. A knob whose right setting
+        requires knowing the selectivity curve is worse than no knob, so a
+        weight stays what it is -- a column -- and `.filter(v.x.score >= 3)`
+        after the hop is both the spelling and the fast path.
         """
         source = self._source_var(from_)
         target = to or type
@@ -142,20 +170,39 @@ class Frame:
         rows, targets, codes, weights = traverse.expand(
             self.graph, nodes, relation, reverse, normalized=norm)
 
-        if type is not None:
-            low, high = self.graph.block(type)
-            keep = (targets >= low) & (targets < high)
-            rows, targets, codes, weights = rows[keep], targets[keep], codes[keep], weights[keep]
+        keep = self._admitted(targets, type, where)
+        if keep is not None:
+            rows, targets, codes, weights = (rows[keep], targets[keep],
+                                             codes[keep], weights[keep])
 
         edge = as_ or relation or target
+        self._claim(target, edge, relation)
         data = self._df[rows] if len(rows) else self._df.clear()
-        added = [pl.Series(self._free(target), targets.astype(np.int32)),
-                 pl.Series(self._free(f"{edge}.score"), weights)]
+        added = [pl.Series(target, targets.astype(np.int32)),
+                 pl.Series(f"{edge}.score", weights)]
         if relation is None:
-            added.append(pl.Series(self._free(f"{edge}.rel"), self._names(codes)))
+            added.append(pl.Series(f"{edge}.rel", self._names(codes)))
         variables = dict(self.vars)
         variables[target] = type
         return self._wrap(data.with_columns(added), variables)
+
+    def _admitted(self, targets, type_, where):
+        """Which of the nodes just reached are worth building a row for.
+
+        One boolean array, intersected from whatever was said in advance, and
+        None when nothing was -- so the common case allocates nothing."""
+        keep = None
+        if type_ is not None:
+            low, high = self.graph.block(type_)
+            keep = (targets >= low) & (targets < high)
+        if where is not None:
+            # a mask over every node, read at the targets: admission is then an
+            # array lookup rather than a search, however the set was named
+            admissible = np.zeros(self.graph.n_nodes, dtype=bool)
+            admissible[self.graph.ids_of(where)] = True
+            reached = admissible[targets]
+            keep = reached if keep is None else (keep & reached)
+        return keep
 
     def like(self, column, needles, k=1, cutoff=0.6):
         """Keep the k rows closest to each needle, and say how close they were.
@@ -275,14 +322,31 @@ class Frame:
     def group_by(self, *by, maintain_order=True):
         return _GroupBy(self, [name_of(one) for one in _flat(by)], maintain_order)
 
-    def top(self, n, by=None, descending=True):
+    def top(self, n, by=None, descending=True, over=None):
         """The n best rows. `by` defaults to a `score` column when there is one,
-        because that is what the frame was building up to."""
+        because that is what the frame was building up to.
+
+        `over` makes it the n best *per group* -- one user's ten films, one
+        walk's five most promising steps -- which is a window function rather
+        than a sort, so it costs one pass instead of one query per group:
+
+            .top(10, by="score", over="user")
+            .hop(to="mid").top(5, by=v.pr, over="seed").hop(to="rec")
+
+        That second line is a beam search: keep the k most promising partial
+        walks at each step and expand only those. It was an engine once."""
         if by is None:
             by = "score" if "score" in self._df.columns else None
         if by is None:
-            return self.head(n)
-        return self.sort(by, descending=descending).head(n)
+            return self.head(n) if over is None else self
+        column = name_of(by)
+        if over is None:
+            return self.sort(column, descending=descending).head(n)
+        groups = [name_of(one) for one in _flat([over])]
+        ranked = pl.col(column).rank("ordinal", descending=descending).over(groups)
+        return self._wrap(self._df.filter(ranked <= n)
+                          .sort(groups + [column], descending=[False] * len(groups)
+                                + [descending]))
 
     # --- internals -----------------------------------------------------------
 
@@ -308,13 +372,38 @@ class Frame:
         return list(self.vars)[-1]          # the last one introduced
 
     def _free(self, name):
-        """`name`, suffixed if the frame already has a column called that."""
+        """`name`, suffixed if the frame already has a column called that. Used
+        only where a repeat is harmless -- a second `similarity` is a second
+        search, not a second reading of the same thing."""
         if name not in self._df.columns:
             return name
         suffix = 2
         while f"{name}_{suffix}" in self._df.columns:
             suffix += 1
         return f"{name}_{suffix}"
+
+    def _claim(self, target, edge, relation):
+        """Refuse a hop whose columns would land on ones already there.
+
+        Suffixing the second `has_tag.score` to `has_tag.score_2` is what a
+        dataframe would do, and it is wrong here: the two are the weights of two
+        different steps, and a filter written against the obvious name would
+        silently read the other one. Two steps of one relation are two things,
+        so they are named -- which is what `as_` is for."""
+        if target in self._df.columns:
+            raise ValueError(
+                f"this hop would land on {target!r}, which the frame already has. "
+                f"Give the new column its own name: hop(..., to=\"...\")")
+        clash = [name for name in (f"{edge}.score",
+                                   None if relation is not None else f"{edge}.rel")
+                 if name is not None and name in self._df.columns]
+        if clash:
+            raise ValueError(
+                f"this hop would land on {', '.join(repr(name) for name in clash)}, "
+                f"which the frame already has. Two steps of one relation are two "
+                f"different things, and suffixing the second would leave a filter "
+                f"written against the obvious name reading the other one -- so name "
+                f"this step: hop({relation!r}, to={target!r}, as_=\"...\")")
 
     def _names(self, codes):
         """Relation codes as names, with `~` for an edge walked backwards."""

@@ -5,8 +5,6 @@ from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import polars as pl
-
 from jerboas import Graph
 from jerboas.strategies import MatrixFactorization
 from benchmark.split import read_edges, write_edges, train_test_split
@@ -35,7 +33,8 @@ def candidates(graph, users, k):
                .select("user", "seen"))
 
     reached = (watched
-               .hop("has_interact", to="peer", type="user", reverse=True, from_="seen")
+               .hop("has_interact", to="peer", type="user", reverse=True,
+                    from_="seen", as_="by")
                .select("user", "peer").unique(["user", "peer"])
                .hop("has_interact", to="rec", type="movie", from_="peer")
                .select("user", "rec").unique(["user", "rec"]))
@@ -46,8 +45,7 @@ def candidates(graph, users, k):
             # graph about one pair at a time
             .join(watched.rename({"seen": "rec"}), on=["user", "rec"], how="anti")
             .with_columns(score=MatrixFactorization().on("rec", "user"))
-            .filter(pl.col("score").rank("ordinal", descending=True).over("user") <= k)
-            .sort(["user", "score"], descending=[False, True]))
+            .top(k, by="score", over="user"))
 
 
 def recommend_all(graph, k):

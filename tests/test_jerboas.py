@@ -162,7 +162,7 @@ def test_hop_filters_the_target_by_type(small_graph):
 
 def test_hop_leaves_from_the_last_column_and_from_names_another(small_graph):
     two = small_graph.nodes("movie").hop("has_genre", to="genre") \
-                     .hop("has_genre", to="sibling", reverse=True)
+                     .hop("has_genre", to="sibling", reverse=True, as_="back")
     assert two.columns[:3] == ["movie", "genre", "has_genre.score"]
     back = small_graph.nodes("movie").hop("has_genre", to="genre") \
                       .hop("directed_by", to="person", from_="movie")
@@ -182,10 +182,64 @@ def test_hop_needs_a_name_for_its_target(small_graph):
         small_graph.nodes("movie").hop("directed_by")
 
 
-def test_a_repeated_column_name_is_suffixed(small_graph):
-    frame = (small_graph.nodes("movie").hop("has_genre", to="genre")
-             .hop("has_genre", to="rec", reverse=True))
-    assert "has_genre.score" in frame.columns and "has_genre.score_2" in frame.columns
+def test_where_admits_before_the_rows_are_built(small_graph):
+    """The same rows a filter afterwards would leave, without building the ones
+    it would have thrown away."""
+    recent = small_graph.nodes("movie").attrs(movie="year").filter(v.movie.year >= 1999)
+    ahead = small_graph.nodes("person").hop("directed_by", to="rec", reverse=True,
+                                            where=recent)
+    after = (small_graph.nodes("person").hop("directed_by", to="rec", reverse=True)
+             .filter(v.rec.is_in(recent)))
+    assert names(ahead, "rec") == names(after, "rec") == ["movie.2"]
+
+
+def test_where_takes_any_way_of_naming_nodes(small_graph):
+    keys = [small_graph["movie.0"], small_graph["movie.1"]]
+    frame = small_graph.nodes("person").hop("directed_by", to="rec", reverse=True,
+                                            where=keys)
+    assert sorted(names(frame, "rec")) == ["movie.0", "movie.1"]
+
+
+def test_where_and_type_intersect(small_graph):
+    seen = small_graph.nodes(seed=["movie.0"])
+    frame = small_graph.nodes("user").hop(to="rec", type="movie", where=seen)
+    assert set(names(frame, "rec")) == {"movie.0"}
+
+
+def test_top_over_is_the_best_per_group(small_graph):
+    """One user's best film, not the best film overall -- a window function
+    rather than one query per group."""
+    frame = (small_graph.nodes(user="user").hop("has_interact", to="rec")
+             .top(1, by=v.has_interact.score, over="user"))
+    assert len(frame) == 3                                    # one row per user
+    assert frame.pl["has_interact.score"].to_list() == [5.0, 4.0, 5.0]
+
+
+def test_top_over_is_a_beam_when_it_sits_between_two_hops(small_graph):
+    """Keep the k most promising partial walks and expand only those. That was
+    an engine once."""
+    frame = (small_graph.nodes(user="user")
+             .hop("has_interact", to="mid")
+             .top(1, by=v.has_interact.score, over="user")     # the beam
+             .hop("has_genre", to="genre", from_="mid"))
+    assert len(frame) == 3
+    assert set(names(frame, "mid")) == {"movie.0", "movie.1", "movie.2"}
+
+
+def test_a_second_step_of_one_relation_must_be_named(small_graph):
+    """Suffixing the second `has_genre.score` would leave a filter written
+    against the obvious name silently reading the other step's weight."""
+    walked = small_graph.nodes("movie").hop("has_genre", to="genre")
+    with pytest.raises(ValueError, match="name this step"):
+        walked.hop("has_genre", to="rec", reverse=True)
+    named = walked.hop("has_genre", to="rec", reverse=True, as_="carried")
+    assert "has_genre.score" in named.columns and "carried.score" in named.columns
+
+
+def test_a_hop_cannot_overwrite_an_existing_variable(small_graph):
+    walked = small_graph.nodes("movie").hop("has_genre", to="genre")
+    with pytest.raises(ValueError, match="its own name"):
+        walked.hop("has_genre", to="movie", reverse=True)
 
 
 # --- filtering: a predicate is an expression ---------------------------------
@@ -375,7 +429,7 @@ def test_an_exact_match_beats_a_longer_container(tmp_path):
 def test_concat_unions_two_routes(small_graph):
     direct = small_graph.nodes(seed=["movie.0"]).hop("has_genre", to="genre")
     bridged = (small_graph.nodes(seed=["movie.0"]).hop("has_interact", to="user", reverse=True)
-               .hop("has_interact", to="rec"))
+               .hop("has_interact", to="rec", as_="back"))
     both = concat(direct, bridged)
     assert set(both.columns) >= {"seed", "genre", "user", "rec"}
     assert len(both) == len(direct) + len(bridged)
