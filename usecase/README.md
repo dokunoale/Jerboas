@@ -13,9 +13,9 @@ usecase/
 The two answer the same question from opposite ends, which is the point of
 having both. `coldstart` has nothing to go on but a few names, so it *fits* an
 affinity — TransD, a checkpoint, a warm-up. `genome` has the tag genome, where
-the affinity is already measured, so it trains nothing and ranks with one line —
-`rank(Sum(carried.score))`. Same library, same graph shape, different thing in
-the data.
+the affinity is already measured, so it trains nothing and ranks with an
+aggregate — `group_by(v.rec).agg(score=v.carried.score.sum())`. Same library,
+same graph shape, different thing in the data.
 
 ## The convention
 

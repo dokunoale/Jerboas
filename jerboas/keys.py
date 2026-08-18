@@ -1,9 +1,13 @@
-"""The values a query hands back: Key and Rel.
+"""Key: one node, outside the frame.
 
 Internally a node is an integer and a relation is a small code -- that is what
-makes masks, CSR slices and per-node arrays possible (see graph.py). Those
-integers are meaningless on their own, so the pipeline re-attaches their meaning
-at the very last step, in Query._render.
+makes CSR slices and per-node arrays possible (see graph.py). A frame carries
+those integers, because that is what indexes an array; `frame.keys(...)` is
+where one becomes a thing that knows what it is.
+
+There is no `Rel` here any more. A traversed relation is a column of names, with
+a leading `~` for a step taken against the stored direction -- readable when the
+frame prints, and comparable with `==` like any other string column.
 
 Key is not an int subclass: variable-length builtins cannot carry __slots__, and
 `str(key)` would then have to fight int's own formatting. It defines __index__
@@ -89,38 +93,3 @@ class Key:
             f"{self} cannot be pickled: a Key points into a Graph, and pickling "
             f"it would carry the whole graph along. Send str(key) and resolve it "
             f"with graph[...] on the other side.")
-
-
-class Rel:
-    """One relation traversal inside a Path: a name plus the direction it was
-    walked.
-
-    There is no `_r` twin relation any more -- `directed_by` walked backwards is
-    still `directed_by`, with reverse=True. Equality is (name, direction) and
-    never compares equal to a bare string: a Rel that equalled "directed_by" in
-    both directions would make the forward and reverse ones indistinguishable
-    through a string, which is exactly the confusion the `_r` suffix caused.
-    Compare `rel.name` when the direction does not matter.
-    """
-
-    __slots__ = ("name", "reverse")
-
-    def __init__(self, name, reverse=False):
-        self.name = name
-        self.reverse = reverse
-
-    def __hash__(self):
-        return hash((self.name, self.reverse))
-
-    def __eq__(self, other):
-        if isinstance(other, Rel):
-            return self.name == other.name and self.reverse == other.reverse
-        return NotImplemented
-
-    def __str__(self):
-        return f"~{self.name}" if self.reverse else self.name
-
-    __repr__ = __str__
-
-    def __format__(self, spec):
-        return format(str(self), spec)

@@ -6,14 +6,14 @@ Fitting needs torch, so everything here skips without the [torch] extra.
 import numpy as np
 import pytest
 
-from jerboas import Graph, Greedy, Has, Node, Score, Strategy
+from jerboas import Graph, Strategy, v
 from jerboas.checkpoint import FORMAT
 
 torch = pytest.importorskip("torch", reason="fitting needs the [torch] extra")
 
 from jerboas.models import MODELS, train                       # noqa: E402
 from jerboas.models.base import NODE, RELATION                 # noqa: E402
-from jerboas.models.train import triples, type_bounds          # noqa: E402
+from jerboas.models.train import examples, type_bounds         # noqa: E402
 
 
 @pytest.fixture(params=sorted(MODELS))
@@ -34,11 +34,10 @@ def fitted(request, small_graph, tmp_path):
 
 def test_a_model_is_a_strategy():
     """No wrapper and no registry pairing a model with its maths: the class is
-    the ranker, so rank(TransD.load(...)) needs nothing around it."""
+    the ranker, so TransD.load(...).on("rec") needs nothing around it."""
     for name, model in MODELS.items():
         assert issubclass(model, Strategy)
         assert model.name == name
-        assert model.supports_guidance
 
 
 def test_tables_declare_their_index_space():
@@ -49,21 +48,34 @@ def test_tables_declare_their_index_space():
         assert len(set(names)) == len(names)
 
 
-def test_score_and_plausibility_stay_distinct():
-    """`score` is the one interface rank(...) speaks; a triple's plausibility is
-    a different quantity and carries a different name."""
+def test_scores_and_plausibility_stay_distinct():
+    """`scores` is the one interface a strategy speaks; a triple's plausibility
+    is a different quantity and carries a different name."""
     for model in MODELS.values():
-        assert model.score is Strategy.score or callable(model.score)
-        assert model.plausibility is not model.score
+        assert model.scores is Strategy.scores or callable(model.scores)
+        assert model.plausibility is not model.scores
 
 
 # --- the triple store is the CSR --------------------------------------------
 
 def test_triples_read_off_the_csr(small_graph):
-    head, relation, tail = triples(small_graph)
+    head, relation, tail, weight = examples(small_graph)
     assert len(head) == len(relation) == len(tail) == len(small_graph.out_indices)
+    stored = set(zip(small_graph.edges().pl["source"].to_list(),
+                     small_graph.edges().pl["relation"].to_list(),
+                     small_graph.edges().pl["target"].to_list()))
     for h, r, t in list(zip(head.tolist(), relation.tolist(), tail.tolist()))[:20]:
-        assert small_graph.has_edge(h, t, r, reverse=False)
+        assert (h, small_graph.relations[r], t) in stored
+    assert len(weight) == len(head)
+
+
+def test_a_frame_of_edges_narrows_the_training_set(small_graph):
+    """Which edges a run learns from is a frame, so "which ones" is a question
+    with a visible answer."""
+    kept = small_graph.edges("has_interact").filter(v.score >= 3)
+    head, relation, tail, _weight = examples(small_graph, kept)
+    assert len(head) == len(kept) == 4
+    assert set(relation.tolist()) == {small_graph.relation_code("has_interact")}
 
 
 def test_type_bounds_cover_each_node_with_its_own_block(small_graph):
@@ -267,7 +279,7 @@ def test_the_two_weight_forms_score_alike(small_graph, fitted):
     loaded = type(model).load(path, small_graph)
     code = small_graph.relation_code("directed_by")
 
-    head, relation, tail = triples(small_graph)
+    head, relation, tail, _weight = examples(small_graph)
     keep = relation == code
     head, tail = head[keep], tail[keep]
 
@@ -281,45 +293,46 @@ def test_the_two_weight_forms_score_alike(small_graph, fitted):
 
 # --- ranking -----------------------------------------------------------------
 
-def test_ranks_without_a_wrapper(small_graph, fitted):
+def ranked(graph, strategy, type_="movie", column="rec"):
+    return (graph.nodes(**{column: type_})
+            .with_columns(score=strategy.on(column)).top(3))
+
+
+def test_ranks_as_an_ordinary_column(small_graph, fitted):
     model, path = fitted
-    movie = Node("movie")
-    rows = list(small_graph.select(movie, Score())
-                .rank(type(model).load(path, small_graph, to={"user.0"})).top(3))
-    scores = [s for _, s in rows]
-    assert len(rows) == 3 and scores == sorted(scores, reverse=True)
+    frame = ranked(small_graph, type(model).load(path, small_graph, to={"user.0"}))
+    scores = frame.pl["score"].to_list()
+    assert len(frame) == 3 and scores == sorted(scores, reverse=True)
 
 
 def test_can_score_a_relation_backwards(small_graph, fitted):
     # directed_by runs movie -> person, so ranking movies for a person seed has
     # to read it the other way round
     model, path = fitted
-    movie = Node("movie")
-    forward = [s for _, s in small_graph.select(movie, Score()).rank(
-        type(model).load(path, small_graph, to={"person.0"}, relation="directed_by"))]
-    reverse = [s for _, s in small_graph.select(movie, Score()).rank(
-        type(model).load(path, small_graph, to={"person.0"},
-                         relation="directed_by", reverse=True))]
+    forward = ranked(small_graph, type(model).load(
+        path, small_graph, to={"person.0"}, relation="directed_by")).pl["score"].to_list()
+    reverse = ranked(small_graph, type(model).load(
+        path, small_graph, to={"person.0"}, relation="directed_by",
+        reverse=True)).pl["score"].to_list()
     assert forward != reverse
 
 
-def test_guides_greedy(small_graph, fitted):
+def test_scores_each_row_against_its_own_seed(small_graph, fitted):
+    """The second column of on(...) is the seed each row was reached from --
+    which the strategy used to have to dig out of a path."""
     model, path = fitted
-    strategy = type(model).load(path, small_graph, to={"user.0"})
-    user, movie = Node("user"), Node("movie")
-    rows = list(small_graph.select(user, movie)
-                .where(Has(user, "has_interact", movie))
-                .rank(strategy).using(Greedy(k=2)))
-    assert rows
+    loaded = type(model).load(path, small_graph)
+    frame = (small_graph.nodes(seed=["person.0", "person.1"])
+             .hop("directed_by", to="rec", reverse=True)
+             .with_columns(score=loaded.on("rec", "seed")))
+    assert len(frame) == 3 and frame.pl["score"].null_count() == 0
 
 
 def test_is_silent_about_an_unknown_relation(small_graph, fitted):
     model, path = fitted
-    movie = Node("movie")
-    rows = list(small_graph.select(movie, Score())
-                .rank(type(model).load(path, small_graph, to={"user.0"},
-                                       relation="no_such_relation")))
-    assert all(s == 0.0 for _, s in rows)
+    frame = ranked(small_graph, type(model).load(
+        path, small_graph, to={"user.0"}, relation="no_such_relation"))
+    assert all(score == 0.0 for score in frame.pl["score"].to_list())
 
 
 # --- link prediction without naming the relation -----------------------------
@@ -344,12 +357,12 @@ def test_any_relation_finds_each_seed_type_its_own_edge(small_graph, fitted):
     """A person is joined to a film by directed_by backwards, a user by
     has_interact forwards. Neither is named, and both still rank."""
     model, path = fitted
-    movie = Node("movie")
     for seed in ({"person.0"}, {"user.0"}, {"genre.0"}):
-        rows = list(small_graph.select(movie, Score())
-                    .rank(model.__class__.load(path, small_graph, to=seed)).top(3))
-        assert len(rows) == 3
-        assert any(s > 0 for _key, s in rows), seed
+        frame = ranked(small_graph, model.__class__.load(path, small_graph, to=seed))
+        assert len(frame) == 3
+        # plausibility is -||.||, so a real edge scores below zero and a
+        # relation the model could not find scores exactly 0.0
+        assert all(score < 0 for score in frame.pl["score"].to_list()), seed
 
 
 # --- seeds are cheap to change, weights are not ------------------------------
@@ -367,13 +380,12 @@ def test_seeded_shares_the_weights(small_graph, fitted):
 
 def test_seeded_ranks_the_same_as_a_fresh_load(small_graph, fitted):
     model, path = fitted
-    movie = Node("movie")
-    fresh = list(small_graph.select(movie, Score())
-                 .rank(model.__class__.load(path, small_graph, to={"user.0"})))
-    reused = list(small_graph.select(movie, Score())
-                  .rank(model.__class__.load(path, small_graph).seeded({"user.0"})))
-    assert [str(k) for k, _ in fresh] == [str(k) for k, _ in reused]
-    assert np.allclose([s for _, s in fresh], [s for _, s in reused])
+    fresh = ranked(small_graph, model.__class__.load(path, small_graph, to={"user.0"}))
+    reused = ranked(small_graph,
+                    model.__class__.load(path, small_graph).seeded({"user.0"}))
+    assert [str(key) for key in fresh.keys("rec")] == \
+           [str(key) for key in reused.keys("rec")]
+    assert np.allclose(fresh.pl["score"].to_list(), reused.pl["score"].to_list())
 
 
 # --- refusals ----------------------------------------------------------------
@@ -452,45 +464,45 @@ def test_weighting_is_inert_on_an_unweighted_graph(tmp_path):
 def test_where_narrows_what_a_run_learns_from(small_graph):
     """The threshold that used to live in the loader, as an argument to the fit:
     the graph still holds the 1-star interaction, this run just never sees it."""
-    from jerboas import Edge
-    from jerboas.models.train import admitted, triples
+    kept = small_graph.edges("has_interact").filter(v.score >= 3)
+    _head, relation, _tail, _weight = examples(small_graph, kept)
+    names = [small_graph.relations[code] for code in relation]
 
-    keep = admitted(small_graph, [Edge("has_interact", score=(3, None))])
-    _head, relation, _tail = triples(small_graph, keep)
-    kept = [small_graph.relations[code] for code in relation]
-
-    assert kept.count("has_interact") == 4          # 5, 4, 3, 5 -- not the 1 or the 2
-    assert kept.count("has_genre") == 3             # unscored relations are untouched
-    assert len(triples(small_graph)[0]) == len(kept) + 2
+    assert names.count("has_interact") == 4         # 5, 4, 3, 5 -- not the 1 or the 2
+    assert len(examples(small_graph)[0]) == len(names) + 8
 
 
-def test_a_marker_naming_no_relation_constrains_every_edge(small_graph):
-    from jerboas import Edge
-    from jerboas.models.train import admitted
-
-    keep = admitted(small_graph, [Edge(score=(3, None))])
-    relations = {small_graph.relations[c] for c in small_graph.out_rels[keep]}
-    assert relations == {"has_interact"}            # everything unscored weighs 1
+def test_a_filter_can_leave_the_other_relations_alone(small_graph):
+    """A rating scale says nothing about the knowledge graph, and a frame is
+    where that is written rather than implied: the interactions are judged, the
+    rest passes."""
+    kept = small_graph.edges().filter(
+        (v.relation != "has_interact") | (v.score >= 3))
+    _head, relation, _tail, _weight = examples(small_graph, kept)
+    names = [small_graph.relations[code] for code in relation]
+    assert names.count("has_interact") == 4        # 5, 4, 3, 5 -- not the 1 or the 2
+    assert len(names) == 10                        # the 6 kg edges are untouched
 
 
 def test_the_filter_is_recorded_in_the_checkpoint(small_graph, tmp_path):
-    from jerboas import Edge
     from jerboas.models import TransE
 
+    kept = small_graph.edges("has_interact").filter(v.score >= 3)
     model = train(TransE(factors=4, seed=1), small_graph, epochs=1, batch_size=8,
-                  device="cpu", where=[Edge("has_interact", score=(3, None))], report=None)
-    assert model.meta["trained_on"] == "has_interact.score ge 3"
-    assert model.meta["trained_edges"] == 10        # 6 in the kg, 4 interactions left
+                  device="cpu", where=kept, report=None)
+    assert model.meta["trained_on"] == "4 edges of has_interact"
+    assert model.meta["trained_edges"] == 4
 
     path = str(tmp_path / "w.npz")
     model.save(path)
-    assert TransE.load(path, small_graph).meta["trained_on"] == "has_interact.score ge 3"
+    assert TransE.load(path, small_graph).meta["trained_on"] == "4 edges of has_interact"
 
 
 def test_a_filter_that_admits_nothing_says_so(small_graph):
-    from jerboas import Edge
     from jerboas.models import TransE
 
-    with pytest.raises(ValueError, match="no edge satisfies"):
+    with pytest.raises(ValueError, match="filter frame is empty"):
         train(TransE(factors=4), small_graph, epochs=1,
-              where=[Edge(score=(99, None))], report=None)
+              where=small_graph.edges().filter(v.score >= 99), report=None)
+
+

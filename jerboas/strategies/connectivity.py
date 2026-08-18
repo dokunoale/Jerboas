@@ -1,5 +1,7 @@
 """Two-hop reachability from a seed set, counted with a bitset."""
 
+import numpy as np
+
 from ..core import Strategy
 
 
@@ -12,7 +14,7 @@ class Connectivity(Strategy):
         self.to = to
 
     def fit(self, graph):
-        seeds = tuple(sorted(i for i in (graph.lookup(s) for s in self.to) if i is not None))
+        seeds = tuple(sorted(graph.ids_of(self.to).tolist()))
         self._counts = self.cached(graph, ("connectivity", seeds),
                                    lambda: self._compute_counts(graph, seeds))
 
@@ -37,9 +39,12 @@ class Connectivity(Strategy):
             for target in graph.neighbours(node):
                 reached[target] = reached.get(target, 0) | mask
 
-        return {node: mask.bit_count() for node, mask in reached.items()}
+        # one array rather than a dict: the score is then a gather, and the
+        # rows it is asked about are a column of ids
+        counts = np.zeros(graph.n_nodes)
+        for node, mask in reached.items():
+            counts[node] = mask.bit_count()
+        return counts
 
-    def score(self, query, rows):
-        col = query.primary_column
-        counts = getattr(self, "_counts", None) or {}
-        return [float(counts.get(row[col], 0)) for row in rows]
+    def scores(self, graph, columns):
+        return self._counts[columns[0]]

@@ -17,19 +17,21 @@ is -- which is the whole difference between the two, and why this file is half
 the size.
 
 Two hops carry the query: watchlist -> a tag both films are strong on -> a
-candidate. What ranks them is `Sum` over the tags they carry -- one shared tag is
-a coincidence, twenty is a taste -- which is a question about the matches rather
-than about the graph, and therefore an aggregate rather than a strategy.
+candidate. What ranks them is the sum of the tag weights they carry -- one
+shared tag is a coincidence, twenty is a taste -- which is a question about the
+matches rather than about the graph, and therefore a group_by rather than a
+strategy. There is no ranking object in this file at all: it is two hops, a
+filter and an aggregate.
 """
 
-from collections import defaultdict
 from contextlib import asynccontextmanager
 
+import polars as pl
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 import jerboas as jb
-from jerboas import Node, Edge, Path, Score, Like, Sum
+from jerboas import v
 
 DATA_DIR = "./data/genome"
 
@@ -47,7 +49,7 @@ def filed_as(title):
     """A title the way MovieLens files it: the leading article goes to the end,
     so *The Matrix* is stored as *Matrix, The*.
 
-    Worth the four lines. `Like` treats a title that contains the needle as a
+    Worth the four lines. `like` treats a title that contains the needle as a
     perfect match, so "The Matrix" untranslated lands on *The Matrix Revisited*
     -- a documentary -- while the film itself is left to come back as its own
     top suggestion."""
@@ -58,77 +60,80 @@ def filed_as(title):
 
 
 def resolve(graph, titles):
-    """Watchlist entries as film keys, one best match each.
+    """Watchlist entries as a frame of films, one best match each.
 
     A watchlist is typed by a person, so it is matched the way a search box
-    matches: `Like` admits the closest stored title rather than a region around
+    matches: `like` admits the closest stored title rather than a region around
     it, and what it landed on comes back in the response so a wrong guess is
     visible rather than silent."""
     wanted = [filed_as(title.strip()) for title in titles if title and title.strip()]
     if not wanted:
-        return set()
-    movie = Node("movie")
-    return set(graph.select(movie).where(Like(movie.title.is_in(wanted), k=1)))
+        return None
+    return graph.nodes(seed="movie").like(v.seed.title, wanted, k=1).select("seed")
+
+
+def shared(graph, seeds, strength):
+    """Every (watchlist film, tag, candidate) the genome connects, as a frame.
+
+    One walk, written once: the ranking groups it and the explanation reads it,
+    so the two cannot drift apart -- where they used to be two queries repeating
+    the same pattern in the hope of agreeing.
+
+    The tag weight is normalized on the way out of the hop, because a sum of
+    unbounded scores is arithmetic on a scale nobody chose."""
+    return (graph.nodes(seed=seeds)
+            .hop("has_tag", to="tag", as_="strong", norm=True)
+            .filter(v.strong.score >= strength)
+            .hop("has_tag", to="rec", reverse=True, as_="carried", norm=True)
+            .filter(v.carried.score >= strength)
+            .filter(~v.rec.is_in(seeds)))                 # already on the list
 
 
 def suggest(graph, watchlist, k, strength):
     seeds = resolve(graph, watchlist)
-    if not seeds:
+    if seeds is None or not len(seeds):
         return [], []
+    matched = sorted(seeds.attrs(seed="title").pl["seed.title"].to_list())
 
-    seed, tag, rec, path = Node("movie"), Node("tag"), Node("movie"), Path()
-    # one marker walked forwards out of the watchlist and backwards into a
-    # candidate. `carried` is named rather than written twice because `.inverse`
-    # makes a new marker each time, and the ranking has to mean *that* edge
-    strong = Edge("has_tag", score=(strength, None))
-    carried = strong.inverse
+    matches = shared(graph, seeds, strength)
+    if not len(matches):
+        return matched, []
 
-    ranked = graph.select(rec, Score()).where(
-        path == [seed, strong, tag, carried, rec],
-        seed.is_in(seeds),
-        ~rec.is_in(seeds),                       # already on the list
-    ).rank(Sum(carried.score)).top(k)
+    ranked = (matches
+              .group_by(v.rec)
+              .agg(score=v.carried.score.sum(),
+                   # the evidence, strongest tag first: an aggregate collapses
+                   # the rows it was computed from, so what explains a film is
+                   # gathered in the same breath as what ranks it.
+                   #
+                   # Deduplicated, unlike the score: a tag shared with two of
+                   # your films is twice the evidence, and the same word twice
+                   # in a list of reasons is a bug.
+                   shared=v.tag.expr.sort_by(pl.col("carried.score"), descending=True)
+                                    .unique(maintain_order=True).head(5))
+              .top(k)
+              .attrs(rec=["title", "year"]))
 
-    films = [film for film, _score in ranked]
-    if not films:
-        return sorted(str(s.title) for s in seeds), []
-
-    shared = _shared_tags(graph, seeds, films, strength)
-    return sorted(str(s.title) for s in seeds), [
+    names = _tag_names(graph, ranked)
+    return matched, [
         {
-            "title": film.attrs["title"],
-            "year": film.attrs.get("year"),
-            "score": score,
-            "shared": shared[film],
+            "title": row["rec.title"],
+            "year": row["rec.year"],
+            "score": row["score"],
+            "shared": [names[tag] for tag in row["shared"]],
         }
-        for film, score in ranked
+        for row in ranked.rows(named=True)
     ]
 
 
-def _shared_tags(graph, seeds, films, strength, limit=5):
-    """Why each of the winners won: the tags it shares with the watchlist,
-    strongest first.
-
-    A second query rather than a column of the first. The ranking collapses to
-    one row per film -- that is what an aggregate is for -- so the evidence has
-    to be asked for separately, and asking it of the k winners is cheaper than
-    carrying it for the thousands that lost. It runs the walk from the films
-    this time, which is the same pattern read from the other end."""
-    film, tag, seed, path = Node("movie"), Node("tag"), Node("movie"), Path()
-    strong = Edge("has_tag", score=(strength, None))
-
-    weighed = defaultdict(dict)
-    for walk in graph.select(path).where(
-        path == [film, strong, tag, strong.inverse, seed],
-        film.is_in(films),
-        seed.is_in(seeds),
-    ):
-        found, name = walk[0], walk[2]
-        weighed[found][str(name.attrs["name"])] = graph.weight_of(
-            int(found), int(name), graph.relation_code("has_tag"), normalized=True)
-
-    return {found: sorted(tags, key=tags.get, reverse=True)[:limit]
-            for found, tags in weighed.items()}
+def _tag_names(graph, ranked):
+    """The tag ids the aggregate kept, as names. A gather over the few that
+    survived, rather than a column carried through the whole walk."""
+    ids = {tag for row in ranked.rows(named=True) for tag in row["shared"]}
+    if not ids:
+        return {}
+    frame = graph.nodes(tag=sorted(ids)).attrs(tag="name")
+    return dict(zip(frame.pl["tag"].to_list(), frame.pl["tag.name"].to_list()))
 
 
 # --- startup -----------------------------------------------------------------
@@ -146,6 +151,7 @@ def load_graph():
             f"{DATA_DIR}/genome.tag",
             f"{DATA_DIR}/genome.genre",
         ],
+        readable={"movie": "title", "tag": "name", "genre": "name"},
     )
 
 

@@ -25,103 +25,101 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 import jerboas as jb
-from jerboas import Node, Edge, Path, Score, Like, PageRank, TransD, train
+from jerboas import PageRank, TransD, train, concat, v
 
 DATA_DIR = "./data/movielens"
 CHECKPOINT = "./checkpoints/ml.transd.npz"
 EPOCHS = 15
 
-# what counts as liking a film, for the model. A 1-star rating is an interaction
-# and belongs in the graph; it is not evidence of an affinity and does not belong
-# in a model of one. Being a training argument rather than a loader argument is
-# the point: the same graph still answers "who rated this at all?".
-LIKED = [Edge("has_interact", score=(3, None))]
-
-
-def cold_start_pattern(path, rec, seed):
-    # candidate movie -> a liked attribute (1 hop) OR -> attribute -> a liked movie (2 hops).
-    # shared by the ranking and explain queries so they can't silently drift apart.
-    # Edge() is undirected, so the bridge closes whichever way the edges are stored.
-    return (path == [rec, Edge(), seed]) | (path == [rec, Edge(), Node(), Edge(), seed])
-
-
-# which column each type reads as a name. The graph names its own columns and
-# does not guess at which one a human reads, so the question says it.
+# which column each type reads as a name. Declared with the data rather than per
+# query: the graph does not guess which of its columns a human reads, and the
+# answer is a fact about the dataset.
 READABLE = {"movie": "title", "person": "name", "genre": "name"}
 
 
-def readable(key):
-    """A key as a person would name it."""
-    return key.attrs.get(READABLE.get(key.type, "name"))
+def liked(graph):
+    """What counts as liking a film, for the model.
+
+    A 1-star rating is an interaction and belongs in the graph; it is not
+    evidence of an affinity and does not belong in a model of one. Being a frame
+    handed to the fit rather than an argument to the loader is the point: the
+    same graph still answers "who rated this at all?"."""
+    return graph.edges().filter((v.relation != "has_interact") | (v.score >= 3))
 
 
-def explain(walk):
-    # walk is (rec, rel, [mid, rel,] seed): how rec connects to your likes
-    seed = walk[-1]
-    if seed.type == "movie" and len(walk) > 3:        # a liked film, via a bridge node
-        return f"similar to {readable(seed)} (shared {walk[2].type})"
-    return f"{walk[-2].name.replace('_', ' ')} {readable(seed)}"
-
-
-def seeds(g, wanted):
+def seeds(graph, wanted):
     """The nodes the caller named, fuzzy-matched per type.
 
     Per type rather than in one untyped query on purpose: the request already
-    says which list is people and which is genres, and `Like` admits its k best
-    values in every type it is allowed to look at -- so asking across all of
-    them would let "Quentin Tarantino" also pull in the nearest film title."""
-    found = set()
+    says which list is people and which is genres, and `like` admits its k best
+    values in whatever it is allowed to look at -- so asking across all of them
+    would let "Quentin Tarantino" also pull in the nearest film title."""
+    frames = []
     for type_, names in wanted.items():
         asked = [name.strip() for name in (names or []) if name and name.strip()]
         if asked:
-            node = Node(type_).alias(readable=READABLE[type_])
-            found |= set(g.select(node).where(Like(node.readable.is_in(asked))))
-    return found
+            frames.append(graph.nodes(seed=type_).labels("seed")
+                          .like(v.seed.label, asked)
+                          .select("seed"))
+    return concat(*frames) if frames else None
 
 
-def rank_films(g, model, seed_keys, exclude, k):
+def expanded(graph, found):
+    """Every film within two hops of a seed, and how it was reached.
+
+    A candidate reaches a liked attribute directly (1 hop) or through a bridge
+    node (2 hops). `hop` with no relation is undirected, so the bridge closes
+    whichever way the edges happen to be stored -- and the columns of the frame
+    *are* the walk, which is what the explanation reads."""
+    direct = graph.nodes(seed=found).hop(to="rec", type="movie")
+    bridge = graph.nodes(seed=found).hop(to="mid").hop(to="rec", type="movie")
+    return concat(direct, bridge)
+
+
+def rank_films(graph, model, found, exclude, k):
     """The k films closest to a mixed bag of seeds.
 
     No single relation joins the seeds to a film -- a person does it through
     directed_by/acted_in read backwards, a genre through has_genre -- so the
     model is asked for the most plausible edge of any kind, which is what a
-    heterogeneous seed set needs."""
-    rec, seed, path = Node("movie"), Node(), Path()
-    return g.select(rec, Score()).where(
-        cold_start_pattern(path, rec, seed),
-        seed.is_in(seed_keys),
-        ~rec.is_in(exclude),
-    ).rank(model.seeded(seed_keys),                   # learned KG plausibility
-           PageRank(to=seed_keys, weighted=True)      # personalized walk: proximity
-           ).top(k)
+    heterogeneous seed set needs.
+
+    The two signals are combined in the open: each is a column, each is put on
+    its own [0, 1] scale, and how much either counts is written down rather than
+    averaged behind the caller's back. `unique` after the sort keeps the best
+    route to each film, so one film cannot take three of the k places."""
+    return (expanded(graph, found)
+            .filter(~v.rec.is_in(exclude))
+            .with_columns(kg=model.seeded(found).on("rec").norm(),
+                          walk=PageRank(to=found, weighted=True).on("rec").norm())
+            .with_columns(score=0.6 * v.kg + 0.4 * v.walk)
+            .sort("score", descending=True)
+            .unique("rec")
+            .head(k)
+            .labels("rec", "seed"))
 
 
-def why(g, films, seed_keys):
-    """One walk per film, to explain it with.
+def explain(row):
+    """How a film connects to what the caller named.
 
-    A second search rather than selecting the Path alongside the ranking: a Path
-    is one row per walk, and a film reached three ways would take three of the k
-    places. Restricted to the films that survived, so it is small."""
-    rec, seed, path = Node("movie"), Node(), Path()
-    walks = {}
-    for walk in g.select(path).where(cold_start_pattern(path, rec, seed),
-                                     rec.is_in(films), seed.is_in(seed_keys)):
-        walks.setdefault(walk[0], walk)
-    return walks
+    The walk is not a string to parse or a Path object to unpack -- it is the
+    row: `seed` is what was liked, `mid` is the bridge when there was one, and
+    `rec.rel` names the edge that closed it."""
+    seed = row["seed.label"]
+    if row.get("mid") is not None:
+        return f"shares something with {seed}"
+    relation = str(row.get("rec.rel") or "").lstrip("~").replace("_", " ")
+    return f"{relation} {seed}"
 
 
-def recommend(g, model, people, genres, titles, k):
-    found = seeds(g, {"movie": titles, "person": people, "genre": genres})
-    if not found:
+def recommend(graph, model, people, genres, titles, k):
+    found = seeds(graph, {"movie": titles, "person": people, "genre": genres})
+    if found is None or not len(found):
         return []
-    ranked = rank_films(g, model, found, {key for key in found if key.type == "movie"}, k)
-    if not ranked:
-        return []
-    walks = why(g, {film for film, _ in ranked}, found)
-    return [{"title": readable(film),
-             "score": score,
-             "why": explain(walks[film]) if film in walks else None}
-            for film, score in ranked]
+    watched = [key for key in found.keys("seed") if key.type == "movie"]
+    ranked = rank_films(graph, model, found, watched, k)
+    return [{"title": row["rec.label"], "score": row["score"], "why": explain(row)}
+            for row in ranked.rows(named=True)]
 
 
 # --- startup -----------------------------------------------------------------
@@ -131,7 +129,7 @@ def load_graph():
     # score per edge, and what counts as a good enough rating is decided by
     # whoever asks. The walk reads it as a weight (PageRank(weighted=True)) and
     # the model is trained without the ratings it should not learn from (see
-    # LIKED, below) -- neither decision is baked into the graph.
+    # liked(), above) -- neither decision is baked into the graph.
     return jb.Graph(
         kg=f"{DATA_DIR}/ml.kg",
         edges=[f"{DATA_DIR}/ml.has_interact"],
@@ -142,6 +140,7 @@ def load_graph():
             f"{DATA_DIR}/ml.user",
             f"{DATA_DIR}/ml.person",
         ],
+        readable=READABLE,
     )
 
 
@@ -156,7 +155,7 @@ def load_or_fit(graph, path=CHECKPOINT, epochs=EPOCHS):
     if not os.path.exists(path):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         train(TransD(factors=64), graph, epochs=epochs, device=device(),
-              where=LIKED).save(path)
+              where=liked(graph)).save(path)
     return TransD.load(path, graph)
 
 

@@ -1,23 +1,43 @@
-"""Jerboas: a non-deterministic-first, ORM-like graph query library.
+"""Jerboas: query a knowledge graph like a dataframe, rank it like a recommender.
 
-Public surface, grouped by the four object families (see core.py):
+Two objects, and the second is a dataframe:
 
-    references   Node, Edge, Path            -> select(...)
-                 Sum, Count, Mean, Min, Max  -> rank(...), over what matched
-    conditions   Like, In, Has, Match,       -> where(...)
-                 And, Or, Not
-    strategies   Score, Ascending, Descending, PageRank,        -> rank(...)
-                 MatrixFactorization, DiffusedMatrixFactorization,
-                 Weight, TransD, TransE
-    engines      Default, Greedy             -> using(...)
+    g = jb.Graph(kg=..., edges=[...], attrs=[...])
+    print(g)                # <Graph: 15369 nodes in 5 types, 127k edges ...>
+    print(g.nodes("movie")) # shape: (1682, 1) -- a table, with a graph behind it
 
-Plus Graph (the data + `select`), the values a query returns (Key, Rel), and the
-interfaces (Ref, Condition, Strategy, Engine) for extending any family.
-Comparisons on refs (`node.year >= 1990`, `movie.directed_by == Node("person")`)
-build conditions implicitly; everything else is an explicit object.
+`Graph` is the data structure: a typed, positional node store plus an
+edge-labeled CSR. `Frame` is what you ask it -- a polars DataFrame that knows
+which of its columns hold nodes, and adds the four verbs a table cannot get from
+being a table:
 
-A relation has one name and two directions: `person.directed_by.inverse` walks
-it backwards, and the wildcard `Edge()` walks both.
+    hop      one traversal, one result row per edge
+    like     graded membership over a text column -- the search box
+    attrs    a stored attribute as a column
+    labels   the column a person reads, per the graph's `readable` map
+
+Everything else is polars: `filter`, `with_columns`, `group_by`, `sort`, `join`,
+and `.pl` for whatever is not forwarded. A pattern variable is a column name --
+`v.rec` is the column `rec`, `v.rec.year` the column `rec.year` -- so two of them
+are the same variable when they are spelled the same, and the frame prints what
+it is holding.
+
+    seeds = g.nodes("artist").labels("artist").like(v.artist.label, "Golden", k=3)
+
+    (g.nodes(seed=seeds).hop(to="song", type="song")
+       .with_columns(score=PageRank(to=seeds).on("song"))
+       .top(5).attrs(song="name"))
+
+A `Strategy` is the one thing a column cannot be: a score computed from the
+graph -- a walk, a factorization, an embedding. `on(...)` names the columns it
+reads, and the frame turns it into a column, which is then ordinary arithmetic:
+
+    .with_columns(pr=PageRank(to=seeds).on("rec").norm(),
+                  kg=TransD.load(path, g, to=seeds).on("rec").norm())
+    .with_columns(score=0.7 * v.pr + 0.3 * v.kg)
+
+Nothing is combined behind your back, and every intermediate signal stays a
+column you can print.
 
 The embedding models (TransD, TransE) are strategies like the rest, but they are
 imported on demand: fitting one needs torch, which is an optional extra, and the
@@ -35,42 +55,29 @@ def __getattr__(name):
         return getattr(importlib.import_module(f".{_LAZY[name]}", __name__), name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
-from .core import Ref, Expr, Condition, Strategy, Engine
+from .core import Strategy, Signal
+from .expr import v, col, norm
+from .frame import Frame, concat
 from .graph import Graph
-from .keys import Key, Rel
-from .refs import (Node, Edge, Path, Attr, Degree, EdgeScore,
-                   Sum, Count, Mean, Min, Max)
-from .conditions import Like, In, Has, Compare, Match, And, Or, Not
+from .keys import Key
 from .strategies import (
-    Score,
-    ExprStrategy,
-    Ascending,
-    Descending,
-    MatrixFactorization,
-    DiffusedMatrixFactorization,
     Connectivity,
+    DiffusedMatrixFactorization,
+    MatrixFactorization,
     PageRank,
     Weight,
 )
-from .engine import Default, Greedy
 
 __all__ = [
-    # interfaces
-    "Ref", "Expr", "Condition", "Strategy", "Engine",
-    # data + entry point
-    "Graph",
-    # result values
-    "Key", "Rel",
-    # references
-    "Node", "Edge", "Path", "Attr", "Degree", "EdgeScore",
-    "Sum", "Count", "Mean", "Min", "Max",
-    # conditions
-    "Like", "In", "Has", "Compare", "Match", "And", "Or", "Not",
-    # strategies
-    "Score", "ExprStrategy", "Ascending", "Descending",
-    "MatrixFactorization", "DiffusedMatrixFactorization", "Connectivity", "PageRank",
-    "Weight",
+    # the data, and what you ask it
+    "Graph", "Frame", "concat",
+    # naming a column
+    "v", "col", "norm",
+    # a node, outside the frame
+    "Key",
+    # strategies: the scores a column cannot hold on its own
+    "Strategy", "Signal",
+    "Connectivity", "MatrixFactorization", "DiffusedMatrixFactorization",
+    "PageRank", "Weight",
     "TransD", "TransE",
-    # engines
-    "Default", "Greedy",
 ]

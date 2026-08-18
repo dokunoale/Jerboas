@@ -24,8 +24,8 @@ import polars as pl
 
 from . import fuzzy, traverse
 from .core import Signal
-from .expr import Col, expression, name_of
-from .keys import Key, Rel
+from .expr import Col, name_of
+from .keys import Key
 
 RELATION = "relation"
 
@@ -173,8 +173,10 @@ class Frame:
                  if value is not None]
         if isinstance(needles, (str, bytes)):
             needles = [needles]
-        found = fuzzy.best([n for n in needles], texts, k, cutoff)
-        order = sorted(found, key=lambda row: -found[row])
+        found = fuzzy.best(list(needles), texts, k, cutoff)
+        # best first, and among equals the frame's own order: a tie between two
+        # exact matches is not a ranking, so it should not look like one
+        order = sorted(found, key=lambda row: (-found[row], row))
         data = frame._df[order].with_columns(
             pl.Series(frame._free("similarity"), [found[row] for row in order], dtype=pl.Float64))
         return frame._wrap(data)
@@ -289,7 +291,7 @@ class Frame:
         if isinstance(value, Signal):
             arrays = tuple(self._df[column].to_numpy() for column in value.columns)
             return pl.Series(name, value.values(self.graph, arrays), dtype=pl.Float64)
-        return expression(value) if isinstance(value, Col) else value
+        return _expr(value)
 
     def _var(self, variable=None):
         if variable is not None:
@@ -426,12 +428,22 @@ def concat(*frames, how="diagonal"):
     return Frame(frames[0].graph, data, variables)
 
 
+def _expr(item):
+    """A Col as the expression it stands for, and everything else untouched.
+
+    Only Col is translated on purpose. polars already reads a bare string as a
+    column name wherever these verbs take one, and reading it that way *here*
+    too would turn `filter(title="Alpha")` -- where the string is a value -- into
+    a comparison against a column called Alpha."""
+    return item.expr if isinstance(item, Col) else item
+
+
 def _exprs(items):
-    return [expression(item) for item in _flat(items)]
+    return [_expr(item) for item in _flat(items)]
 
 
 def _exprs_dict(named):
-    return {name: expression(value) for name, value in named.items()}
+    return {name: _expr(value) for name, value in named.items()}
 
 
 def _listed(thing):

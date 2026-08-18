@@ -12,11 +12,11 @@ needs no wrapper.
 
 Two words, deliberately kept apart:
 
-    score(query, rows)              the Strategy contract -- one float per result row
+    scores(graph, columns)          the Strategy contract -- one float per row
     plausibility(head, rel, tail)   this family's own quantity -- is this triple real?
 
-`score` stays the single scoring interface everything passed to `rank(...)`
-implements. `plausibility` is what a subclass defines, in three or four lines.
+`scores` stays the single scoring interface every strategy implements.
+`plausibility` is what a subclass defines, in three or four lines.
 """
 
 import numpy as np
@@ -38,8 +38,8 @@ class Translational(Strategy, nn.Module):
     seed would be. Two readings, chosen the way DiffusedMatrixFactorization
     chooses its own:
 
-        TransD.load(path, g, to=seeds)   the best plausibility against any seed
-        TransD.load(path, g)             each row against its own path seed
+        TransD.load(path, g, to=seeds).on("rec")     best against any seed
+        TransD.load(path, g).on("rec", "seed")       each row against its own
 
     `relation` picks the edge being judged. Left as None -- the default -- the
     score is the best over *every* relation in both directions, which is link
@@ -49,12 +49,7 @@ class Translational(Strategy, nn.Module):
     forwards. Naming one relation (with `reverse=` for its direction) asks the
     narrower question.
 
-    edge_weight is the same quantity on a single edge, which makes this family the
-    one place where guiding a Greedy engine is the model's own objective rather
-    than a proxy for it.
     """
-
-    supports_guidance = True
 
     name = None          # the key a checkpoint records
     tables = ()          # (name, space) pairs
@@ -185,6 +180,7 @@ class Translational(Strategy, nn.Module):
         clone = type(self)(factors=self.factors, to=to, relation=relation, reverse=reverse)
         clone._graph = self._graph
         clone.arrays = self.arrays               # shared, read-only
+        clone.weights = self.weights             # so a just-fitted model aims too
         clone.meta = self.meta
         clone.missing_nodes = self.missing_nodes
         clone.missing_relations = self.missing_relations
@@ -193,6 +189,13 @@ class Translational(Strategy, nn.Module):
     # --- the Strategy contract ------------------------------------------------
 
     def fit(self, graph):
+        if self.arrays is None and self.built:
+            # a model that has just been fitted still holds its weights as torch
+            # tables. Scoring reads them with an integer array, so they are read
+            # out once here -- the same arrays a checkpoint would have stored,
+            # which is what makes "train it, then rank with it" one step
+            self.arrays = {table: weights.weight.detach().cpu().numpy()
+                           for table, weights in self.weights.items()}
         known = [code for code in range(len(graph.relations))
                  if code not in self.missing_relations]
         if self.relation is None:               # any relation, either direction
@@ -200,9 +203,7 @@ class Translational(Strategy, nn.Module):
         else:
             code = graph.relation_code(self.relation)
             self._edges = () if code is None or code not in known else ((code, self.reverse),)
-        self._seeds = np.fromiter(
-            (i for i in (graph.lookup(s) for s in (self._to or ())) if i is not None),
-            dtype=np.int64)
+        self._seeds = graph.ids_of(self._to or ()).astype(np.int64)
 
     def _one(self, code, reverse, seed, candidate):
         relation = np.full(len(candidate), code, dtype=np.int64)
@@ -218,27 +219,18 @@ class Translational(Strategy, nn.Module):
             best = scored if best is None else np.maximum(best, scored)
         return best
 
-    def edge_weight(self, source, relation, target):
-        if not self._edges:
-            return 0.0
-        return float(self._against(np.array([source]), np.array([target]))[0])
+    def scores(self, graph, columns):
+        """on("rec") against the `to=` seeds, or on("rec", "seed") per row."""
+        candidates = np.asarray(columns[0], dtype=np.int64)
+        if not len(candidates) or not self._edges:
+            return np.zeros(len(candidates))
 
-    def score(self, query, rows):
-        if not rows or not self._edges:
-            return [0.0] * len(rows)
-        candidates = np.fromiter((row[query.primary_column] for row in rows),
-                                 dtype=np.int64, count=len(rows))
-
-        if len(self._seeds):                     # best plausibility against any seed
-            best = None
-            for seed in self._seeds:
-                against = self._against(np.full(len(candidates), seed), candidates)
-                best = against if best is None else np.maximum(best, against)
-            return best.tolist()
-
-        path_col = query.path_column
-        if path_col is None:
-            return [0.0] * len(rows)
-        seeds = np.fromiter((row[path_col][-1] for row in rows),
-                            dtype=np.int64, count=len(rows))
-        return self._against(seeds, candidates).tolist()
+        if len(columns) > 1:                     # each row against its own seed
+            return self._against(np.asarray(columns[1], dtype=np.int64), candidates)
+        if not len(self._seeds):
+            return np.zeros(len(candidates))
+        best = None                              # the best plausibility of any seed
+        for seed in self._seeds:
+            against = self._against(np.full(len(candidates), seed), candidates)
+            best = against if best is None else np.maximum(best, against)
+        return best

@@ -20,8 +20,8 @@ for the representation:
 
 Relations are directed and stored once, as a single edge-labeled CSR plus its
 transpose. Walking backwards reads the transpose instead of a separate `_r`
-relation, so there is no `rv` flag, no duplicated edges, and `Edge()` traverses
-both directions because both are always present.
+relation, so there is no `rv` flag, no duplicated edges, and a wildcard hop
+traverses both directions because both are always present.
 
 Every edge carries a weight, a float defaulting to 1.0 -- there is no such thing
 as an unweighted edge, only one whose weight nobody wrote down. That is why the
@@ -51,9 +51,10 @@ import os
 from itertools import chain
 
 import numpy as np
+import polars as pl
 import scipy.sparse as sp
 
-from .columns import build as build_column
+from .columns import Column, build as build_column
 from .frame import Frame, RELATION
 from .keys import Key
 
@@ -418,7 +419,7 @@ class Graph:
         """One edge-labeled CSR plus its transpose.
 
         Sorting each node's slice by relation is what makes both access patterns
-        cheap from a single store: a wildcard `Edge()` is the whole slice, and a
+        cheap from a single store: a wildcard hop is the whole slice, and a
         named relation is a searchsorted sub-range of it. Two arrays per
         direction, versus a dict of dicts of lists holding 2x the edges.
 
@@ -697,9 +698,15 @@ class Graph:
                            lambda: self._build_relation_matrix(relation, weights))
 
     def _build_relation_matrix(self, relation, weights):
-        code = self._relation_code.get(relation)
         sources = self.sources()
-        keep = slice(None) if code is None else (self.out_rels == code)
+        if relation is None:                       # every relation
+            keep = slice(None)
+        else:
+            code = self._relation_code.get(relation)
+            # a name the graph never saw matches nothing. Reading it as "all of
+            # them" is how a typo used to become the whole graph
+            keep = (self.out_rels == code) if code is not None \
+                else np.zeros(len(sources), dtype=bool)
         rows, cols = sources[keep], self.out_indices[keep]
         return sp.csr_matrix((self._edge_data(weights)[keep], (rows, cols)),
                              shape=(self.n_nodes, self.n_nodes))
@@ -754,22 +761,30 @@ class Graph:
                      {"node": None})
 
     def edges(self, relation=None, normalized=False):
-        """Every stored edge of one relation, as a frame of source and target.
+        """Every stored edge, or every edge of one relation, as a frame.
 
-        The CSR is already this table; this is the view of it, for the queries
-        that are about the edges themselves rather than about what they join."""
+        The CSR is already this table -- source, relation, target, weight -- so
+        this is a view of it rather than a copy of it. It is what a query about
+        the edges themselves asks, and what a training run is handed to say which
+        of them it may learn from.
+
+        The relation rides along as an Enum: dictionary-encoded, so naming it on
+        seventy million rows costs a byte each rather than a string each."""
         sources = self.sources()
-        data = {"source": sources, "target": self.out_indices,
-                "score": self.weights(normalized)[0]}
-        variables = {"source": None, "target": None}
-        if relation is None:
-            data[RELATION] = [self.relations[code] for code in self.out_rels.tolist()]
-            return Frame(self, data, variables)
-        code = self._relation_code.get(relation)
-        keep = np.zeros(len(sources), dtype=bool) if code is None else (self.out_rels == code)
-        return Frame(self, {name: column[keep] if isinstance(column, np.ndarray)
-                            else [value for value, take in zip(column, keep) if take]
-                            for name, column in data.items()}, variables)
+        keep = slice(None)
+        if relation is not None:
+            code = self._relation_code.get(relation)
+            keep = (np.zeros(len(sources), dtype=bool) if code is None
+                    else self.out_rels == code)
+        names = pl.Enum(self.relations) if self.relations else pl.String
+        data = pl.DataFrame({
+            "source": sources[keep],
+            RELATION: pl.Series([self.relations[code]
+                                 for code in self.out_rels[keep].tolist()], dtype=names),
+            "target": self.out_indices[keep],
+            "score": self.weights(normalized)[0][keep],
+        })
+        return Frame(self, data, {"source": None, "target": None})
 
     def ids_of(self, values):
         """A set of nodes as an int32 array, however it was named: Keys, source

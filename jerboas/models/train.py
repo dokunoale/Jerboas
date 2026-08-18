@@ -23,67 +23,52 @@ import time
 import numpy as np
 import torch
 
-from ..refs import Edge
+from ..frame import RELATION
 
 
-def triples(graph, keep=None):
-    """(head, relation, tail) as three parallel arrays, read off the CSR --
-    narrowed to `keep`, a boolean over stored edges, when there is one."""
-    heads = np.repeat(np.arange(graph.n_nodes), np.diff(graph.out_indptr))
-    rels, tails = np.asarray(graph.out_rels), np.asarray(graph.out_indices)
-    if keep is None:
-        return heads, rels, tails
-    return heads[keep], rels[keep], tails[keep]
 
+def examples(graph, where=None):
+    """The triples a run may learn from, as four parallel arrays.
 
-def admitted(graph, where):
-    """Which stored edges a run may read, from a list of `Edge` markers.
+    With no filter, every stored edge, read straight off the out-CSR -- the CSR
+    *is* the triple store, which is why this library has no dataloader.
 
-    A marker constrains *its own* relation and says nothing about the others:
-    `Edge("has_interact", score=(3, None))` drops the interactions not worth
-    learning from and leaves the knowledge graph untouched. One naming no
-    relation constrains every edge.
+    A filter is a frame of edges, because that is what a frame of edges is for:
 
-    Reuses the query's machinery rather than reimplementing it -- the same
-    `graph.admits` masks the engine walks by -- so a filter means the same thing
-    at training time as it does in a where()."""
-    markers = [where] if isinstance(where, Edge) else list(where or ())
-    if not markers:
-        return None
-    keep = np.ones(len(graph.out_indices), dtype=bool)
-    for marker in markers:
-        admits = None
-        for condition in marker.filters:               # Compare(EdgeScore, op, value)
-            mask = graph.admits(condition.op, condition.value, condition.left.normalized)[0]
-            admits = mask if admits is None else (admits & mask)
-        if admits is not None:
-            # an edge outside the marker's relation is not what it speaks about,
-            # so it passes rather than being judged by someone else's scale
-            keep &= admits | ~_scope(graph, marker.relations)
-    return keep
+        train(model, g, where=g.edges("has_interact").filter(v.score >= 3))
 
+    Below a rating of 3 the edge is noise and the model should not see it. Saying
+    it here rather than at load time answers the question for this run only, and
+    leaves the graph still able to say who rated a film at all -- and because the
+    filter is an ordinary frame, "which edges" is a question with a visible
+    answer rather than a marker object.
+    """
+    weights = graph.weights(normalized=True)[0]
+    if where is None:
+        heads = graph.sources()
+        return (heads.astype(np.int64), np.asarray(graph.out_rels),
+                np.asarray(graph.out_indices), weights)
 
-def _scope(graph, relations):
-    """The stored edges a marker is talking about: its relations, or all of them
-    when it names none."""
-    if not relations:
-        return np.ones(len(graph.out_rels), dtype=bool)
-    codes = [code for code in (graph.relation_code(name) for name in relations)
-             if code is not None]
-    return np.isin(graph.out_rels, codes)
+    frame = where.pl if hasattr(where, "pl") else where
+    heads = frame["source"].to_numpy().astype(np.int64)
+    tails = frame["target"].to_numpy().astype(np.int64)
+    codes = {name: code for code, name in enumerate(graph.relations)}
+    rels = np.asarray([codes[name] for name in frame[RELATION].to_list()], dtype=np.int64)
+    scores = frame["score"].to_numpy()
+    low, high = graph.weight_bounds()
+    span = high[rels] - low[rels]
+    scaled = np.where(span > 0, (scores - low[rels]) / np.where(span > 0, span, 1.0), 1.0)
+    return heads, np.asarray(rels), tails, scaled
 
 
 def _describe(where):
     """The filter as one line of provenance: six months on, a checkpoint should
     still say which edges it was allowed to see."""
-    markers = [where] if isinstance(where, Edge) else list(where or ())
-    parts = []
-    for marker in markers:
-        name = "|".join(marker.relations) or "*"
-        for condition in marker.filters:
-            scale = ".norm()" if condition.left.normalized else ""
-            parts.append(f"{name}.score{scale} {condition.op} {condition.value}")
-    return ", ".join(parts)
+    if where is None:
+        return ""
+    frame = where.pl if hasattr(where, "pl") else where
+    relations = sorted(set(frame[RELATION].to_list()))
+    return f"{len(frame)} edges of {', '.join(relations)}"
 
 
 def type_bounds(graph):
@@ -106,7 +91,7 @@ def train(model, graph, epochs=50, batch_size=4096, lr=0.01, device="cpu",
 
     Two ways to tell the run what an edge is worth, and they compose:
 
-        where=[Edge("has_interact", score=(3, None))]   # don't learn from these
+        where=g.edges("has_interact").filter(v.score >= 3)   # don't learn from these
         weighted=True                                    # learn less from weak ones
 
     `where` is the hard reading, and it is the one that used to live in the
@@ -117,15 +102,15 @@ def train(model, graph, epochs=50, batch_size=4096, lr=0.01, device="cpu",
     """
     if not model.built:
         model.build(graph)
+    model.arrays = None          # the fitted weights, not the ones read out before
     device = torch.device(device)
     model.to(device)
 
-    keep = admitted(graph, where)
-    head, relation, tail = triples(graph, keep)
+    head, relation, tail, weights = examples(graph, where)
     if len(head) == 0:
         raise ValueError("nothing to train on: the graph has no edges"
                          if where is None else
-                         f"nothing to train on: no edge satisfies {_describe(where)}")
+                         "nothing to train on: the filter frame is empty")
     low, high = type_bounds(graph)
 
     model.meta.update(epochs=epochs, batch_size=batch_size, lr=lr,
@@ -136,10 +121,8 @@ def train(model, graph, epochs=50, batch_size=4096, lr=0.01, device="cpu",
     head_t = torch.as_tensor(head, device=device)
     relation_t = torch.as_tensor(relation.astype(np.int64), device=device)
     tail_t = torch.as_tensor(tail.astype(np.int64), device=device)
-    # aligned with the triples above: both are the out-CSR read in its own order
-    weights = graph.weights(normalized=True)[0]
-    weight_t = (torch.as_tensor(weights if keep is None else weights[keep],
-                                device=device, dtype=torch.float32) if weighted else None)
+    weight_t = (torch.as_tensor(weights, device=device, dtype=torch.float32)
+                if weighted else None)
 
     rng = np.random.default_rng(seed)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)

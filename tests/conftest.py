@@ -92,4 +92,7 @@ def small_graph(tmp_path):
         kg=str(kg_path),
         edges=[str(interact_path)],
         attrs=[str(movie_path), str(person_path), str(genre_path)],
+        # which column a person reads, per type -- declared once with the data,
+        # because it is a fact about the dataset and not about any one query
+        readable={"movie": "title", "person": "name", "genre": "name"},
     )
