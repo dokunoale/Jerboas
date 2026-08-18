@@ -1,42 +1,54 @@
+"""Reading an edge file, and splitting it into train and test.
+
+An edge file is `source <TAB> target <TAB> score` under a header row, and the
+score travels with the pair through the split: the graph the benchmark trains on
+has to be the same shape as the one the library loads, weights included.
+"""
+
 import random
 from collections import defaultdict
 
+HEADER = ("source", "target", "score")
 
-def read_pairs(path):
-    pairs = []
+
+def read_edges(path):
+    """(source, target, score) rows; an absent score reads as 1, the weight of an
+    edge nobody scored."""
+    rows = []
     with open(path, "r") as f:
+        f.readline()                        # header
         for line in f:
             parts = line.rstrip("\n").split("\t")
             if len(parts) < 2:
                 continue
-            # la ui puo' avere una terza colonna (rating): viene ignorata
-            user, item = parts[0], parts[1]
-            pairs.append((user, item))
-    return pairs
+            score = parts[2] if len(parts) > 2 and parts[2] != "" else "1"
+            rows.append((parts[0], parts[1], score))
+    return rows
 
 
-def write_pairs(pairs, path):
+def write_edges(rows, path):
     with open(path, "w") as f:
-        for user, item in pairs:
-            f.write(f"{user}\t{item}\n")
+        f.write("\t".join(HEADER) + "\n")
+        for source, target, score in rows:
+            f.write(f"{source}\t{target}\t{score}\n")
 
 
-def train_test_split(pairs, test_ratio=0.2, seed=42):
+def train_test_split(rows, test_ratio=0.2, seed=42):
     rng = random.Random(seed)
 
-    by_user = defaultdict(list)
-    for user, song in pairs:
-        by_user[user].append(song)
+    by_source = defaultdict(list)
+    for source, target, score in rows:
+        by_source[source].append((target, score))
 
     train, test = [], []
-    for user, songs in by_user.items():
-        songs = songs[:]
-        rng.shuffle(songs)
+    for source, edges in by_source.items():
+        edges = edges[:]
+        rng.shuffle(edges)
 
-        n_test = round(len(songs) * test_ratio) if len(songs) > 1 else 0
-        test_songs, train_songs = songs[:n_test], songs[n_test:]
+        n_test = round(len(edges) * test_ratio) if len(edges) > 1 else 0
+        held_out, kept = edges[:n_test], edges[n_test:]
 
-        train += [(user, song) for song in train_songs]
-        test += [(user, song) for song in test_songs]
+        train += [(source, target, score) for target, score in kept]
+        test += [(source, target, score) for target, score in held_out]
 
     return train, test

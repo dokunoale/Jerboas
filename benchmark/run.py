@@ -1,12 +1,13 @@
 import os
 import sys
+import tempfile
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from jerboas import Graph, Node, Edge, Path, Has
 from jerboas.strategies import MatrixFactorization
-from benchmark.split import read_pairs, write_pairs, train_test_split
+from benchmark.split import read_edges, write_edges, train_test_split
 from benchmark.metrics import precision_at_k, recall_at_k, hit_rate_at_k, ndcg_at_k
 
 
@@ -31,20 +32,23 @@ def recommend_all(graph, k):
     return recommended_by_user
 
 
-def run(kg_path="data/movielens/ml.kg", ui_path="data/movielens/ml.ui", k=10, test_ratio=0.2, seed=42):
-    pairs = read_pairs(ui_path)
-    train, test = train_test_split(pairs, test_ratio=test_ratio, seed=seed)
-
-    train_path = "data/movielens/ml.ui_train"
-    write_pairs(train, train_path)
-
-    graph = Graph(kg=kg_path, ui=train_path)
+def run(kg_path="data/movielens/ml.kg", edges_path="data/movielens/ml.has_interact",
+        k=10, test_ratio=0.2, seed=42):
+    train, test = train_test_split(read_edges(edges_path), test_ratio=test_ratio, seed=seed)
 
     relevant_by_user = defaultdict(set)
-    for user, movie in test:
+    for user, movie, _score in test:
         relevant_by_user[user].add(movie)
 
-    recommended_by_user = recommend_all(graph, k)
+    # the training split is a temporary artifact of this run, not data: writing
+    # it next to the dataset would leave a file that looks like part of it and
+    # changes under whoever runs the benchmark next. The suffix still names the
+    # relation, because that is how the loader reads one.
+    with tempfile.TemporaryDirectory() as workdir:
+        train_path = os.path.join(workdir, "train.has_interact")
+        write_edges(train, train_path)
+        graph = Graph(kg=kg_path, edges=[train_path])
+        recommended_by_user = recommend_all(graph, k)
 
     scores = defaultdict(list)
     for user_name, relevant in relevant_by_user.items():

@@ -52,8 +52,9 @@ def _seed(spec, var):
 
 def _neighbors(graph, node, edge):
     """[(target, code)] for one pattern edge; a negative code marks a traversal
-    made against the stored direction."""
-    return graph.expand(node, edge.relation, edge.reverse)
+    made against the stored direction. `edge.admits`, when the query constrained
+    the edges' weights, is a mask the graph reads as a slice."""
+    return graph.expand(node, edge.relation, edge.reverse, edge.admits)
 
 
 class Default(Engine):

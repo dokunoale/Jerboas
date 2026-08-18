@@ -23,7 +23,8 @@ import numpy as np
 import torch
 from torch import nn
 
-from ..checkpoint import load as load_checkpoint, provenance, save as save_checkpoint
+from ..checkpoint import (IDENTITY, load as load_checkpoint, provenance,
+                          save as save_checkpoint)
 from ..core import Strategy
 
 NODE = "node"            # a table with one row per node
@@ -120,23 +121,37 @@ class Translational(Strategy, nn.Module):
             self.weights[table] = embedding
         return self
 
-    def loss(self, head, relation, tail, corrupt_head, corrupt_tail):
+    def loss(self, head, relation, tail, corrupt_head, corrupt_tail, weight=None):
         """Margin ranking: a real triple must outscore its corruption by `margin`.
 
         Corrupting the head and the tail are separate terms rather than one
         averaged example, so a relation is pushed to learn both of its
         directions -- which matters because the graph stores each edge once and
-        every relation is read in both."""
+        every relation is read in both.
+
+        `weight` scales each example by how much the edge is worth (its
+        normalized score), so a 5-star rating pushes harder than a 2-star one
+        and an edge weighing nothing contributes no gradient. That is the soft
+        reading of the threshold the loader used to apply: instead of deciding
+        once, for every query, that a poor edge is not an edge, the model is
+        simply told how much to believe it."""
         positive = self.plausibility(head, relation, tail)
-        return (torch.relu(self.margin - positive
-                           + self.plausibility(head, relation, corrupt_tail)).mean()
-                + torch.relu(self.margin - positive
-                             + self.plausibility(corrupt_head, relation, tail)).mean())
+        corrupted_tail = torch.relu(self.margin - positive
+                                    + self.plausibility(head, relation, corrupt_tail))
+        corrupted_head = torch.relu(self.margin - positive
+                                    + self.plausibility(corrupt_head, relation, tail))
+        if weight is None:
+            return corrupted_tail.mean() + corrupted_head.mean()
+        return (weight * corrupted_tail).mean() + (weight * corrupted_head).mean()
 
     # --- storage --------------------------------------------------------------
 
-    def save(self, path, **details):
-        """Write a checkpoint that can be rebound to any graph, by name."""
+    def save(self, path, alias=IDENTITY, **details):
+        """Write a checkpoint that can be rebound to any graph, by name.
+
+        `alias` is the attribute that identifies a node durably, for a graph
+        whose ids are its own numbering rather than the world's -- `alias="uri"`
+        on Spotify. It defaults to the id and is stored in the file."""
         if not self.built:
             raise ValueError("nothing to save: the model has not been built or fitted")
         arrays = {table: weights.weight.detach().cpu().numpy()
@@ -144,12 +159,14 @@ class Translational(Strategy, nn.Module):
         meta = provenance(self._graph, model=self.name, factors=self.factors,
                           margin=self.margin, seed=self.seed, **self.meta, **details)
         return save_checkpoint(path, self.name, self.tables, self.factors,
-                               self._graph, arrays, meta)
+                               self._graph, arrays, meta, alias=alias)
 
     @classmethod
-    def load(cls, path, graph, to=None, relation=None, reverse=False):
-        """Read a checkpoint back as a strategy ready for rank(...)."""
-        stored = load_checkpoint(path, graph, cls.name, cls.tables)
+    def load(cls, path, graph, to=None, relation=None, reverse=False, alias=None):
+        """Read a checkpoint back as a strategy ready for rank(...).
+
+        The alias comes off the file; pass one only to override it."""
+        stored = load_checkpoint(path, graph, cls.name, cls.tables, alias=alias)
         model = cls(factors=stored.factors, to=to, relation=relation, reverse=reverse)
         model._graph = graph
         model.arrays = stored.tensors

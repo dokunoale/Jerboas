@@ -3,11 +3,12 @@
 Public surface, grouped by the four object families (see core.py):
 
     references   Node, Edge, Path            -> select(...)
+                 Sum, Count, Mean, Min, Max  -> rank(...), over what matched
     conditions   Like, In, Has, Match,       -> where(...)
                  And, Or, Not
-    strategies   Score, Alphabetical, PageRank, Connectivity,   -> rank(...)
+    strategies   Score, Ascending, Descending, PageRank,        -> rank(...)
                  MatrixFactorization, DiffusedMatrixFactorization,
-                 TransD, TransE
+                 Weight, TransD, TransE
     engines      Default, Greedy             -> using(...)
 
 Plus Graph (the data + `select`), the values a query returns (Key, Rel), and the
@@ -37,16 +38,19 @@ def __getattr__(name):
 from .core import Ref, Expr, Condition, Strategy, Engine
 from .graph import Graph
 from .keys import Key, Rel
-from .refs import Node, Edge, Path, Attr, Degree
+from .refs import (Node, Edge, Path, Attr, Degree, EdgeScore,
+                   Sum, Count, Mean, Min, Max)
 from .conditions import Like, In, Has, Compare, Match, And, Or, Not
 from .strategies import (
     Score,
     ExprStrategy,
-    Alphabetical,
+    Ascending,
+    Descending,
     MatrixFactorization,
     DiffusedMatrixFactorization,
     Connectivity,
     PageRank,
+    Weight,
 )
 from .engine import Default, Greedy
 
@@ -58,12 +62,14 @@ __all__ = [
     # result values
     "Key", "Rel",
     # references
-    "Node", "Edge", "Path", "Attr", "Degree",
+    "Node", "Edge", "Path", "Attr", "Degree", "EdgeScore",
+    "Sum", "Count", "Mean", "Min", "Max",
     # conditions
     "Like", "In", "Has", "Compare", "Match", "And", "Or", "Not",
     # strategies
-    "Score", "ExprStrategy", "Alphabetical",
+    "Score", "ExprStrategy", "Ascending", "Descending",
     "MatrixFactorization", "DiffusedMatrixFactorization", "Connectivity", "PageRank",
+    "Weight",
     "TransD", "TransE",
     # engines
     "Default", "Greedy",

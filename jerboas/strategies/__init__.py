@@ -8,10 +8,11 @@ excludes.
 
 One module per family, because this is the family users extend most:
 
-    basic                  Score, ExprStrategy, Alphabetical
+    basic                  Score, ExprStrategy, Ascending, Descending
     matrix_factorization   MatrixFactorization, DiffusedMatrixFactorization
     connectivity           Connectivity
     pagerank               PageRank
+    weight                 Weight
 
 Nodes are integers throughout, which is what makes an embedding table a single
 (N, factors) array a strategy can index directly.
@@ -22,13 +23,14 @@ where it is a Strategy too -- fitted by an explicit batch job, then loaded from 
 checkpoint and passed to rank(...) like any other.
 """
 
-from .basic import Score, ExprStrategy, Alphabetical
+from .basic import Score, ExprStrategy, Ascending, Descending
 from .connectivity import Connectivity
 from .matrix_factorization import MatrixFactorization, DiffusedMatrixFactorization
 from .pagerank import PageRank
+from .weight import Weight
 
 __all__ = [
-    "Score", "ExprStrategy", "Alphabetical",
+    "Score", "ExprStrategy", "Ascending", "Descending",
     "MatrixFactorization", "DiffusedMatrixFactorization",
-    "Connectivity", "PageRank",
+    "Connectivity", "PageRank", "Weight",
 ]

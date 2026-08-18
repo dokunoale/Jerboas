@@ -23,17 +23,19 @@ ranking, grouping -- and become Key/Rel values only in _render, at the edge.
 """
 
 import heapq
+from collections.abc import Sequence
 
 import numpy as np
 
-from .core import Compiler, Strategy
+from .core import Compiler, Condition, Strategy
 from .conditions import Or
 from .keys import Rel
 from .columns import Column, column_mask
-from .refs import Node, Attr, Edge, Path, Degree, PathStep, PathStepAttr
+from .refs import (Node, Attr, Edge, Path, Degree, PathStep, PathStepAttr,
+                   EdgeScore, Aggregate, score_bounds)
 from .strategies import Score, ExprStrategy
 from .engine import Default
-from .ir import NodeSpec, EdgeSpec, Output, SearchSpec
+from .ir import NodeSpec, EdgeSpec, Output, SearchSpec, aliased
 
 
 def _projection_var(projection):
@@ -47,6 +49,20 @@ def _projection_var(projection):
     return None   # Score() and the like have no variable
 
 
+def _projection_name(projection):
+    """What to call a projection's column: the attribute, the node's type, or
+    what the object is when it has no name of its own."""
+    if isinstance(projection, (Attr, PathStepAttr)):
+        return projection.name
+    if isinstance(projection, Degree):
+        return f"{projection.relation or 'edge'}_count"
+    if isinstance(projection, Node):
+        return projection.type or "node"
+    if isinstance(projection, (Path, PathStep)):
+        return "path"
+    return type(projection).__name__.lower()
+
+
 class _Scope:
     """One ranking level: a (possibly empty) sequence of strategies and a limit."""
 
@@ -55,7 +71,7 @@ class _Scope:
         self.limit = None
 
 
-class Query:
+class Query(Sequence):
     def __init__(self, graph, *projections):
         self.graph = graph
         self.projections = projections
@@ -77,6 +93,14 @@ class Query:
             elif isinstance(var, Path) and self.path_column is None:
                 self.path_column = col
 
+        # what an aggregate groups by: the nodes that were selected. A Path is
+        # evidence of a match, not part of what was matched, so it must not
+        # split a group -- that is what lets a query rank by an aggregate and
+        # still hand back one walk per result to explain it with.
+        self._group_columns = tuple(col for col, var in enumerate(self.nodes)
+                                    if isinstance(var, Node)) or \
+            tuple(range(len(self.nodes)))
+
         self.conditions = []
         self.engine = Default()
         self.group_var = None
@@ -88,6 +112,7 @@ class Query:
         self._has_hidden = False
         self._antijoins = []
         self._paths = {}
+        self._aggregates = {}      # id(Aggregate) -> what to read per row
         self._results = None
 
     def _select_vars(self, projections):
@@ -102,6 +127,12 @@ class Query:
     # --- pipeline verbs ------------------------------------------------------
 
     def where(self, *conditions):
+        for condition in conditions:
+            if not isinstance(condition, Condition):
+                raise TypeError(
+                    f"where(...) takes Conditions, not {type(condition).__name__}: "
+                    f"{condition!r}. A comparison builds one (`node.year >= 1990`), "
+                    f"and `&`, `|`, `~` combine them.")
         self.conditions.extend(conditions)
         return self
 
@@ -132,13 +163,29 @@ class Query:
     def _as_strategy(s):
         return s if isinstance(s, Strategy) else ExprStrategy(s)
 
+    def group_key(self, row):
+        """The identity an aggregate folds a row into -- see _group_columns."""
+        return tuple(row[col] for col in self._group_columns)
+
+    def aggregates(self):
+        """The Aggregate expressions this query ranks by. They change three
+        things -- the rows carry their operand, nothing dedupes before they are
+        computed, and the result collapses after -- so the pipeline asks."""
+        return [s.expr for s in self._all_strategies()
+                if isinstance(s, ExprStrategy) and isinstance(s.expr, Aggregate)]
+
     def _soft_signals(self):
         """The 'soft where': any where-condition that is also a Strategy (a Like)
         contributes its graded membership as a ranking signal, on top of the
         widened crisp admission its compile() already emits."""
         return [c for c in self.conditions if isinstance(c, Strategy)]
 
-    # --- lazy result protocol ------------------------------------------------
+    # --- the result protocol -------------------------------------------------
+    #
+    # A Query is a Sequence, so `len`, `in`, `reversed`, `.index` and `.count`
+    # come from the ABC on top of the three methods below. Every one of them
+    # runs the query: it is lazy until something asks, and then it is a sequence
+    # like any other.
 
     def __iter__(self):
         return iter(self._ensure_run())
@@ -146,11 +193,40 @@ class Query:
     def __len__(self):
         return len(self._ensure_run())
 
-    def __getitem__(self, i):
-        return self._ensure_run()[i]
+    def __getitem__(self, index):
+        """`q[3]` indexes the results; `q[:5]` *is* `top(5)`.
+
+        Without that second reading the two spellings would look alike and cost
+        differently -- `top` limits the search, while slicing a computed list
+        would have ranked the whole graph first to throw most of it away."""
+        if isinstance(index, slice) and index.start in (0, None) and index.step is None:
+            if index.stop is not None:
+                self.top(index.stop)
+            return self._ensure_run()
+        return self._ensure_run()[index]
 
     def __repr__(self):
         return repr(self._ensure_run())
+
+    @property
+    def columns(self):
+        """A name per projection, for handing rows to something tabular:
+
+            pandas.DataFrame(query, columns=query.columns)
+        """
+        used, names = {}, []
+        for projection in self.projections:
+            name = _projection_name(projection)
+            used[name] = used.get(name, 0) + 1
+            names.append(name if used[name] == 1 else f"{name}_{used[name]}")
+        return names
+
+    def __array__(self, dtype=None, copy=None):
+        """`np.asarray(query)`. One projection gives a flat array -- the rows are
+        already bare values -- and several give one row per match. A column with
+        gaps stays `object`, because the alternative is inventing a value for
+        the nodes that have none."""
+        return np.array(self._ensure_run(), dtype=dtype)
 
     def _ensure_run(self):
         if self._results is None:
@@ -224,6 +300,7 @@ class Query:
         self._visible_count = compiler.visible_count
         self._has_hidden = compiler.has_hidden
         self._paths = compiler.paths
+        self._aggregates = compiler.aggregates
         return spec
 
     # --- post-search filters -------------------------------------------------
@@ -233,21 +310,24 @@ class Query:
             return rows
         graph = self.graph
         checks = []
-        for source, relations, target, reverse in self._antijoins:
+        for source, relations, target, reverse, admits in self._antijoins:
             codes = [graph.relation_code(r) for r in relations] or [None]
-            checks.append((self._columns[id(source)], self._columns[id(target)], codes, reverse))
+            checks.append((self._columns[id(source)], self._columns[id(target)],
+                           codes, reverse, admits))
         kept = []
         for row in rows:
-            for src_col, tgt_col, codes, reverse in checks:
+            for src_col, tgt_col, codes, reverse, admits in checks:
                 source, target = row[src_col], row[tgt_col]
-                if any(graph.has_edge(source, target, code, reverse) for code in codes):
+                if any(graph.has_edge(source, target, code, reverse, admits) for code in codes):
                     break                       # anti-join: the edge must NOT exist
             else:
                 kept.append(row)
         return kept
 
     def _dedupe_hidden(self, rows):
-        if not self._has_hidden:
+        # an aggregate is computed *from* the duplicates -- one row per match is
+        # the whole input -- so it does its own collapsing, after scoring
+        if not self._has_hidden or self.aggregates():
             return rows
         seen = {}
         for row in rows:
@@ -298,6 +378,10 @@ class Query:
             scores = self._combine_scores(rank, rows)
             for row, score in zip(rows, scores):
                 self._row_scores[row] = score
+            if self.aggregates():
+                # every row of a group holds the group's score by now, so which
+                # one survives is arbitrary -- but that it is one is not
+                rows, scores = _collapse(self, rows, scores)
             rows = [row for _, row in sorted(zip(scores, rows), key=lambda x: x[0], reverse=True)]
         if limit is not None:
             rows = rows[:limit]
@@ -346,7 +430,13 @@ class Query:
             return lambda row: self._row_scores.get(row, 0.0)
         if isinstance(projection, Attr):
             col, name = self._columns[id(projection.node)], projection.name
-            return lambda row: graph.value(row[col], name)
+            aliases = getattr(projection.node, "_aliases", None)
+            if not aliases:
+                return lambda row: graph.value(row[col], name)
+            # resolved per row, because an untyped variable may alias the name
+            # differently for each type it binds to
+            return lambda row: graph.value(
+                row[col], aliased(aliases, name, graph.type_of(row[col])))
         if isinstance(projection, Degree):
             col = self._columns[id(projection.node)]
             degrees = graph.degree(projection.relation, projection.reverse)
@@ -368,6 +458,26 @@ class Query:
         raise TypeError(f"unsupported projection: {projection!r}")
 
 
+def _collapse(query, rows, scores):
+    """One row per group, keeping its score. What an aggregate means by
+    grouping: you selected the nodes, so those are the groups."""
+    kept = {}
+    for row, score in zip(rows, scores):
+        kept.setdefault(query.group_key(row), (row, score))
+    pairs = list(kept.values())
+    return [row for row, _ in pairs], [score for _, score in pairs]
+
+
+def _intersect(one, other):
+    """Two edge admission pairs, ANDed. Either may be absent, which reads as
+    'admits everything' rather than 'admits nothing'."""
+    if one is None:
+        return other
+    if other is None:
+        return one
+    return one[0] & other[0], one[1] & other[1]
+
+
 def _rel(graph, code):
     """A relation code back into a named, directed Rel. Reverse traversals are
     stored as ~code, so one integer carries both the relation and its direction."""
@@ -376,17 +486,24 @@ def _rel(graph, code):
     return Rel(graph.relations[~code], True) if code < 0 else Rel(graph.relations[code], False)
 
 
-def _closest(needle, texts, k, cutoff, closeness):
+def _closest(needle, texts, k, cutoff, scorer):
     """The k rows closest to one needle.
 
     A needle that is literally present is already as close as anything can be, so
     the expensive comparison only runs when plain containment cannot fill k --
     which is the difference between a millisecond and a fifth of a second on a
-    column of twelve thousand names."""
-    contained = [local for local, text in texts if needle and needle in text]
+    column of twelve thousand names. `scorer` is the Condition's own measure,
+    prepared for this needle."""
+    # shortest first: "alien" is contained in Alien, Aliens, Alien 3 and Alien:
+    # Resurrection, and the one that adds least is the one that was meant. Taking
+    # them in column order instead let an exact match lose to whatever loaded
+    # first, which is a coin toss wearing the shape of a search result.
+    contained = sorted((len(text), local) for local, text in texts
+                       if needle and needle in text)
     if len(contained) >= k:
-        return contained[:k]
-    scored = ((closeness(needle, text), local) for local, text in texts)
+        return [local for _length, local in contained[:k]]
+    close = scorer(needle, cutoff)
+    scored = ((close(text), local) for local, text in texts)
     return [local for score, local in heapq.nlargest(k, scored) if score >= cutoff]
 
 
@@ -409,9 +526,13 @@ class _Compiler(Compiler):
         self._node_of = {}        # var -> Node, for diagnostics only
         self._counter = 0
         self._negate = negate
+        self._edge_specs = {}     # id(Edge marker) -> [EdgeSpec] it produced
+        self._edge_preds = {}     # id(Edge marker) -> [(op, value, normalized, negate)]
+        self._edge_markers = {}   # id(Edge marker) -> the marker, for diagnostics
         # results the Query reads back after build()
         self.columns = dict(query._columns)   # id(ref) -> column (seed with visible)
-        self.antijoins = []                   # [(source Node, relations, target Node, reverse)]
+        self.antijoins = []                   # [(source, relations, target, reverse, admits)]
+        self.aggregates = {}                  # id(Aggregate) -> what to read per row
         self.paths = {}                       # id(Path) -> (seq vars, [EdgeSpec])
         self.visible_count = len(query.nodes)
         self.has_hidden = False
@@ -428,11 +549,16 @@ class _Compiler(Compiler):
         # pass 2: each condition describes itself
         for condition in conditions:
             condition.compile(self)
-        # pass 3: antijoin endpoints not selected become hidden columns so the
-        # post-search filter can read them
-        for source, _relations, target, _reverse in self.antijoins:
+        # pass 3: weight predicates land on their pattern edge. Deferred because
+        # `watched.score >= 3` may be written before the pattern that introduces
+        # `watched`, and a where() clause has no order of its own
+        self._apply_edge_predicates()
+        # pass 4: what an anti-join or an aggregate needs to read becomes a
+        # hidden column -- the search has it bound, the row just has to carry it
+        for source, _relations, target, _reverse, _admits in self.antijoins:
             for node in (source, target):
                 self._ensure_column(node)
+        self._plan_aggregates()
         self._reject_disconnected()
         return SearchSpec(self._nodes, self._edges, self._build_outputs())
 
@@ -467,7 +593,7 @@ class _Compiler(Compiler):
             joined.setdefault(other, set()).add(one)
         for edge in self._edges:
             link(edge.source, edge.target)
-        for source, _relations, target, _reverse in self.antijoins:
+        for source, _relations, target, _reverse, _admits in self.antijoins:
             # an anti-join is a join too: it constrains a pair, so an endpoint
             # reached only this way is connected, not orphaned
             link(self.var(source), self.var(target))
@@ -498,6 +624,13 @@ class _Compiler(Compiler):
     # -- Compiler surface the Condition family calls --
 
     def constrain(self, expr, op, value):
+        if isinstance(expr, EdgeScore):
+            # not a node predicate at all: it says which stored edges a pattern
+            # edge may cross. Held until every edge exists (see build, pass 3)
+            self._edge_markers[id(expr.edge)] = expr.edge
+            self._edge_preds.setdefault(id(expr.edge), []).append(
+                (op, value, expr.normalized, self._negate))
+            return
         if isinstance(expr, Degree):
             spec = self.spec(expr.node)
             degrees = self.graph.degree(expr.relation, expr.reverse)
@@ -519,13 +652,13 @@ class _Compiler(Compiler):
         spec = self.spec(ref.node)                 # attribute membership
         self._restrict(spec, self._attr_mask(spec, ref.name, "in", set(values)))
 
-    def best_match(self, ref, needles, k, cutoff, closeness):
+    def best_match(self, ref, needles, k, cutoff, scorer):
         """The k stored values closest to each needle, and nothing else.
 
         Softening a set of strings used to widen it into a substring test, which
         failed in both directions: a typo admitted nothing, and the empty string
         admitted the whole column. Someone typing a name wants the value they
-        meant, so that is what is admitted -- `closeness` is the Condition's own
+        meant, so that is what is admitted -- `scorer` is the Condition's own
         measure, passed in rather than reinvented here, and `cutoff` is where a
         match stops being one."""
         graph = self.graph
@@ -533,27 +666,33 @@ class _Compiler(Compiler):
         mask = np.zeros(graph.n_nodes, dtype=bool)
         types = [spec.type] if spec.type is not None else graph.types
         for type_ in types:
-            column = graph.column(type_, ref.name)
+            column = graph.column(type_, spec.column(ref.name, type_))
             if column is None or column.values.dtype != object:
                 continue                         # only text is matched this way
             low, _high = graph.block(type_)
             texts = [(local, str(column.get(local)).lower())
                      for local in range(len(column)) if column.get(local) is not None]
             for needle in needles:
-                for local in _closest(str(needle).lower(), texts, k, cutoff, closeness):
+                for local in _closest(str(needle).lower(), texts, k, cutoff, scorer):
                     mask[low + local] = True
         self._restrict(spec, mask)
 
-    def edge(self, source, relation, target, reverse=False):
+    def edge(self, source, relation, target, reverse=False, score=None, marker=None):
         relations = self._relation_tuple(relation)
+        # the kwarg narrows *which* edge is looked for, so it is not what a
+        # surrounding Not negates: ~Has(..., score=(3, None)) asks for the
+        # absence of a highly rated edge, not for the presence of a poor one
+        admits = self._admits([(op, value, False, False) for op, value in score_bounds(score)])
         if self._negate:                           # anti-join: applied after the search
-            self.antijoins.append((source, relations, target, reverse))
+            self.antijoins.append((source, relations, target, reverse, admits))
             self.spec(source); self.spec(target)
             return
         self.spec(source); self.spec(target)
         name = relations[0] if len(relations) == 1 else None   # single relation or wildcard
-        self._edges.append(EdgeSpec(self.var(source), self._code(name),
-                                    self.var(target), self._direction(name, reverse)))
+        spec = EdgeSpec(self.var(source), self._code(name), self.var(target),
+                        self._direction(name, reverse), admits)
+        self._edges.append(spec)
+        self._register_edge(marker, spec)
 
     def path(self, path_ref, pattern):
         items = self._normalize_pattern(pattern)
@@ -563,11 +702,12 @@ class _Compiler(Compiler):
                 self._bind_node(item)
         path_edges = []
         for i in range(0, len(items) - 2, 2):
-            source, edge, target = items[i], items[i + 1], items[i + 2]
-            code, reverse = self._edge_relation(edge)
+            source, marker, target = items[i], items[i + 1], items[i + 2]
+            code, reverse = self._edge_relation(marker)
             spec = EdgeSpec(self.var(source), code, self.var(target), reverse)
             self._edges.append(spec)
             path_edges.append(spec)
+            self._register_edge(marker, spec)
         self.paths[id(path_ref)] = (seq, path_edges)
 
     def schema(self):
@@ -594,7 +734,7 @@ class _Compiler(Compiler):
         mask = np.zeros(graph.n_nodes, dtype=bool)
         types = [spec.type] if spec.type is not None else graph.types
         for type_ in types:
-            column = graph.column(type_, name)
+            column = graph.column(type_, spec.column(name, type_))
             if column is None:
                 continue
             low, high = graph.block(type_)
@@ -630,6 +770,88 @@ class _Compiler(Compiler):
             return True
         return False if name is not None else None
 
+    # -- edge weights: a predicate on a score, as a mask over stored edges --
+
+    def _register_edge(self, marker, spec):
+        """Remember which EdgeSpec an `Edge` marker produced, so a condition
+        naming that marker knows what to constrain -- the edge-level counterpart
+        of `var()` for Nodes. Also expands the marker's own `score=` sugar, once
+        however many pattern edges it ends up in."""
+        if not isinstance(marker, Edge):
+            return
+        key = id(marker)
+        first = key not in self._edge_specs
+        self._edge_specs.setdefault(key, []).append(spec)
+        self._edge_markers[key] = marker
+        if first:
+            for condition in marker.filters:
+                condition.compile(self)
+
+    def _apply_edge_predicates(self):
+        for key, predicates in self._edge_preds.items():
+            specs = self._edge_specs.get(key)
+            if not specs:
+                raise ValueError(
+                    "an Edge is constrained by score but never appears in a pattern, "
+                    "so nothing would be filtered. Two identical-looking Edges are two "
+                    "different markers: reuse the same object in the path pattern and "
+                    "in where()."
+                )
+            admits = self._admits(predicates)
+            for spec in specs:
+                spec.admits = _intersect(spec.admits, admits)
+
+    # -- aggregates: what a rank(Sum(...)) needs the rows to carry --
+
+    def _plan_aggregates(self):
+        """Give every aggregate the columns it will read, and record how.
+
+        An aggregate is evaluated from the bindings, not from the graph: the
+        weight of a matched edge comes from its two endpoints, both of which are
+        pattern variables the search already binds. So there is nothing to add
+        to the engine -- only a column to carry, which is the mechanism an
+        anti-join endpoint already uses."""
+        for aggregate in self.query.aggregates():
+            over = aggregate.over
+            if isinstance(over, EdgeScore):
+                self.aggregates[id(aggregate)] = self._edge_plan(aggregate, over)
+            elif isinstance(over, Node):
+                if aggregate.how != "count":
+                    raise TypeError(
+                        f"{type(aggregate).__name__} needs a number; a Node has only "
+                        f"identity, so Count is the one aggregate it takes")
+                self._ensure_column(over)
+                self.aggregates[id(aggregate)] = ("node", over)
+            else:
+                raise TypeError(f"cannot aggregate over {over!r}: "
+                                f"expected an edge's score or a Node of the pattern")
+
+    def _edge_plan(self, aggregate, score):
+        specs = self._edge_specs.get(id(score.edge))
+        if not specs:
+            raise ValueError(
+                f"{type(aggregate).__name__} names an Edge that never appears in a "
+                f"pattern, so there is nothing to aggregate. Two identical-looking "
+                f"Edges are two different markers -- and `.inverse` makes a third: "
+                f"name the one the pattern walks and reuse it here.")
+        spec = specs[0]
+        source, target = self._node_of[spec.source], self._node_of[spec.target]
+        self._ensure_column(source)
+        self._ensure_column(target)
+        return ("edge", source, target, spec.relation, spec.reverse, score.normalized)
+
+    def _admits(self, predicates):
+        """Several weight predicates as one (out, in) admission pair.
+
+        Each is evaluated once against every stored edge -- the same move the
+        node masks make, for the same reason: the alternative is re-deciding it
+        per traversal, inside the walk."""
+        admits = None
+        for op, value, normalized, negate in predicates:
+            mask = self.graph.admits(op, value, normalized)
+            admits = _intersect(admits, (~mask[0], ~mask[1]) if negate else mask)
+        return admits
+
     # -- internals --
 
     def _fresh(self):
@@ -649,7 +871,8 @@ class _Compiler(Compiler):
         var = self.var(node)
         spec = self._nodes.get(var)
         if spec is None:
-            spec = NodeSpec(var, type=node.type, mask=self._type_mask(node.type))
+            spec = NodeSpec(var, type=node.type, mask=self._type_mask(node.type),
+                            aliases=getattr(node, "_aliases", None))
             self._nodes[var] = spec
             for name, value in getattr(node, "attrs", {}).items():   # Node(**attrs) sugar
                 spec.mask &= self._attr_mask(spec, name, "eq", value)

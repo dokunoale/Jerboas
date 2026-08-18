@@ -142,12 +142,82 @@ def test_rebinds_nodes_by_name_not_position(small_graph, fitted, tmp_path, graph
     there = type(model).load(path, shuffled)
     assert there.missing_nodes == []
 
-    keys = ["movie.1", "movie.3", "person.2", "genre.1", "user.1"]
+    keys = ["movie.0", "movie.2", "person.1", "genre.0", "user.0"]
     assert [k for k in keys if small_graph.lookup(k) != shuffled.lookup(k)], \
         "the two graphs agree on every id; this test would prove nothing"
     for key in keys:
         a, b = small_graph.lookup(key), shuffled.lookup(key)
         assert np.allclose(here.arrays["entity"][a], there.arrays["entity"][b]), key
+
+
+def _renumbered(tmp_path, name, uris):
+    """A graph whose movies carry `uris`, in order, at positions 0..n-1.
+
+    The point of an alias: an id is a position, so the same entity sits
+    somewhere else in a build made from more of the source, and only an
+    attribute survives that."""
+    kg = tmp_path / f"{name}.kg"
+    kg.write_text("".join(f"movie.{i}\tdirected_by\tperson.0\n"
+                          for i in range(len(uris))))
+    attrs = tmp_path / f"{name}.movie"
+    attrs.write_text("id\turi\ttitle\n"
+                     + "".join(f"{i}\t{uri}\t{uri[4:]}\n" for i, uri in enumerate(uris)))
+    return Graph(kg=str(kg), attrs=[str(attrs)])
+
+
+ALPHA, BETA = "urn:alpha", "urn:beta"
+
+
+def test_an_alias_rebinds_where_the_ids_have_moved(tmp_path):
+    """`alias="uri"` keys the checkpoint on an attribute, so a graph that put
+    the same entity in a different place still gets its own weights."""
+    here = _renumbered(tmp_path, "a", [ALPHA])
+    model = train(MODELS["transd"](factors=4, seed=1), here,
+                  epochs=1, batch_size=2, device="cpu", report=None)
+    path = str(tmp_path / "alias.npz")
+    model.save(path, alias="uri")
+
+    there = _renumbered(tmp_path, "b", [BETA, ALPHA])        # alpha moved to 1
+    alpha_here, alpha_there = here.lookup("movie.0"), there.lookup("movie.1")
+    assert alpha_here != alpha_there, "alpha did not move; this would prove nothing"
+
+    loaded, rebound = type(model).load(path, here), type(model).load(path, there)
+    assert np.allclose(loaded.arrays["entity"][alpha_here],
+                       rebound.arrays["entity"][alpha_there])
+    assert alpha_there not in rebound.missing_nodes
+    assert there.lookup("movie.0") in rebound.missing_nodes   # beta was never trained
+
+
+def test_without_the_alias_the_moved_node_is_simply_unknown(tmp_path):
+    """The failure has to be visible: keyed on the position, the entity that
+    moved is reported missing rather than quietly given somebody else's row --
+    which is what makes the alias the portable way to store a checkpoint."""
+    here = _renumbered(tmp_path, "c", [ALPHA])
+    model = train(MODELS["transd"](factors=4, seed=1), here,
+                  epochs=1, batch_size=2, device="cpu", report=None)
+    path = str(tmp_path / "plain.npz")
+    model.save(path)                                  # alias defaults to the id
+
+    there = _renumbered(tmp_path, "d", [BETA, ALPHA])
+    rebound = type(model).load(path, there)
+    moved = there.lookup("movie.1")
+    assert moved in rebound.missing_nodes
+    assert np.allclose(rebound.arrays["entity"][moved], 0.0)
+
+
+def test_an_older_checkpoint_reads_as_keyed_on_the_id(small_graph, fitted, tmp_path):
+    """Format 2 is format 3 without `alias`, so the files already on disk keep
+    loading and keep meaning what they meant."""
+    model, path = fitted
+    with np.load(path, allow_pickle=False) as data:
+        payload = {key: data[key] for key in data.files if key != "alias"}
+    payload["format"] = np.asarray(2)
+    older = str(tmp_path / "v2.npz")
+    np.savez_compressed(older, **payload)
+
+    new, old = type(model).load(path, small_graph), type(model).load(older, small_graph)
+    assert old.missing_nodes == []
+    assert np.allclose(new.arrays["entity"], old.arrays["entity"])
 
 
 def test_rebinds_relations_by_name(small_graph, fitted, tmp_path, graph_rows):
@@ -165,12 +235,15 @@ def test_rebinds_relations_by_name(small_graph, fitted, tmp_path, graph_rows):
 
 
 def test_reports_nodes_it_never_saw(fitted, tmp_path):
+    """A fourth film, where the fixture had three: an id past the end of what
+    was trained is the shape "the checkpoint has never met this node" takes once
+    ids are positions."""
     model, path = fitted
     extra = tmp_path / "c.kg"
-    extra.write_text("movie.99\tdirected_by\tperson.1\n")
+    extra.write_text("".join(f"movie.{i}\tdirected_by\tperson.0\n" for i in range(4)))
     bigger = Graph(kg=str(extra))
     rebound = type(model).load(path, bigger)
-    unseen = bigger.lookup("movie.99")
+    unseen = bigger.lookup("movie.3")
     assert unseen in rebound.missing_nodes
     assert np.allclose(rebound.arrays["entity"][unseen], 0.0)
 
@@ -178,7 +251,7 @@ def test_reports_nodes_it_never_saw(fitted, tmp_path):
 def test_reports_relations_it_never_saw(fitted, tmp_path):
     model, path = fitted
     extra = tmp_path / "d.kg"
-    extra.write_text("movie.1\tinspired_by\tmovie.2\n")
+    extra.write_text("movie.0\tinspired_by\tmovie.1\n")
     other = Graph(kg=str(extra))
     rebound = type(model).load(path, other)
     assert other.relation_code("inspired_by") in rebound.missing_relations
@@ -212,7 +285,7 @@ def test_ranks_without_a_wrapper(small_graph, fitted):
     model, path = fitted
     movie = Node("movie")
     rows = list(small_graph.select(movie, Score())
-                .rank(type(model).load(path, small_graph, to={"user.1"})).top(3))
+                .rank(type(model).load(path, small_graph, to={"user.0"})).top(3))
     scores = [s for _, s in rows]
     assert len(rows) == 3 and scores == sorted(scores, reverse=True)
 
@@ -223,16 +296,16 @@ def test_can_score_a_relation_backwards(small_graph, fitted):
     model, path = fitted
     movie = Node("movie")
     forward = [s for _, s in small_graph.select(movie, Score()).rank(
-        type(model).load(path, small_graph, to={"person.1"}, relation="directed_by"))]
+        type(model).load(path, small_graph, to={"person.0"}, relation="directed_by"))]
     reverse = [s for _, s in small_graph.select(movie, Score()).rank(
-        type(model).load(path, small_graph, to={"person.1"},
+        type(model).load(path, small_graph, to={"person.0"},
                          relation="directed_by", reverse=True))]
     assert forward != reverse
 
 
 def test_guides_greedy(small_graph, fitted):
     model, path = fitted
-    strategy = type(model).load(path, small_graph, to={"user.1"})
+    strategy = type(model).load(path, small_graph, to={"user.0"})
     user, movie = Node("user"), Node("movie")
     rows = list(small_graph.select(user, movie)
                 .where(Has(user, "has_interact", movie))
@@ -244,7 +317,7 @@ def test_is_silent_about_an_unknown_relation(small_graph, fitted):
     model, path = fitted
     movie = Node("movie")
     rows = list(small_graph.select(movie, Score())
-                .rank(type(model).load(path, small_graph, to={"user.1"},
+                .rank(type(model).load(path, small_graph, to={"user.0"},
                                        relation="no_such_relation")))
     assert all(s == 0.0 for _, s in rows)
 
@@ -272,7 +345,7 @@ def test_any_relation_finds_each_seed_type_its_own_edge(small_graph, fitted):
     has_interact forwards. Neither is named, and both still rank."""
     model, path = fitted
     movie = Node("movie")
-    for seed in ({"person.1"}, {"user.1"}, {"genre.1"}):
+    for seed in ({"person.0"}, {"user.0"}, {"genre.0"}):
         rows = list(small_graph.select(movie, Score())
                     .rank(model.__class__.load(path, small_graph, to=seed)).top(3))
         assert len(rows) == 3
@@ -286,19 +359,19 @@ def test_seeded_shares_the_weights(small_graph, fitted):
     graph, so it must not happen again."""
     model, path = fitted
     loaded = model.__class__.load(path, small_graph)
-    aimed = loaded.seeded({"user.1"})
+    aimed = loaded.seeded({"user.0"})
     for table, _space in model.tables:
         assert aimed.arrays[table] is loaded.arrays[table]
-    assert aimed._to == {"user.1"} and loaded._to is None
+    assert aimed._to == {"user.0"} and loaded._to is None
 
 
 def test_seeded_ranks_the_same_as_a_fresh_load(small_graph, fitted):
     model, path = fitted
     movie = Node("movie")
     fresh = list(small_graph.select(movie, Score())
-                 .rank(model.__class__.load(path, small_graph, to={"user.1"})))
+                 .rank(model.__class__.load(path, small_graph, to={"user.0"})))
     reused = list(small_graph.select(movie, Score())
-                  .rank(model.__class__.load(path, small_graph).seeded({"user.1"})))
+                  .rank(model.__class__.load(path, small_graph).seeded({"user.0"})))
     assert [str(k) for k, _ in fresh] == [str(k) for k, _ in reused]
     assert np.allclose([s for _, s in fresh], [s for _, s in reused])
 
@@ -338,7 +411,86 @@ def _rebuild(tmp_path, rows):
 
     return Graph(
         kg=write("r.kg", list(reversed(rows["kg"]))),
-        ui=write("r.ui", list(reversed(rows["ui"]))),
+        edges=[write("r.has_interact",
+                     [("source", "target", "score")] + list(reversed(rows["has_interact"])))],
         attrs=[write("r.genre", rows["genre"]), write("r.person", rows["person"]),
                write("r.movie", rows["movie"])],
     )
+
+
+# --- edge weights ------------------------------------------------------------
+
+def test_training_weights_each_example_by_its_edge(small_graph):
+    """The weighted run is a different fit, not the same one relabelled -- which
+    is the whole claim of moving the score filter out of the loader."""
+    from jerboas.models import TransE
+
+    def fit(weighted):
+        return train(TransE(factors=4, seed=1), small_graph, epochs=3, batch_size=8,
+                     device="cpu", weighted=weighted, report=None
+                     ).weights["entity"].weight.detach().numpy().copy()
+
+    assert not np.allclose(fit(True), fit(False))
+
+
+def test_weighting_is_inert_on_an_unweighted_graph(tmp_path):
+    from jerboas.models import TransE
+
+    kg = tmp_path / "u.kg"
+    kg.write_text("movie.0\tdirected_by\tperson.0\nmovie.1\tdirected_by\tperson.1\n")
+    graph = Graph(kg=str(kg))
+
+    def fit(weighted):
+        return train(TransE(factors=4, seed=1), graph, epochs=3, batch_size=8,
+                     device="cpu", weighted=weighted, report=None
+                     ).weights["entity"].weight.detach().numpy().copy()
+
+    # every weight is 1.0, so weighting by it is multiplying by one
+    assert np.allclose(fit(True), fit(False))
+
+
+def test_where_narrows_what_a_run_learns_from(small_graph):
+    """The threshold that used to live in the loader, as an argument to the fit:
+    the graph still holds the 1-star interaction, this run just never sees it."""
+    from jerboas import Edge
+    from jerboas.models.train import admitted, triples
+
+    keep = admitted(small_graph, [Edge("has_interact", score=(3, None))])
+    _head, relation, _tail = triples(small_graph, keep)
+    kept = [small_graph.relations[code] for code in relation]
+
+    assert kept.count("has_interact") == 4          # 5, 4, 3, 5 -- not the 1 or the 2
+    assert kept.count("has_genre") == 3             # unscored relations are untouched
+    assert len(triples(small_graph)[0]) == len(kept) + 2
+
+
+def test_a_marker_naming_no_relation_constrains_every_edge(small_graph):
+    from jerboas import Edge
+    from jerboas.models.train import admitted
+
+    keep = admitted(small_graph, [Edge(score=(3, None))])
+    relations = {small_graph.relations[c] for c in small_graph.out_rels[keep]}
+    assert relations == {"has_interact"}            # everything unscored weighs 1
+
+
+def test_the_filter_is_recorded_in_the_checkpoint(small_graph, tmp_path):
+    from jerboas import Edge
+    from jerboas.models import TransE
+
+    model = train(TransE(factors=4, seed=1), small_graph, epochs=1, batch_size=8,
+                  device="cpu", where=[Edge("has_interact", score=(3, None))], report=None)
+    assert model.meta["trained_on"] == "has_interact.score ge 3"
+    assert model.meta["trained_edges"] == 10        # 6 in the kg, 4 interactions left
+
+    path = str(tmp_path / "w.npz")
+    model.save(path)
+    assert TransE.load(path, small_graph).meta["trained_on"] == "has_interact.score ge 3"
+
+
+def test_a_filter_that_admits_nothing_says_so(small_graph):
+    from jerboas import Edge
+    from jerboas.models import TransE
+
+    with pytest.raises(ValueError, match="no edge satisfies"):
+        train(TransE(factors=4), small_graph, epochs=1,
+              where=[Edge(score=(99, None))], report=None)

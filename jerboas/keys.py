@@ -12,7 +12,10 @@ strategy can write `embeddings[key]` with no conversion -- while printing and
 comparing on its own terms.
 """
 
+from functools import total_ordering
 
+
+@total_ordering
 class Key:
     """One node, as returned by a query: `movie.123`.
 
@@ -38,7 +41,8 @@ class Key:
 
     @property
     def label(self):
-        """The type's label column (name/title/...), falling back to str(self)."""
+        """What identifies this node outside the graph: the id its source used
+        under `renumber`, and its position otherwise."""
         return self._graph.label_of(self._index)
 
     @property
@@ -74,6 +78,17 @@ class Key:
         # int.__format__ would win for an int subclass; here the only risk is an
         # empty spec silently falling back to object.__format__, so be explicit
         return format(str(self), spec)
+
+    def __reduce__(self):
+        """A Key holds its graph so a caller can read a label off it, which the
+        default pickling would then serialise -- 4.6 MB for one MovieLens node,
+        gigabytes for one Spotify song. It is a *reference into* a graph, and a
+        reference is meaningless without the thing it points at, so it refuses
+        rather than quietly copying one. `str(key)` is what travels."""
+        raise TypeError(
+            f"{self} cannot be pickled: a Key points into a Graph, and pickling "
+            f"it would carry the whole graph along. Send str(key) and resolve it "
+            f"with graph[...] on the other side.")
 
 
 class Rel:

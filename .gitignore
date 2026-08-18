@@ -10,7 +10,7 @@ venv/
 # MovieLens may not be redistributed: "The user may not redistribute the data
 # without separate permission" (GroupLens usage licence), and the IMDb-derived
 # files are non-commercial-use only. data/example/ is synthetic and ships.
-data/movielens/
+data/
 
 # trained model checkpoints (convention: checkpoints/<dataset>.<model>.npz)
 checkpoints/

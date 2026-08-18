@@ -11,12 +11,19 @@ from ..core import Strategy
 class MatrixFactorization(Strategy):
     """Implicit-feedback matrix factorization scored per row. The full user-item
     matrix is factorized once in fit() (cached per graph); each row is scored by
-    its user's affinity for its item. edge_weight guides a Greedy engine."""
+    its user's affinity for its item. edge_weight guides a Greedy engine.
+
+    `weighted=True` reads the interaction's stored score instead of its mere
+    existence, which turns the same solver into explicit feedback: the target is
+    the rating rather than a 1. Implicit stays the default because "she watched
+    it" and "she rated it 2" are different claims, and only the caller knows
+    which one their edges carry."""
 
     supports_guidance = True
 
     def __init__(self, factors=8, iterations=20, regularization=0.05, seed=42,
-                 item_type="movie", user_type="user", relation="has_interact"):
+                 item_type="movie", user_type="user", relation="has_interact",
+                 weighted=False):
         self.factors = factors
         self.iterations = iterations
         self.regularization = regularization
@@ -24,6 +31,7 @@ class MatrixFactorization(Strategy):
         self.item_type = item_type
         self.user_type = user_type
         self.relation = relation
+        self.weighted = weighted
 
     def fit(self, graph):
         self._graph = graph
@@ -36,9 +44,12 @@ class MatrixFactorization(Strategy):
         used to be a hand-built CSR with its own index arrays."""
         users = graph.block(self.user_type)
         items = graph.block(self.item_type)
-        matrix = graph.relation_matrix(self.relation)[users[0]:users[1], items[0]:items[1]]
+        weights = "raw" if self.weighted else None
+        matrix = graph.relation_matrix(self.relation, weights)[users[0]:users[1],
+                                                               items[0]:items[1]]
         matrix = matrix.tocsr()
-        matrix.data.fill(1.0)      # CSR sums duplicate entries; feedback stays binary
+        if not self.weighted:
+            matrix.data.fill(1.0)  # CSR sums duplicate entries; feedback stays binary
         matrix.sort_indices()
         user_factors, item_factors = self._factorize(matrix)
         return users, items, user_factors, item_factors
@@ -92,29 +103,30 @@ class MatrixFactorization(Strategy):
         # straight off the sparse layout once: CSR stores row i's column indices
         # contiguously in indices[indptr[i]:indptr[i+1]], and CSC does the same
         # per column. That is the alternative to re-scanning a boolean mask (and
-        # a strided column of it) on every pass.
+        # a strided column of it) on every pass. The values travel with them, so
+        # implicit and explicit feedback run the same loop.
         csr, csc = matrix.tocsr(), matrix.tocsc()
-        by_user = [csr.indices[csr.indptr[i]:csr.indptr[i + 1]] for i in range(n_users)]
-        by_item = [csc.indices[csc.indptr[j]:csc.indptr[j + 1]] for j in range(n_items)]
+        by_user = [_slice(csr, i) for i in range(n_users)]
+        by_item = [_slice(csc, j) for j in range(n_items)]
 
         for _ in range(self.iterations):
-            for i, observed in enumerate(by_user):
+            for i, (observed, target) in enumerate(by_user):
                 if observed.size:
                     A = item_factors[observed]
-                    # feedback is binary, so the right-hand side A.T @ ones is
-                    # just the column sum -- one matmul less per row
-                    user_factors[i] = np.linalg.solve(A.T @ A + reg, A.sum(axis=0))
-            for j, observed in enumerate(by_item):
+                    # the right-hand side is A.T @ target; with binary feedback
+                    # every target is 1 and it degenerates to the column sum
+                    user_factors[i] = np.linalg.solve(A.T @ A + reg, target @ A)
+            for j, (observed, target) in enumerate(by_item):
                 if observed.size:
                     A = user_factors[observed]
-                    item_factors[j] = np.linalg.solve(A.T @ A + reg, A.sum(axis=0))
+                    item_factors[j] = np.linalg.solve(A.T @ A + reg, target @ A)
 
         # The matrix spans the whole type block, so it includes items nobody
         # interacted with. Their solve is skipped, which would leave them holding
         # the random initialization -- an affinity invented out of nothing. No
         # evidence means no affinity, so they are zeroed.
-        user_factors[[i for i, o in enumerate(by_user) if not o.size]] = 0.0
-        item_factors[[j for j, o in enumerate(by_item) if not o.size]] = 0.0
+        user_factors[[i for i, (o, _) in enumerate(by_user) if not o.size]] = 0.0
+        item_factors[[j for j, (o, _) in enumerate(by_item) if not o.size]] = 0.0
         return user_factors, item_factors
 
 
@@ -148,7 +160,11 @@ class DiffusedMatrixFactorization(MatrixFactorization):
         # interacted with has no representation, so letting it into the
         # denominator would shrink its neighbours' embeddings toward zero for no
         # reason. That count is itself a matrix-vector product.
-        incidence = graph.adjacency()[:, items[0]:items[1]]
+        #
+        # Weighted, the mean becomes a weighted mean -- normalized, because a
+        # negative weight would pull an embedding to the far side of the space
+        # rather than count for less.
+        incidence = graph.adjacency("norm" if self.weighted else None)[:, items[0]:items[1]]
         represented = (item_factors != 0).any(axis=1)
         counts = incidence @ represented.astype(np.float64)
         embeddings = np.zeros((graph.n_nodes, self.factors))
@@ -196,3 +212,9 @@ class DiffusedMatrixFactorization(MatrixFactorization):
 def _within(index, block):
     """The index itself when it falls inside a type's block, else None."""
     return index if block[0] <= index < block[1] else None
+
+
+def _slice(matrix, i):
+    """One row (CSR) or column (CSC): its observed indices and their values."""
+    start, stop = matrix.indptr[i], matrix.indptr[i + 1]
+    return matrix.indices[start:stop], matrix.data[start:stop]
