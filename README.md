@@ -174,6 +174,28 @@ Without that rule a method on the class would win the attribute lookup and
 `v.person.name` would silently mean something else — which is the worst way for
 a query language to be wrong, since it returns an answer.
 
+## Nearness is the same idea, over vectors
+
+A column of lists in an attributes frame is a **vector**, not an attribute — the
+dtype says which — kept as one `(n, d)` float32 block per type. What a query asks
+of one is nearness, which is graded membership again:
+
+```python
+g.nodes(chunk="chunk").filter(v.chunk.embedding.near(query, k=50))
+                      .sort(v.chunk.embedding.score, descending=True)
+```
+
+Same three properties as `like`: it admits the k nearest rather than a region,
+the cosine becomes the column's confidence, and the two cannot disagree because
+they are one computation. Several query vectors are several questions, and a row
+answers whichever it answers best. A cosine below zero is not a weaker answer but
+the opposite direction, so it reads as no confidence rather than a negative one.
+
+The search is exact — a matmul against a few hundred thousand rows is
+milliseconds, and there is nothing to be wrong about. An index belongs behind the
+same expression later, where "approximate" shows up as a lower confidence rather
+than as a different API.
+
 ## Membership is graded, and the measure is kept
 
 A filter answers *yes* or *no*. `like` answers *how much*, in `[0, 1]`, and that
@@ -590,6 +612,49 @@ not run.
 | `Weight(how="min")` | `v.x.score`, and arithmetic |
 | `using(Greedy(k))` | `.top(k, by=..., over=...)` between two hops |
 
+## A graph out of anything polars reads
+
+```python
+Graph.from_frames({"has_interact": pl.read_parquet("ratings.parquet")},
+                  attrs={"movie": movies, "chunk": chunks},
+                  source=("user", "user_id"), target=("movie", "movie_id"),
+                  score="rating")
+```
+
+A column may name nodes two ways: as source keys — `movie.123`, the format the
+files use — or as a `(type, column)` pair, a column of ids and the type they
+belong to. The second is what data from anywhere else looks like, with the type
+in the schema rather than in the value.
+
+Everything downstream is the file loader's, ids-are-positions included, and a
+graph is complete when it exists — which is why this takes what it needs in one
+call rather than being built up.
+
+## When a walk is too big to take whole
+
+A hop expands a frame by the degree of what it walks, and the expansion happens
+before any filter can reduce it. On a small frame that is nothing; on a large one
+it is the whole problem.
+
+```python
+with jb.optimize(batch=100_000):
+    frame = (watched.hop(peer="~has_interact", rec="has_interact")
+                    .filter(v.rec.is_in(wanted)))
+```
+
+Inside `optimize` a hop describes itself instead of taking place, the filters
+written after it join the description, and the whole of it runs when something
+reads the frame — a batch of source rows at a time, each walked, filtered and
+reduced before the next one starts. The answer is the same; the peak is a batch
+instead of the lot. On MovieLens the query above is killed by the kernel eagerly
+and completes in a bounded 2.6 GB with a batch of 2 000.
+
+It is a peephole with a ceiling, not a planner. It defers one hop — several
+steps of it, which is what bounds a bridge, since the middle never exists whole
+— and the conditions about where it lands; anything else runs the walk first.
+Two things follow from batching: a predicate that aggregates sees its batch, and
+row order is the batches' order.
+
 ## Install
 
 ```bash
@@ -795,6 +860,8 @@ jerboas/
   frame.py        the query: a polars frame that knows its graph
   traverse.py     one hop, as a gather over CSR slices
   expr.py         v / col -- names, resolved by the frame that has the graph
+  resolve.py      a hop that has not built its rows, and what resolves a name
+  optimize.py     deferring a walk so its cost has a ceiling
   fuzzy.py        graded membership over a text column
   columns.py      typed, nullable attribute columns
   keys.py         Key -- a node, outside the frame

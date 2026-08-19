@@ -309,3 +309,47 @@ def take(values, keep):
     if keep.dtype == bool:
         return [value for value, take in zip(values, keep.tolist()) if take]
     return [values[position] for position in keep.tolist()]
+
+
+class Plan:
+    """A walk described but not taken, and the conditions about where it lands.
+
+    Held only inside `optimize`. Executing it runs the same eager hop and the
+    same filters, a batch of source rows at a time, and stacks the results --
+    so the answer is what it would have been and the peak is one batch's
+    expansion rather than the whole walk's.
+    """
+
+    __slots__ = ("base", "variables", "via", "steps", "predicates", "batch")
+
+    def __init__(self, base, variables, via, steps, batch, predicates=()):
+        self.base = base                # the frame before the walk
+        self.variables = variables      # what the base's columns hold
+        self.via = via
+        self.steps = steps              # [(relation spec, column or None)]
+        self.predicates = list(predicates)   # conditions about where it lands
+        self.batch = batch
+
+    def narrowed(self, predicates):
+        """The same plan, with more said about where the walk may land."""
+        return Plan(self.base, self.variables, self.via, self.steps, self.batch,
+                    self.predicates + list(predicates))
+
+    def build(self, frame_of):
+        """Run it. `frame_of` makes a Frame of one slice of the base, which is
+        what keeps every rule about hopping and filtering in one place rather
+        than in two."""
+        through = [spec for spec, name in self.steps if name is None]
+        named = {name: spec for spec, name in self.steps if name is not None}
+        parts = []
+        for start in range(0, max(self.base.height, 1), self.batch):
+            slice_ = self.base.slice(start, self.batch)
+            if not slice_.height:
+                continue
+            part = frame_of(slice_).hop(*through, **named)
+            if self.predicates:
+                part = part.filter(*self.predicates)
+            parts.append(part.raw)
+        if not parts:                      # an empty base still has a schema
+            return frame_of(self.base.clear()).hop(*through, **named).raw
+        return parts[0] if len(parts) == 1 else pl.concat(parts, how="vertical")

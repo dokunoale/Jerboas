@@ -60,6 +60,7 @@ from .expr import SCORE, VIA, col, norm, reverse, shadow, v
 from .frame import Frame, concat
 from .graph import Graph
 from .keys import Key
+from .optimize import optimize
 from .strategies import (
     Connectivity,
     DiffusedMatrixFactorization,
@@ -75,6 +76,8 @@ __all__ = [
     "v", "col", "norm", "reverse", "shadow", "SCORE", "VIA",
     # a node, outside the frame
     "Key",
+    # deferring a walk so its cost has a ceiling
+    "optimize",
     # strategies: the scores a column cannot hold on its own
     "Strategy", "Signal",
     "Connectivity", "MatrixFactorization", "DiffusedMatrixFactorization",

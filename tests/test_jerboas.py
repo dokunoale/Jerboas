@@ -10,6 +10,8 @@ import numpy as np
 import polars as pl
 import pytest
 
+import jerboas as jb
+
 from jerboas import (Connectivity, DiffusedMatrixFactorization, Graph, Key,
                      MatrixFactorization, PageRank, Weight, col, concat, reverse,
                      v)
@@ -1360,3 +1362,77 @@ def test_chunked_slices_the_frame(small_graph):
     parts = list(frame.chunked(4))
     assert [len(one) for one in parts] == [4, 2]
     assert sum(len(one) for one in parts) == len(frame)
+
+
+# --- optimize: the walk described, then taken a batch at a time --------------
+
+def test_optimize_gives_the_answer_the_eager_walk_would(small_graph):
+    """The whole promise: the same rows, a batch at a time."""
+    def query():
+        return (small_graph.nodes(user="user").hop(rec="has_interact")
+                .filter(v.rec.year >= 1994))
+
+    eager = query()
+    with jb.optimize(batch=1):
+        deferred = query()
+    assert deferred.raw.sort(["user", "rec"]).equals(eager.raw.sort(["user", "rec"]))
+
+
+def test_optimize_carries_the_confidence_through_the_batches(small_graph):
+    with jb.optimize(batch=1):
+        frame = small_graph.nodes(user="user").hop(rec="has_interact")
+    assert frame.hidden == ["__jb_score__rec"]
+    assert sorted(frame.with_columns(s=v.rec.score).pl["s"].to_list()) \
+        == [0.0, 0.25, 0.5, 0.75, 1.0, 1.0]
+
+
+def test_a_condition_joins_the_walk_it_is_written_after(small_graph):
+    """Which is the point: the batch a walk runs in is the batch it filters, so
+    what the condition rejects is never built at all."""
+    with jb.optimize(batch=1):
+        frame = small_graph.nodes(user="user").hop(rec="has_interact")
+        assert frame._plan is not None and not frame._plan.predicates
+        narrowed = frame.filter(v.rec.year >= 1999)
+        assert narrowed._plan is not None and len(narrowed._plan.predicates) == 1
+    assert sorted(names(narrowed, "rec")) == ["movie.2", "movie.2"]
+
+
+def test_a_condition_about_anything_else_runs_the_walk_first(small_graph):
+    with jb.optimize(batch=1):
+        frame = (small_graph.nodes(user="user").attrs(user="id")
+                 .hop(rec="has_interact").filter(v.user.id == 0))
+    assert sorted(names(frame, "rec")) == ["movie.0", "movie.1"]
+
+
+def test_a_walk_that_fits_in_one_batch_is_not_deferred(small_graph):
+    """Describing a walk that would be taken whole costs a plan and saves
+    nothing."""
+    with jb.optimize(batch=1000):
+        frame = small_graph.nodes(user="user").hop(rec="has_interact")
+    assert frame._plan is None
+
+
+def test_several_steps_are_one_plan(small_graph):
+    """Which is what bounds a bridge: the middle of it never exists whole."""
+    def query():
+        return small_graph.nodes(user="user").hop("has_interact", rec="~has_interact")
+
+    eager = query()
+    with jb.optimize(batch=1):
+        deferred = query()
+    assert len(deferred) == len(eager)
+    assert set(names(deferred, "rec")) == set(names(eager, "rec"))
+
+
+def test_the_context_puts_it_back(small_graph):
+    from jerboas.optimize import batch_size
+    assert batch_size() is None
+    with jb.optimize(batch=7):
+        assert batch_size() == 7
+    assert batch_size() is None
+
+
+def test_a_batch_of_nothing_is_refused():
+    with pytest.raises(ValueError, match="at least one row"):
+        with jb.optimize(batch=0):
+            pass

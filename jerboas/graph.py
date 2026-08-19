@@ -755,6 +755,29 @@ class Graph:
     def relation_code(self, name):
         return self._relation_code.get(name)
 
+    def target_types(self, relation=None, reverse=None):
+        """The type a relation lands in, when it lands in only one.
+
+        A schema fact rather than a fact about any query: read once per relation
+        off the store and memoized. It is what lets a walk be described before it
+        is taken -- `optimize` defers the walk, and something still has to know
+        what the column it will fill is going to hold."""
+        return self.cached(("target_types", relation, reverse),
+                           lambda: self._target_types(relation, reverse))
+
+    def _target_types(self, relation, reverse):
+        code = None if relation is None else self._relation_code.get(relation)
+        if relation is not None and code is None:
+            return None
+        found = set()
+        for backwards in ((False, True) if reverse is None else (reverse,)):
+            rels = self.in_rels if backwards else self.out_rels
+            indices = self.in_indices if backwards else self.out_indices
+            targets = indices if code is None else indices[rels == code]
+            if len(targets):
+                found.update(np.unique(self._type_tag_of[targets]).tolist())
+        return self.types[found.pop()] if len(found) == 1 else None
+
     def neighbours(self, index):
         """Every neighbour, both directions, deduplicated -- the undirected
         one-hop set a reachability strategy walks."""

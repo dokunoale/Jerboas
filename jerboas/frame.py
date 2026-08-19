@@ -29,7 +29,8 @@ from . import traverse
 from .expr import (SCORE, VIA, Col, Expr, direction, is_shadow, name_of,
                    reverse, shadow, shadowed)
 from .keys import Key
-from .resolve import Pending, Resolver, take
+from .optimize import batch_size
+from .resolve import Pending, Plan, Resolver, take
 
 RELATION = "relation"
 
@@ -44,7 +45,8 @@ RELATION = "relation"
 class Frame:
     """A table of node ids, joined to the graph that gave them meaning."""
 
-    def __init__(self, graph, data, variables=None, pending=None, via=None):
+    def __init__(self, graph, data, variables=None, pending=None, via=None,
+                 plan=None):
         self.graph = graph
         self._data = (None if data is None else
                       data if isinstance(data, pl.DataFrame) else pl.DataFrame(data))
@@ -54,16 +56,23 @@ class Frame:
         # {column: relation} for the steps that walked one relation for every
         # row. A constant needs no array, but `v.x.via` should still answer
         self.via = dict(via or {})
-        # a hop that has walked but not built its rows yet (see _Pending). The
-        # only thing that reads it is `filter`, which may be able to apply
+        # a hop that has walked but not built its rows yet (see resolve.Pending).
+        # The only thing that reads it is `filter`, which may be able to apply
         # itself to the arrays instead of to the rows they would become
         self._pending = pending
+        # a hop that has not even walked: inside `optimize`, so that the walk
+        # can run a batch at a time with the filters that follow it (resolve.Plan)
+        self._plan = plan
 
     @property
     def _df(self):
-        """The rows. Building them is what a pending hop was deferring, so
+        """The rows. Building them is what a deferred hop was putting off, so
         anything that touches this pays for it -- and `filter` gets first
         refusal."""
+        if self._plan is not None:
+            plan, self._plan = self._plan, None
+            self._data = plan.build(lambda data: Frame(
+                self.graph, data, plan.variables, via=plan.via))
         if self._pending is not None:
             self._data = self._pending.build()
             self._pending = None
@@ -214,6 +223,17 @@ class Frame:
             if name is not None:
                 self._claim(name)
 
+        batch = batch_size()
+        if batch is not None and batch < base.height:
+            # described rather than taken: the walk runs when something reads
+            # the frame, a batch of source rows at a time (see optimize.py)
+            variables = dict(self.vars)
+            for spec, name in steps:
+                if name is not None:
+                    variables[name] = self._target_type(spec)
+            return Frame(graph, None, variables,
+                         plan=Plan(base, dict(self.vars), dict(self.via), steps, batch))
+
         rows = np.arange(base.height, dtype=np.int64)
         nodes = base[source].to_numpy()
         added, variables, via = {}, dict(self.vars), dict(self.via)
@@ -259,6 +279,15 @@ class Frame:
             if name in self.vars:
                 return name
         raise ValueError("hop(...) needs a column of nodes to leave from")
+
+    def _target_type(self, spec):
+        """What a step will land in, before it is taken: a schema fact, since
+        there is no data yet to read one off."""
+        relations = _relations(spec)
+        if relations is None or len(relations) != 1:
+            return None
+        name, backwards = relations[0]
+        return self.graph.target_types(name, backwards)
 
     def _one_type(self, targets):
         """The type these nodes are, when they are all of one -- read off the
@@ -375,6 +404,8 @@ class Frame:
         predicate about the node it just reached is applied to the arrays
         instead -- so the rows it would have dropped are never built."""
         frame, predicates = self, list(predicates)
+        if frame._plan is not None and predicates:
+            frame, predicates = frame._defer(predicates)
         if frame._pending is not None and predicates:
             frame, predicates = frame._pushdown(predicates)
         if not predicates and not named:
@@ -553,6 +584,21 @@ class Frame:
         data = (data.filter(ranked <= n)
                 .sort(groups + [ordering], descending=[False] * len(groups) + [descending]))
         return self._wrap(resolver.detach(data))
+
+    def _defer(self, predicates):
+        """Hand a condition to a walk that has not happened, so the batch it
+        runs in is the batch it filters."""
+        plan = self._plan
+        target = next(name for _spec, name in reversed(plan.steps) if name is not None)
+        joins, stays = [], []
+        for one in predicates:
+            paths = one.reads() if isinstance(one, Expr) else _root_paths(one)
+            (joins if paths and all(path[0] == target for path in paths)
+             else stays).append(one)
+        if not joins:
+            return self, stays
+        return Frame(self.graph, None, self.vars, via=self.via,
+                     plan=plan.narrowed(joins)), stays
 
     # --- pushing a predicate into a hop that has not built its rows ----------
 

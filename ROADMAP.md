@@ -9,10 +9,17 @@ if it makes retrieval and ranking one operation, or if it removes a reason
 someone cannot use the library at all. Breadth for its own sake does not.
 
 Ordered by what unblocks the most, not by what is most interesting to build.
+Items 1, 2, 4 and most of 5 are **done** (see below); 3 is done as far as a
+peephole goes and not as a planner.
 
 ---
 
-## 1. A graph built from frames
+## 1. A graph built from frames — done
+
+`Graph.from_frames` takes a frame of edges (or a mapping from relation to
+frame) and a mapping of attribute frames. A column names nodes as source keys or
+as a `(type, column)` pair. What follows is the loader's, ids-are-positions
+included.
 
 **The problem.** `Graph(kg=..., edges=[...], attrs=[...])` takes file paths and
 nothing else. Real data lives in Parquet, Postgres, an object store, another
@@ -43,7 +50,11 @@ using it. This one decides who can start.
 
 ---
 
-## 2. Vector columns, and a graded nearness condition
+## 2. Vector columns, and a graded nearness condition — done
+
+A list column in an attrs frame is a vector; `v.chunk.embedding.near(q, k=50)`
+admits the k nearest and keeps the cosine as the column's confidence. Exact, by
+matmul against a unit block. An index is the part still to come.
 
 **The problem.** Attribute columns are int64, float64 or text
 (`columns.build`). There is no vector, no index, no k-nearest anything. So the
@@ -73,7 +84,7 @@ convenience, and it lands on the existing design without bending it.
 
 ---
 
-## 3. `jb.optimize`: laziness and a planner
+## 3. `jb.optimize`: laziness and a planner — half done
 
 **The problem.** Every verb materialises. The one exception is the peephole
 that lets a filter written after a hop apply to the arrays the hop produced —
@@ -97,13 +108,21 @@ cardinality estimate no join optimizer over anonymous tables can get, and it is
 what would let the planner choose which end of a pattern to expand from, when to
 fold, and when to batch.
 
-**Why third.** It unlocks scale, and scale matters once 1 and 2 have brought
-graphs that are not MovieLens. It is also the largest piece here by some
-distance.
+**What exists.** `jb.optimize(batch=n)` defers one hop -- several steps of it --
+and the conditions about where it lands, then runs the walk a batch of source
+rows at a time. A query that the kernel kills eagerly completes in a bounded
+2.6 GB. The answer is identical and the peak is a batch instead of the lot.
+
+**What does not.** A planner: nothing chooses the batch size, the direction to
+expand from, or when to fold, and nothing is deferred across two hops written as
+two calls. The degrees the graph already knows are still an estimate nobody
+reads.
 
 ---
 
-## 4. Reducing several confidences to one
+## 4. Reducing several confidences to one — done
+
+`.confidence("min" | "max" | "mean" | "product" | "sum" | callable)`.
 
 **The open end.** Confidence deliberately does not compose along a walk:
 `v.tag.score` is the step that revealed `tag`, `v.rec.score` the step after.
