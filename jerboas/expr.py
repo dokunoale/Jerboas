@@ -44,6 +44,35 @@ ATTR, REL = "attr", "rel"
 SCORE, VIA, TYPE = "score", "via", "type"
 PROVENANCE = (SCORE, VIA, TYPE)
 
+# How a step says it reads a relation backwards, and how `v.x.via` says it did.
+# One place, so the two cannot drift -- and so `reverse()` below can go on
+# meaning the same thing if the character ever changes.
+REVERSED = "~"
+
+
+def reverse(relation):
+    """A relation read the other way: `reverse("directed_by")` is the films a
+    person directed rather than the people who directed a film.
+
+    The same thing as writing `"~directed_by"`, and there for two reasons: the
+    prefix is spelling rather than syntax, so code that says `reverse(...)`
+    keeps meaning it if the character changes; and `~` already means `not` in a
+    predicate, so a query that would rather not write it twice for two different
+    reasons need not.
+
+    Applied twice it gives back what it was given, and it maps over a collection
+    of relations rather than making you write it out."""
+    if not isinstance(relation, str):
+        return tuple(reverse(one) for one in relation)
+    return relation[len(REVERSED):] if relation.startswith(REVERSED) \
+        else f"{REVERSED}{relation}"
+
+
+def direction(relation):
+    """A step's relation as (name, backwards)."""
+    return (relation[len(REVERSED):], True) if relation.startswith(REVERSED) \
+        else (relation, False)
+
 
 class Expr:
     """A predicate or a value, not yet bound to a frame.

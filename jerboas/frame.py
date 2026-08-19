@@ -24,7 +24,7 @@ import polars as pl
 
 from . import fuzzy, traverse
 from .expr import (ATTR, PROVENANCE, REL, SCORE, TYPE, VIA, Col, Expr, Relation,
-                   name_of)
+                   direction, name_of, reverse)
 from .keys import Key
 
 RELATION = "relation"
@@ -545,7 +545,7 @@ class Frame:
     def _names(self, codes):
         """Relation codes as names, with `~` for an edge walked backwards."""
         relations = self.graph.relations
-        return [f"~{relations[~code]}" if code < 0 else relations[code]
+        return [reverse(relations[~code]) if code < 0 else relations[code]
                 for code in codes.tolist()]
 
     def _attributes(self, var):
@@ -885,12 +885,12 @@ def _walk(graph, nodes, spec):
     specs = _relations(spec)
     if specs is None:                                   # any relation, either way
         return traverse.expand(graph, nodes, None, None, normalized=True) + (None,)
-    parts = [traverse.expand(graph, nodes, name, reverse, normalized=True)
-             for name, reverse in specs]
+    parts = [traverse.expand(graph, nodes, name, backwards, normalized=True)
+             for name, backwards in specs]
     single = None
     if len(specs) == 1:
-        name, reverse = specs[0]
-        single = f"~{name}" if reverse else name
+        name, backwards = specs[0]
+        single = reverse(name) if backwards else name
     if len(parts) == 1:
         return parts[0] + (single,)
     return tuple(np.concatenate(column) for column in zip(*parts)) + (single,)
@@ -906,8 +906,7 @@ def _relations(spec):
     specs = tuple(spec)
     if not specs:
         return None
-    return [(name[1:], True) if name.startswith("~") else (name, False)
-            for name in specs]
+    return [direction(name) for name in specs]
 
 
 def _distinct(graph, rows, nodes):

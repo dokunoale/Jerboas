@@ -56,7 +56,7 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 from .core import Strategy, Signal
-from .expr import SCORE, VIA, v, col, norm
+from .expr import SCORE, VIA, col, norm, reverse, v
 from .frame import Frame, concat, shadow
 from .graph import Graph
 from .keys import Key
@@ -72,7 +72,7 @@ __all__ = [
     # the data, and what you ask it
     "Graph", "Frame", "concat",
     # naming a column, and its confidence
-    "v", "col", "norm", "shadow", "SCORE", "VIA",
+    "v", "col", "norm", "reverse", "shadow", "SCORE", "VIA",
     # a node, outside the frame
     "Key",
     # strategies: the scores a column cannot hold on its own

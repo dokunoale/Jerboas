@@ -31,7 +31,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 import jerboas as jb
-from jerboas import SCORE, shadow, v
+from jerboas import SCORE, reverse, shadow, v
 
 DATA_DIR = "./data/genome"
 
@@ -85,7 +85,7 @@ def shared(graph, seeds, strength):
     written after their hop and applied before its rows are built."""
     return (graph.nodes(seed=seeds)
             .hop(tag="has_tag").filter(v.tag.score >= strength)
-            .hop(rec="~has_tag").filter(v.rec.score >= strength)
+            .hop(rec=reverse("has_tag")).filter(v.rec.score >= strength)
             .filter(~v.rec.is_in(seeds)))                 # already on the list
 
 

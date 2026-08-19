@@ -245,6 +245,15 @@ on the relation is the empty set of constraints.
 .hop(step=("has_genre", "~directed_by"))     # either, at this step
 ```
 
+The prefix is spelling rather than syntax, and `reverse()` says the same thing
+without it — worth preferring in code meant to last, since the character could
+change and `~` already means `not` in a predicate:
+
+```python
+.hop(movie=reverse("directed_by"))           # == "~directed_by"
+reverse(reverse("x")) == "x"                 # and it maps over a collection
+```
+
 The empty step walking both ways is what lets a two-hop bridge close without
 duplicating every edge in memory to fake it. Which relation it walked comes back
 as `v.mid.via`.

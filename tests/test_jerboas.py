@@ -11,7 +11,8 @@ import polars as pl
 import pytest
 
 from jerboas import (Connectivity, DiffusedMatrixFactorization, Graph, Key,
-                     MatrixFactorization, PageRank, Weight, col, concat, v)
+                     MatrixFactorization, PageRank, Weight, col, concat, reverse,
+                     v)
 
 
 def names(frame, column=None):
@@ -397,6 +398,25 @@ def test_naming_a_step_keeps_it(small_graph):
     frame = small_graph.nodes(seed=["movie.0"]).hop(via_1=(), rec=())
     assert frame.columns == ["seed", "via_1", "rec"]
     assert frame.vars["via_1"] is None
+
+
+def test_reverse_is_the_prefix_without_the_character(small_graph):
+    """The prefix is spelling, not syntax: `reverse(...)` goes on meaning the
+    same thing if the character changes, and `~` already means `not` in a
+    predicate."""
+    assert reverse("directed_by") == "~directed_by"
+    assert reverse(reverse("directed_by")) == "directed_by"
+    assert reverse(("a", "b")) == ("~a", "~b")
+    written = small_graph.nodes("person").hop(movie=reverse("directed_by"))
+    spelled = small_graph.nodes("person").hop(movie="~directed_by")
+    assert written.pl.equals(spelled.pl)
+
+
+def test_reverse_matches_what_via_prints(small_graph):
+    """What you write is what you later read."""
+    frame = small_graph.nodes(seed=["movie.0"]).hop(other=())
+    printed = frame.with_columns(r=v.other.via).pl["r"].to_list()
+    assert reverse("has_interact") in printed
 
 
 def test_a_step_may_name_several_relations(small_graph):
