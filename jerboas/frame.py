@@ -23,11 +23,37 @@ import numpy as np
 import polars as pl
 
 from . import fuzzy, traverse
-
-from .expr import ATTR, REL, Col, Expr, Relation, name_of
+from .expr import (ATTR, PROVENANCE, REL, SCORE, TYPE, VIA, Col, Expr, Relation,
+                   name_of)
 from .keys import Key
 
 RELATION = "relation"
+
+# Every column carries a confidence, and where something measured one it is kept
+# here: an ordinary polars column under a reserved prefix, so filter, sort, join
+# and group_by keep it aligned with its values without a line of code from us.
+# Hidden from `columns` and from `print`, because it is an attribute of a column
+# rather than a column -- `v.rec.score` is how it is read.
+#
+# Absent means 1.0. A graph with no weights and a query with no fuzzy matching
+# therefore allocate nothing at all.
+SHADOW = "__jb_"
+
+
+def shadow(kind, column):
+    return f"{SHADOW}{kind}__{column}"
+
+
+def is_shadow(name):
+    return name.startswith(SHADOW)
+
+
+def shadowed(name):
+    """(kind, column) of a shadow column, or None."""
+    if not is_shadow(name):
+        return None
+    kind, _, column = name[len(SHADOW):].partition("__")
+    return kind, column
 
 
 class Frame:
@@ -89,7 +115,19 @@ class Frame:
 
     @property
     def columns(self):
-        return self._df.columns
+        """What the frame holds, as a person reads it. A column's confidence and
+        provenance are attributes of it (`v.rec.score`), not entries here."""
+        return [name for name in self._df.columns if not is_shadow(name)]
+
+    @property
+    def hidden(self):
+        """The shadow columns, for a caller who wants to see the bookkeeping."""
+        return [name for name in self._df.columns if is_shadow(name)]
+
+    @property
+    def visible(self):
+        """The polars frame without the shadows -- what `print` shows."""
+        return self._df.select(self.columns)
 
     @property
     def height(self):
@@ -97,7 +135,7 @@ class Frame:
 
     @property
     def shape(self):
-        return self._df.shape
+        return self._df.height, len(self.columns)
 
     @property
     def schema(self):
@@ -117,210 +155,148 @@ class Frame:
         return self._wrap(got) if isinstance(got, pl.DataFrame) else got
 
     def __repr__(self):
-        return repr(self._df)
+        return repr(self.visible)
 
     def __str__(self):
-        return str(self._df)
+        return str(self.visible)
 
     def _repr_html_(self):
-        return self._df._repr_html_()
+        return self.visible._repr_html_()
 
     def rows(self, named=False):
         return self._df.rows(named=named)
 
     # --- the graph verbs -----------------------------------------------------
 
-    def hop(self, relation=None, *, to=None, type=None, reverse=None, as_=None,
-            from_=None, norm=False, where=None):
-        """Every edge leaving a column of nodes, one result row per edge.
+    def hop(self, *, reverse=None, from_=None, **step):
+        """One traversal: `hop(genre="has_genre")` reaches the genres of what the
+        frame holds and calls them `genre`.
 
-            .hop("has_genre", to="genre")        # forwards along one relation
-            .hop("directed_by", to="person", reverse=True)
-            .hop(to="mid")                       # wildcard: any relation, both ways
+        The keyword is the name of the new column and its value is the relation
+        walked to fill it -- the same shape as `g.nodes(rec="movie")`, where the
+        keyword names and the value says what. `"*"` is the wildcard: any
+        relation, and both directions, which is what closes a bridge without the
+        store holding every edge twice. A named relation reads forwards unless
+        `reverse=True`.
 
-        A named relation reads forwards unless `reverse=True`; the wildcard has
-        no natural direction and walks both, which is what closes a bridge
-        pattern without the store holding every edge twice.
+        Only the new column is added. What the step measured is the column's
+        confidence -- `v.genre.score`, the edge's weight on its own relation's
+        [0, 1] scale -- and which relation it walked is `v.genre.via`. Both are
+        attributes of the column rather than columns, and neither costs anything
+        when it says the same thing about every row.
 
-        The step's own columns come back beside the target: `<as_>.score` always,
-        and `<as_>.rel` when the relation was a wildcard and therefore worth
-        naming. `as_` defaults to the relation's name, or to the target's.
+        Nothing else is a parameter, because nothing else is a fact about the
+        step. Which nodes are worth landing on is a condition, so it goes where
+        conditions go:
 
-        `type` and `where` say *in advance* which nodes are worth landing on,
-        and they exist for one reason: cost. A hop's expensive half is not the
-        walk -- that is a gather over CSR slices -- but building the result,
-        which drags every column the frame already had along to every new row.
-        Both are the same restriction a `filter` would apply afterwards, applied
-        instead to the arrays the walk produced, so the rows that will not
-        survive are never built.
+            .hop(rec="has_genre", reverse=True).filter(v.rec.year >= 1990)
 
-        `where` is a frame of admissible nodes, which is also how an attribute
-        predicate gets in -- a frame is where one is written:
-
-            recent = g.nodes("movie").attrs(movie="year").filter(v.movie.year >= 1990)
-            frame.hop("has_genre", to="rec", reverse=True, where=recent)
-
-        This is the compiler's old admission mask, back where it belongs. It
-        never makes the answer different; it makes it cheaper -- measured on
-        MovieLens, 34% off a hop admitting 3% of what it walked, tapering to
-        nothing as the admission widens, because the alternative is a hash probe
-        against every edge walked.
-
-        There is deliberately no such parameter for the edge's weight. It was
-        written, measured, and removed: filtering the weight array before
-        building the frame beats polars' own comparison only below about 1%
-        selectivity, and costs twice as much at 39%. A knob whose right setting
-        requires knowing the selectivity curve is worse than no knob, so a
-        weight stays what it is -- a column -- and `.filter(v.x.score >= 3)`
-        after the hop is both the spelling and the fast path.
+        and the filter reaches the frame before the rows are built, so what it
+        rejects is never built (see `filter`).
         """
+        if len(step) != 1:
+            raise TypeError(
+                "hop(...) takes one keyword: the name of the new column, and the "
+                "relation that fills it -- hop(genre=\"has_genre\"), or "
+                "hop(mid=\"*\") for any relation either way.")
+        (target, relation), = step.items()
+        if relation in ("*", None):
+            relation = None
         source = self._source_var(from_)
-        target = to or type
-        if target is None:
-            raise TypeError("hop(...) needs `to=` (or `type=`): the new column's name")
         if reverse is None and relation is not None:
             reverse = False                      # a named relation reads forwards
+        self._claim(target)
 
         nodes = self._df[source].to_numpy()
         rows, targets, codes, weights = traverse.expand(
-            self.graph, nodes, relation, reverse, normalized=norm)
+            self.graph, nodes, relation, reverse, normalized=True)
 
-        keep = self._admitted(targets, type, where)
-        if keep is not None:
-            rows, targets, codes, weights = (rows[keep], targets[keep],
-                                             codes[keep], weights[keep])
+        added = {target: targets.astype(np.int32)}
+        if len(weights) and not (weights == 1.0).all():
+            added[shadow(SCORE, target)] = weights
+        if relation is None and len(codes):
+            added[shadow(VIA, target)] = self._names(codes)
 
-        edge = as_ or relation or target
-        self._claim(target, edge, relation)
-        added = {target: targets.astype(np.int32), f"{edge}.score": weights}
-        if relation is None:
-            added[f"{edge}.rel"] = self._names(codes)
         variables = dict(self.vars)
-        variables[target] = type
+        variables[target] = self._one_type(targets)
         # not built yet: a filter written next may be able to apply itself to
         # these arrays, which is the difference between admitting a candidate
         # and building a row only to drop it
-        pending = _Pending(self._df, rows, added, target, type)
-        return Frame(self.graph, None, variables, pending=pending)
+        return Frame(self.graph, None, variables,
+                     pending=_Pending(self._df, rows, added, target))
 
-    def _admitted(self, targets, type_, where):
-        """Which of the nodes just reached are worth building a row for.
+    def _one_type(self, targets):
+        """The type these nodes are, when they are all of one -- read off the
+        data rather than declared, so it cannot be declared wrongly."""
+        if not len(targets):
+            return None
+        tags = np.unique(self.graph._type_tag_of[targets])
+        return self.graph.types[int(tags[0])] if len(tags) == 1 else None
 
-        One boolean array, intersected from whatever was said in advance, and
-        None when nothing was -- so the common case allocates nothing."""
-        keep = None
-        if type_ is not None:
-            low, high = self.graph.block(type_)
-            keep = (targets >= low) & (targets < high)
-        if where is not None:
-            # a mask over every node, read at the targets: admission is then an
-            # array lookup rather than a search, however the set was named
-            admissible = np.zeros(self.graph.n_nodes, dtype=bool)
-            admissible[self.graph.ids_of(where)] = True
-            reached = admissible[targets]
-            keep = reached if keep is None else (keep & reached)
-        return keep
-
-    def paths(self, relation=None, *, to, hops=(1, 2), type=None, where=None,
-              through=None, keep_via=False, from_=None):
+    def paths(self, *predicates, hops=(1, 2), through=None, keep_via=False,
+              reverse=None, from_=None, **step):
         """Walks of more than one length, as one frame.
 
-            .paths(to="rec", type="movie", hops=(1, 2))
-            .paths(to="rec", type="movie", hops=(1, 2), through="person")
+            .paths(v.rec.type == "movie", rec="*", hops=(1, 2))
 
-        `hops` is an inclusive range of lengths, or an int for exactly one. Each
-        length is a branch, the branches are concatenated diagonally, and a
-        `hops` column says which one a row came from -- so "one hop or two" is
-        one frame rather than two and a concat.
+        The keyword names the destination the way `hop` does; `hops` is an
+        inclusive range of lengths, or an int for exactly one. Each length is a
+        branch, the branches are concatenated diagonally, and a `hops` column
+        says which one a row came from.
 
-        The reason it is a verb and not sugar is the `unique` between the steps.
-        A two-hop walk expands the first hop by the degree of the second, and two
-        sources reaching the same intermediate carry the same rows onward: that
-        product is what makes a naive bridge query exhaust memory, and folding it
-        is what the old engine's memoized sub-path search was for. So by default
-        the intermediates are dropped and deduplicated at every level.
+        Any conditions given are applied to each branch *before* its rows are
+        built -- which is why they are passed here rather than written after:
+        a two-hop wildcard that keeps only movies should not build the rest.
 
-        `keep_via=True` keeps them, as `via_1`, `via_2`, ... -- and then nothing
-        can be deduplicated, because the columns that would collapse are the
-        answer. Use it when the walk itself is what you are after.
+        The reason it is a verb and not sugar over hop+concat is the `unique`
+        between the steps. Two routes that meet at an intermediate carry
+        identical rows onward, and folding them is what the old engine's
+        memoized sub-path search was for. `keep_via=True` keeps the walk as
+        `via_1`, `via_2`, ... -- and then nothing can be folded, because the
+        columns that would collapse are the answer.
 
-        `type` and `where` admit the *destination*; `through` admits the
-        intermediates, and takes a type name as well as a set of nodes."""
+        `through` admits the intermediates, by type name or by node set."""
+        if len(step) != 1:
+            raise TypeError("paths(...) takes one keyword: the name of the "
+                            "destination column, and the relation that fills it")
+        (target, relation), = step.items()
         low, high = (hops, hops) if isinstance(hops, int) else hops
         if low < 1 or high < low:
             raise ValueError(f"hops must be a length or an increasing range, got {hops!r}")
         wanted = range(low, high + 1)
-        arrival = [to, f"{to}.score"] + ([] if relation is not None else [f"{to}.rel"])
 
         chain, branches = self, []
-        for step in range(1, high + 1):
-            start = None if step > 1 else from_
-            if step in wanted:                       # a branch that ends here
-                branch = chain.hop(relation, to=to, type=type, where=where,
-                                   as_=to, from_=start)
+        for step_no in range(1, high + 1):
+            start = None if step_no > 1 else from_
+            if step_no in wanted:                    # a branch that ends here
+                branch = chain.hop(reverse=reverse, from_=start, **{target: relation})
+                branch = branch.filter(*predicates) if predicates else branch
                 if not keep_via:
                     # what got here is not what this branch is about: keep where
                     # it started and where it arrived, and fold the routes
-                    branch = branch.select(*self.columns, *arrival).unique()
-                branches.append(branch.with_columns(hops=pl.lit(step, dtype=pl.Int32)))
-            if step == high:
+                    branch = branch.select(*self.columns, target).unique()
+                branches.append(branch.with_columns(hops=pl.lit(step_no, dtype=pl.Int32)))
+            if step_no == high:
                 break
-            chain = chain.hop(relation, to=f"via_{step}", as_=f"via_{step}", from_=start,
-                              where=through if not isinstance(through, str) else None,
-                              type=through if isinstance(through, str) else None)
+            name = f"via_{step_no}"
+            chain = chain.hop(reverse=reverse, from_=start, **{name: relation})
+            if through is not None:
+                chain = chain.filter(_through(name, through))
             if not keep_via:
-                # the fold: two routes that met here carry identical rows from
-                # now on, and only one of them is worth walking
-                chain = chain.select(*self.columns, f"via_{step}").unique()
+                chain = chain.select(*self.columns, name).unique()
         return concat(*branches) if branches else self.head(0)
 
-    def degree(self, relation=None, *, of=None, reverse=None, as_=None):
-        """How many edges a node has, as a column.
-
-        A fact about the graph, not about what this frame matched -- the same
-        number whatever the query asked, which is exactly what distinguishes it
-        from `group_by(...).agg(count)`. Read off a per-node array the graph
-        computes once, so it costs a gather.
-
-            .degree("has_genre", of="movie")     # -> movie.has_genre_count
-        """
-        var = self._source_var(of)
-        counts = self._degrees(relation, reverse)
-        name = as_ or f"{var}.{relation or 'edge'}_count"
-        ids = self._df[var].to_numpy()
-        return self._wrap(self._df.with_columns(pl.Series(name, counts[ids])))
-
-    def having(self, relation=None, *, where=None, reverse=None, of=None, absent=False):
-        """Keep the rows whose node has such an edge -- without walking it.
-
-            .having("directed_by")                     # directs anything at all
-            .having("directed_by", where=people)       # directs one of these
-            .missing("has_interact", where=watched)    # the negation
-
-        This is a filter, not a traversal: no row is added and none of the frame
-        is expanded. With no `where` it reads the node's arity off the graph's
-        own count. With one, it walks the *given* set backwards and collects
-        what reaches it -- so the cost is the degree of `where`, not of the
-        frame. Pass the smaller side.
-        """
-        var = self._source_var(of)
-        admissible = self._reachable(relation, where, reverse)
-        keep = admissible[self._df[var].to_numpy()]
-        return self._wrap(self._df.filter(pl.Series(~keep if absent else keep)))
-
-    def missing(self, relation=None, *, where=None, reverse=None, of=None):
-        """The rows `having` would have dropped."""
-        return self.having(relation, where=where, reverse=reverse, of=of, absent=True)
-
-    def _reachable(self, relation, where, reverse):
+    def _reachable(self, relation, where, reverse=None):
         """Which nodes of the graph have such an edge, as one boolean array.
 
         With no `where` that is the node's arity. With one it is read from the
         other end -- what has an edge into this set is what this set reaches
         when walked the other way -- so the cost is the degree of `where` and
-        the frame is never expanded."""
-        if reverse is None and relation is not None:
-            reverse = False
+        the frame is never expanded.
+
+        Both directions unless told otherwise: `v.movie.directed_by.is_in(who)`
+        asks whether the two are joined by that relation, and a condition has
+        nowhere to say which way it is stored."""
         if where is None:
             return self._degrees(relation, reverse) > 0
         back = None if reverse is None else not reverse
@@ -346,41 +322,14 @@ class Frame:
             names |= set(self.graph.columns.get(one, {}))
         return sorted(names)
 
-    def _degrees(self, relation, reverse):
-        """Per-node arity, in the direction a hop would have read.
-
-        A named relation counts forwards unless told otherwise; the wildcard has
-        no natural direction and counts both, the way it walks both."""
+    def _degrees(self, relation, reverse=None):
+        """Per-node arity. Both directions unless told otherwise: how many edges
+        of that relation a node is part of, which is what `.count()` on a
+        relation asks and the only reading a condition can mean."""
         graph = self.graph
-        if reverse is None and relation is not None:
-            reverse = False
         if reverse is None:
             return graph.degree(relation, False) + graph.degree(relation, True)
         return graph.degree(relation, reverse)
-
-    def like(self, column, needles, k=1, cutoff=0.6):
-        """Keep the k rows closest to each needle, and say how close they were.
-
-            g.nodes("person").labels("person").like(v.person.label, ["tarantino"])
-
-        A `similarity` column comes back with them, in [0, 1]: the same measure
-        that decided admission, so the rows kept are exactly the ones a ranking
-        would have put on top. It is an ordinary column -- add it to a score, or
-        ignore it."""
-        name = name_of(column)
-        frame = self if name in self._df.columns else self._materialize(name)
-        values = frame._df[name].to_list()
-        texts = [(row, str(value).lower()) for row, value in enumerate(values)
-                 if value is not None]
-        if isinstance(needles, (str, bytes)):
-            needles = [needles]
-        found = fuzzy.best(list(needles), texts, k, cutoff)
-        # best first, and among equals the frame's own order: a tie between two
-        # exact matches is not a ranking, so it should not look like one
-        order = sorted(found, key=lambda row: (-found[row], row))
-        data = frame._df[order].with_columns(
-            pl.Series(frame._free("similarity"), [found[row] for row in order], dtype=pl.Float64))
-        return frame._wrap(data)
 
     def attrs(self, *paths, **named):
         """Stored attributes as columns, named `<var>.<attribute>`.
@@ -461,11 +410,18 @@ class Frame:
         return self._wrap(resolver.detach(data, keep=asked))
 
     def select(self, *exprs, **named):
-        # no detaching: a selection is already exactly what was asked for
+        """Choose columns. A column's confidence and provenance travel with it,
+        because they are attributes of it and not columns of their own."""
         resolver = _Resolver(self)
         columns = [_resolved(one, resolver) for one in _flat(exprs)]
         keyed = {name: _resolved(value, resolver) for name, value in named.items()}
-        return self._wrap(resolver.attach(self._df).select(*columns, **keyed))
+        data = resolver.attach(self._df).select(*columns, **keyed)
+        carried = [name for name in self._df.columns
+                   if is_shadow(name) and shadowed(name)[1] in data.columns
+                   and name not in data.columns]
+        if carried:
+            data = data.hstack(resolver.attach(self._df).select(carried))
+        return self._wrap(data)
 
     def sort(self, *by, descending=False, nulls_last=True):
         resolver = _Resolver(self)
@@ -488,7 +444,11 @@ class Frame:
         return self._wrap(self._df.tail(n))
 
     def drop(self, *names):
-        return self._wrap(self._df.drop([name_of(one) for one in _flat(names)]))
+        """Drop columns, and with each one the shadows that belong to it."""
+        going = [name_of(one) for one in _flat(names)]
+        going += [name for name in self._df.columns
+                  if is_shadow(name) and shadowed(name)[1] in going]
+        return self._wrap(self._df.drop(going))
 
     def rename(self, mapping):
         variables = {mapping.get(name, name): type_ for name, type_ in self.vars.items()}
@@ -522,14 +482,19 @@ class Frame:
             by = "score" if "score" in self._df.columns else None
         if by is None:
             return self.head(n) if over is None else self
-        column = name_of(by)
+        resolver = _Resolver(self)
+        ordering = _resolved(by, resolver)
+        if isinstance(ordering, str):          # polars reads a bare name as a column
+            ordering = pl.col(ordering)
+        data = resolver.attach(self._df)
         if over is None:
-            return self.sort(column, descending=descending).head(n)
+            data = data.sort(ordering, descending=descending).head(n)
+            return self._wrap(resolver.detach(data))
         groups = [name_of(one) for one in _flat([over])]
-        ranked = pl.col(column).rank("ordinal", descending=descending).over(groups)
-        return self._wrap(self._df.filter(ranked <= n)
-                          .sort(groups + [column], descending=[False] * len(groups)
-                                + [descending]))
+        ranked = ordering.rank("ordinal", descending=descending).over(groups)
+        data = (data.filter(ranked <= n)
+                .sort(groups + [ordering], descending=[False] * len(groups) + [descending]))
+        return self._wrap(resolver.detach(data))
 
     # --- internals -----------------------------------------------------------
 
@@ -545,15 +510,15 @@ class Frame:
         stays, pushed = [], []
         for one in predicates:
             paths = one.reads() if isinstance(one, Expr) else _root_paths(one)
-            if paths and all(path[0] == pending.var or ".".join(path) in pending.added
-                             for path in paths):
+            if paths and all(path[0] == pending.var for path in paths):
                 pushed.append(one)
             else:
                 stays.append(one)
         if not pushed:
             return self, stays
 
-        narrow = Frame(self.graph, pending.narrow(), {pending.var: pending.type})
+        narrow = Frame(self.graph, pending.narrow(),
+                       {pending.var: self.vars.get(pending.var)})
         resolver = _Resolver(narrow)
         exprs = [_resolved(one, resolver) for one in pushed]
         keep = (resolver.attach(narrow._df)
@@ -585,28 +550,16 @@ class Frame:
             suffix += 1
         return f"{name}_{suffix}"
 
-    def _claim(self, target, edge, relation):
-        """Refuse a hop whose columns would land on ones already there.
+    def _claim(self, target):
+        """Refuse a hop that would land on a column already there.
 
-        Suffixing the second `has_tag.score` to `has_tag.score_2` is what a
-        dataframe would do, and it is wrong here: the two are the weights of two
-        different steps, and a filter written against the obvious name would
-        silently read the other one. Two steps of one relation are two things,
-        so they are named -- which is what `as_` is for."""
+        Suffixing it to `tag_2` is what a dataframe would do, and it is wrong
+        here: the two are different steps, and a filter written against the
+        obvious name would silently read the other one."""
         if target in self._df.columns:
             raise ValueError(
                 f"this hop would land on {target!r}, which the frame already has. "
-                f"Give the new column its own name: hop(..., to=\"...\")")
-        clash = [name for name in (f"{edge}.score",
-                                   None if relation is not None else f"{edge}.rel")
-                 if name is not None and name in self._df.columns]
-        if clash:
-            raise ValueError(
-                f"this hop would land on {', '.join(repr(name) for name in clash)}, "
-                f"which the frame already has. Two steps of one relation are two "
-                f"different things, and suffixing the second would leave a filter "
-                f"written against the obvious name reading the other one -- so name "
-                f"this step: hop({relation!r}, to={target!r}, as_=\"...\")")
+                f"Give the new column its own name: hop(<name>=<relation>).")
 
     def _names(self, codes):
         """Relation codes as names, with `~` for an edge walked backwards."""
@@ -698,14 +651,13 @@ class _Pending:
     Nothing else is deferred: any other verb reads `_df` and pays for it. This
     is a peephole, not a query planner."""
 
-    __slots__ = ("base", "rows", "added", "var", "type")
+    __slots__ = ("base", "rows", "added", "var")
 
-    def __init__(self, base, rows, added, var, type_):
+    def __init__(self, base, rows, added, var):
         self.base = base            # the frame before the hop
         self.rows = rows            # which base row each candidate came from
-        self.added = added          # {column: array} the step produced
+        self.added = added          # {column: array} the step produced, shadows included
         self.var = var              # the new node column
-        self.type = type_
 
     def narrow(self):
         """Just what the step produced -- the frame a pushable predicate is
@@ -716,7 +668,7 @@ class _Pending:
     def masked(self, keep):
         return _Pending(self.base, self.rows[keep],
                         {name: _take(values, keep) for name, values in self.added.items()},
-                        self.var, self.type)
+                        self.var)
 
     def build(self):
         data = self.base[self.rows] if len(self.rows) else self.base.clear()
@@ -727,31 +679,35 @@ class _Pending:
 class _Resolver:
     """What turns a name into a column, with the graph in hand.
 
-    Three answers, in this order: a column the frame already has, an attribute
-    of that variable's type, or a relation of the graph. The first is free; the
-    second reads one array out of the graph; the third has no per-row value at
-    all and comes back as a Relation, for `.count()` or `.is_in(...)` to make
-    sense of.
+    Four answers, in this order: the provenance of a column (its confidence, the
+    relation that revealed it, the type its ids fall in), a column the frame
+    already has, an attribute of that variable's type, or a relation of the
+    graph. Only the first is free; the rest read one array out of the graph.
 
-    Anything read on demand is attached to the frame for the length of one verb
-    and taken off again, because a filter filters rows -- it does not quietly
-    widen the frame. `.attrs(...)` is how a column stays."""
+    Two kinds of thing get attached to the frame. What was read only to decide
+    something is taken off again, because a filter filters rows and does not
+    quietly widen the frame. What was *measured* stays -- a `like`'s closeness
+    is the column's confidence from then on, and throwing it away would mean
+    computing it twice or, worse, differently."""
 
     def __init__(self, frame):
         self.frame = frame
         self.extra = {}                    # name -> Series, for this verb only
+        self.keep = {}                     # name -> Series, measured and kept
 
     # -- the surface an Expr resolves against --
 
     def lookup(self, path):
         name = ".".join(path)
-        if name in self.frame._df.columns or name in self.extra:
+        if self._present(name):
             return pl.col(name)
+        if len(path) >= 2 and path[-1] in PROVENANCE and path[-2] != ATTR:
+            return self._provenance(".".join(path[:-1]), path[-1])
         if len(path) >= 2 and path[0] in self.frame.vars:
             return self._below(path[0], path[1:])
         raise ValueError(
             f"no column {name!r}, and {path[0]!r} is not a node column of this "
-            f"frame -- it has: {', '.join(self.frame._df.columns)}")
+            f"frame -- it has: {', '.join(self.frame.columns)}")
 
     def degree(self, relation):
         name = f"{relation.var}.{relation.name}_count"
@@ -769,10 +725,22 @@ class _Resolver:
             self.extra[name] = pl.Series(name, admissible[ids])
         return pl.col(name)
 
-    def ids(self, values):
-        return self.frame.graph.ids_of(values)
-
-    # -- attaching and detaching what was read on demand --
+    def like(self, column, needles, k, cutoff):
+        """The k closest rows to each needle, and the closeness kept as the
+        column's confidence -- one computation, so admission and weight cannot
+        disagree."""
+        name = str(column)
+        values = self._values(name)
+        texts = [(row, str(value).lower()) for row, value in enumerate(values)
+                 if value is not None]
+        found = fuzzy.best(needles, texts, k, cutoff)
+        closeness = np.zeros(len(values))
+        for row, score in found.items():
+            closeness[row] = score
+        self.keep[shadow(SCORE, name)] = pl.Series(shadow(SCORE, name), closeness)
+        admitted = f"{name}.__like__"
+        self.extra[admitted] = pl.Series(admitted, closeness > 0)
+        return pl.col(admitted)
 
     def signal(self, signal):
         """A strategy's score, as a literal column the rest of an expression can
@@ -783,8 +751,14 @@ class _Resolver:
                                      dtype=pl.Float64)
         return pl.col(name)
 
+    def ids(self, values):
+        return self.frame.graph.ids_of(values)
+
+    # -- attaching and detaching --
+
     def attach(self, data):
-        return data.with_columns(list(self.extra.values())) if self.extra else data
+        added = list(self.keep.values()) + list(self.extra.values())
+        return data.with_columns(added) if added else data
 
     def detach(self, data, keep=()):
         stale = [name for name in self.extra
@@ -793,11 +767,47 @@ class _Resolver:
 
     # -- internals --
 
+    def _present(self, name):
+        return (name in self.frame._df.columns or name in self.extra
+                or name in self.keep)
+
+    def _values(self, name):
+        """One column's values, materializing it first if it was only virtual."""
+        if name in self.frame._df.columns:
+            return self.frame._df[name].to_list()
+        if name not in self.extra:
+            self.lookup(tuple(name.split(".")))
+        return self.extra[name].to_list()
+
+    def _provenance(self, column, kind):
+        if kind == TYPE:
+            return self._types(column)
+        name = shadow(kind, column)
+        if self._present(name):
+            return pl.col(name)
+        # nothing measured this column, so nothing is in doubt about it
+        return pl.lit(1.0) if kind == SCORE else pl.lit(None, dtype=pl.String)
+
+    def _types(self, column):
+        name = shadow(TYPE, column)
+        if name not in self.extra:
+            if column not in self.frame.vars:
+                raise ValueError(f"{column!r} does not hold nodes, so it has no type")
+            graph = self.frame.graph
+            ids = self.frame._df[column].to_numpy()
+            names = [graph.types[tag] for tag in graph._type_tag_of[ids].tolist()]
+            self.extra[name] = pl.Series(name, names, dtype=pl.Enum(graph.types))
+        return pl.col(name)
+
     def _below(self, var, rest):
         forced = None
         if rest[0] in (ATTR, REL) and len(rest) > 1:
             forced, rest = rest[0], rest[1:]
         name = ".".join(rest)
+        if name == "label" and forced != REL:
+            # the column a person reads, per the graph's `readable` map -- the
+            # same one `labels()` names, so the two spellings cannot diverge
+            return self._gathered(var, None)
         attribute = forced != REL and self.frame._has_attribute(var, name)
         relation = forced != ATTR and name in self.frame.graph.relations
         if attribute and relation and forced is None:
@@ -815,7 +825,7 @@ class _Resolver:
             f"Relations: {', '.join(self.frame.graph.relations)}.")
 
     def _gathered(self, var, attribute):
-        name = f"{var}.{attribute}"
+        name = f"{var}.{attribute if attribute is not None else 'label'}"
         if name not in self.extra:
             ids = self.frame._df[var].to_numpy()
             values, present = self.frame._gather(var, attribute, ids)
@@ -881,6 +891,13 @@ def _aligned(frames):
                   if dtype == pl.Null and name in known]
         out.append(frame.pl.with_columns(recast) if recast else frame.pl)
     return out
+
+
+def _through(column, through):
+    """What a `paths` intermediate is allowed to be: a type name, or a set."""
+    from .expr import v
+    return (v[column].type == through) if isinstance(through, str) \
+        else v[column].is_in(through)
 
 
 def _resolved(item, resolver):

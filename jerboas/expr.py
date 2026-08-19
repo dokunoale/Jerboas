@@ -36,6 +36,14 @@ from .keys import Key
 # the two escapes, for a type whose attribute is named like a relation
 ATTR, REL = "attr", "rel"
 
+# what every column carries besides its values. `score` is the confidence of
+# each row of that column -- the weight of the edge that revealed it, how close
+# a `like` judged it, 1.0 where nothing measured anything. `via` is the relation
+# a hop walked to reach it, and `type` the node type its ids fall in. A type
+# whose own attribute is called one of these is reached with v.x.attr.score.
+SCORE, VIA, TYPE = "score", "via", "type"
+PROVENANCE = (SCORE, VIA, TYPE)
+
 
 class Expr:
     """A predicate or a value, not yet bound to a frame.
@@ -245,6 +253,8 @@ class _Field(Col):
             return _In(self._parent, *args, **kwargs)
         if method == "contains":
             return _Contains(self._parent, *args, **kwargs)
+        if method == "like":
+            return _Like(self._parent, *args, **kwargs)
         if method == "norm":
             return _Norm(self._parent, *args, **kwargs)
         if method not in _NAMED:
@@ -393,6 +403,36 @@ class _In(Expr, _Methods):
         if isinstance(target, Relation):
             return ctx.exists(target, self.values)
         return _expr(target, "is_in").is_in(ctx.ids(self.values))
+
+    __hash__ = Expr.__hash__
+
+
+class _Like(Expr, _Methods):
+    """Graded membership over a text column: the search box, as a condition.
+
+    Admits the `k` stored values closest to each needle rather than a region
+    around them, so a fragment finds the whole, a typo still lands, and the
+    empty needle admits nothing. The measure that decided admission is not
+    thrown away -- it becomes the column's confidence, so `v.person.label.score`
+    is how close each surviving row was, and the two can never disagree because
+    they are one computation."""
+
+    __slots__ = ("target", "needles", "k", "cutoff")
+
+    def __init__(self, target, needles, k=1, cutoff=0.6):
+        self.target = target
+        self.needles = [needles] if isinstance(needles, (str, bytes)) else list(needles)
+        self.k = k
+        self.cutoff = cutoff
+
+    def reads(self):
+        return _reads(self.target)
+
+    def resolve(self, ctx):
+        if not isinstance(self.target, Col):
+            raise TypeError("like(...) reads a column of text: name one, "
+                            "`v.person.label.like(...)`")
+        return ctx.like(self.target, self.needles, self.k, self.cutoff)
 
     __hash__ = Expr.__hash__
 

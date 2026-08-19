@@ -20,29 +20,52 @@ g = jb.Graph(kg="data/example/example.kg",
              readable={"song": "name", "artist": "name",
                        "author": "name", "genre": "name"})
 
-seeds = g.nodes("artist").labels("artist").like(v.artist.label, "Golden", k=3)
+seeds = g.nodes(artist="artist").filter(v.artist.label.like("Golden", k=3))
 
-(g.nodes(seed=seeds).hop(to="song", type="song")
+(g.nodes(seed=seeds).hop(song="performed_by", reverse=True)
    .with_columns(score=PageRank(to=seeds).on("song"))
-   .top(5).attrs(song="name"))
+   .top(5).labels("song"))
 ```
 
 ```
 like("Golden") -> Golden Project, Golden Kids, Golden Collective
 
-shape: (5, 6)
-┌──────┬──────┬────────────┬───────────────┬──────────┬─────────────────┐
-│ seed ┆ song ┆ song.score ┆ song.rel      ┆ score    ┆ song.name       │
-╞══════╪══════╪════════════╪═══════════════╪══════════╪═════════════════╡
-│ 101  ┆ 55   ┆ 1.0        ┆ ~performed_by ┆ 0.013566 ┆ Broken Dreams   │
-│ 101  ┆ 85   ┆ 1.0        ┆ ~performed_by ┆ 0.013212 ┆ Distant Echo    │
-│ 101  ┆ 3    ┆ 1.0        ┆ ~performed_by ┆ 0.013156 ┆ Empty Pulse     │
-│ 101  ┆ 1    ┆ 1.0        ┆ ~performed_by ┆ 0.013076 ┆ Restless Lights │
-│ 101  ┆ 26   ┆ 1.0        ┆ ~performed_by ┆ 0.012462 ┆ Lost Shadows    │
-└──────┴──────┴────────────┴───────────────┴──────────┴─────────────────┘
+shape: (5, 4)
+┌──────┬──────┬──────────┬─────────────────┐
+│ seed ┆ song ┆ score    ┆ song.label      │
+╞══════╪══════╪══════════╪═════════════════╡
+│ 101  ┆ 55   ┆ 0.013566 ┆ Broken Dreams   │
+│ 101  ┆ 85   ┆ 0.013212 ┆ Distant Echo    │
+│ 101  ┆ 3    ┆ 0.013156 ┆ Empty Pulse     │
+│ 101  ┆ 1    ┆ 0.013076 ┆ Restless Lights │
+│ 101  ┆ 26   ┆ 0.012462 ┆ Lost Shadows    │
+└──────┴──────┴──────────┴─────────────────┘
 ```
 
 That runs on a fresh clone: the example graph ships with the repo.
+
+## The frame is a view of a dataframe that is already there
+
+The mental model, and everything else follows from it: a graph *is* a dataframe
+— one column for every position you could name in a walk, one row for every walk
+that exists, and beside each column every fact derivable about it. That frame is
+never built; it could not be. What you hold is a view of it, and there are only
+two things you ever do:
+
+- **name** something — `hop`, `attrs`, `labels`, `with_columns`. A hop does not
+  add data; it makes visible a column that was always in the walk space, and the
+  rows "multiply" only because projecting onto one column had folded them.
+  `unique` folds them back.
+- **restrict** it — `filter`, `top`, `like`. Fewer rows, never fewer facts.
+
+From which the rule about columns, which is otherwise arbitrary:
+
+> **A column is in the frame if and only if you named it.**
+
+So `filter` never widens the frame — what it read to decide is taken off again —
+and `select` never narrows what it was asked to produce. And so a hop adds one
+column, not three: what the step *measured* is an attribute of the column it
+revealed, not a column of its own (see below).
 
 ## Two objects, and the second is a dataframe
 
@@ -61,13 +84,21 @@ a table cannot get from being a table:
 
 | verb | what it does |
 |---|---|
-| `hop` | one traversal: one result row per edge, and the edge's own columns beside it |
+| `hop` | one traversal: one result row per edge |
 | `paths` | several lengths of walk in one frame, folded between the steps |
-| `like` | graded membership over a text column — the search box |
-| `degree` | a node's arity, as a fact about the graph |
-| `having` / `missing` | whether such an edge exists, without walking it |
 | `attrs` | a stored attribute as a column |
 | `labels` | the column a person reads, per the graph's `readable` map |
+
+Four, and no more, because everything else a graph can be asked is a *condition*
+— and conditions go where conditions go:
+
+```python
+.filter(v.movie.year >= 1990)                 # an attribute
+.filter(v.movie.has_genre.count() >= 2)       # a relation's arity
+.filter(v.movie.directed_by.is_in(people))    # an edge exists
+.filter(v.movie.label.like("tarantino"))      # graded membership
+.filter(v.rec.type == "movie")                # the type of a node
+```
 
 Everything else is polars, forwarded verb by verb: `filter`, `with_columns`,
 `select`, `group_by` / `agg`, `sort`, `unique`, `join`, `head`, `top`. The list
@@ -129,33 +160,65 @@ Without that rule a method on the class would win the attribute lookup and
 `v.person.name` would silently mean something else — which is the worst way for
 a query language to be wrong, since it returns an answer.
 
-## Membership is graded
+## Membership is graded, and the measure is kept
 
 A filter answers *yes* or *no*. `like` answers *how much*, in `[0, 1]`, and that
 single idea is what the library is built around.
 
 ```python
-g.nodes("person").labels("person").like(v.person.label, ["tarantino"])
-```
-
-```
-┌────────┬───────────────────┬────────────┐
-│ person ┆ person.label      ┆ similarity │
-╞════════╪═══════════════════╪════════════╡
-│ 1972   ┆ Quentin Tarantino ┆ 1.0        │
-└────────┴───────────────────┴────────────┘
+g.nodes("person").filter(v.person.label.like("tarantino"))
 ```
 
 A set of strings is a **search box, not a filter**: `like` admits the `k` values
 closest to each needle rather than a region around them. So a fragment finds the
 whole (`"tarantino"` → *Quentin Tarantino*), a typo still lands (`"George Lukas"`
-→ *George Lucas*), and asking for nothing returns nothing. Admission and weight
-come from one measure, so the rows that come back are exactly the ones a ranking
-would have put on top.
+→ *George Lucas*), and asking for nothing returns nothing.
 
-And the measure stays. `similarity` is an ordinary column: add it to a score,
-sort by it, or ignore it — but it is *there*, in the table, instead of quietly
-becoming a ranking term nobody wrote.
+It is a condition like any other, so it goes in `filter` — but the measure that
+decided admission is not thrown away. It becomes the **confidence of the column
+it judged**:
+
+```python
+(g.nodes("person")
+   .filter(v.person.label.like("tarantino", k=3))
+   .with_columns(closeness=v.person.label.score)
+   .sort(v.person.label.score, descending=True))
+```
+
+Admission and weight are one computation, so they cannot disagree — the rows
+that come back are exactly the ones a ranking would have put on top.
+
+## Every column has a confidence
+
+That is not a special case for `like`. **Every column carries a `[0, 1]`
+confidence per row**, and `v.A.score` reads it whatever produced `A`:
+
+| what produced the column | what its confidence is |
+|---|---|
+| `hop` | the weight of the edge that revealed it, on that relation's own scale |
+| `like` | how close the value was to what you asked for |
+| anything else | `1.0` — nothing put it in doubt |
+
+```python
+.hop(tag="has_tag").filter(v.tag.score >= 0.9)     # the edge's relevance
+.filter(v.person.label.like("tarantino"))
+ .sort(v.person.label.score, descending=True)      # the same reading
+```
+
+A column also remembers **how** it was reached — `v.tag.via` is the relation the
+hop walked, `~has_interact` for a step taken against the stored direction — and
+`v.rec.type` is the node type its ids fall in.
+
+None of the three is a column. They are attributes of one, kept in shadow
+columns polars keeps aligned for free, hidden from `columns` and from `print`,
+and **not allocated at all when they say the same thing about every row**: on an
+unweighted graph, confidence costs nothing.
+
+That per-relation scale is not a detail. A 1-5 rating and a cosine similarity
+are both floats and mean nothing to each other, so a confidence is min-maxed
+*within its own relation* — which is what makes it a quantity you can compare,
+threshold and sum. The raw stored weight is still there, in `g.edges(...)`,
+where it is what it is.
 
 ## One relation, two directions
 
@@ -163,16 +226,20 @@ There is no `directed_by_r`. Each edge is stored once, as an edge-labeled CSR
 plus its transpose, and direction belongs to the traversal:
 
 ```python
-.hop("directed_by", to="person")                  # movie -> person
-.hop("directed_by", to="movie", reverse=True)     # person -> the films they directed
-.hop(to="other")                                  # wildcard: any relation, either way
+.hop(person="directed_by")                    # movie -> person
+.hop(movie="directed_by", reverse=True)       # person -> the films they directed
+.hop(other="*")                               # wildcard: any relation, either way
 ```
 
+The keyword is the name of the new column and its value is the relation walked
+to fill it — the same shape as `g.nodes(rec="movie")`, where the keyword names
+and the value says what. That is the answer to "what is `rec`": it is `AS rec`,
+not `TO rec`.
+
 The wildcard walking both ways is what lets a two-hop bridge close —
-`.hop(to="mid").hop(to="rec")` — without duplicating every edge in memory to
-fake it. A wildcard hop also brings back a `<edge>.rel` column naming what it
-walked, `~has_interact` for a step taken against the stored direction; a named
-hop does not, because every row would carry the same word.
+`.hop(mid="*").hop(rec="*")` — without duplicating every edge in memory to fake
+it. Which relation a wildcard walked comes back as `v.mid.via`; after a named
+hop it is the name you gave, since every row would carry the same word.
 
 ### What a hop actually does
 
@@ -210,7 +277,7 @@ next step does not need — and write the filter, because a hop does not build i
 rows until something needs them:
 
 ```python
-frame.hop("has_genre", to="rec", reverse=True).filter(v.rec.year >= 1990)
+frame.hop(rec="has_genre", reverse=True).filter(v.rec.year >= 1990)
 ```
 
 The predicate reaches the Frame before it reaches polars, and everything it
@@ -221,40 +288,25 @@ proportion to what the frame is carrying: on a MovieLens hop it is **24% faster
 on a 14-column frame** and a wash on a 2-column one, which is the same cost
 model read from the other side.
 
-`hop(where=...)` says it explicitly, for a set of nodes that is not a predicate:
+This is why `hop` has no `where=`, no `type=` and no `norm=`: each of those was
+a condition wearing a parameter's clothes, and a condition written as one is
+both clearer and no slower.
 
-```python
-recent = g.nodes("movie").attrs(movie="year").filter(v.movie.year >= 1990)
-frame.hop("has_genre", to="rec", reverse=True, where=recent)
-```
-
-There is deliberately **no** such parameter for the edge's weight. It was
+There is deliberately **no** parameter for the edge's weight either. It was
 written, measured and removed: filtering the weight array before building the
 frame beats polars' own comparison only below about 1% selectivity, and costs
 twice as much at 39%. A knob whose right setting requires knowing the
-selectivity curve is worse than no knob — so a weight stays a column, and
-`.filter(v.x.score >= 3)` after the hop is both the spelling and the fast path
-(it is pushed too, being about the step).
+selectivity curve is worse than no knob — so a weight stays what it is, the
+column's confidence, and `.filter(v.rec.score >= 0.9)` after the hop is both the
+spelling and the fast path (it is pushed too, being about the step).
 
-## Edges carry a weight, and a weight is a column
+## What a training run may see
 
 A rating, a similarity, a confidence — every edge has one, defaulting to `1.0`
 for the ones nobody scored. It lives in the file, so the graph holds all of it,
-and *how much of it counts* is asked per query:
-
-```python
-(g.nodes(user="user")
-   .hop("has_interact", to="rec")
-   .filter(v.has_interact.score >= 3))            # ...or rank by it instead
-```
-
-There is no score band, no admission mask, no threshold argument: the weight
-came back from the hop as a column, and a column is filtered by filtering it.
-
-The stored score is an unbounded float, which is honest and useless to anything
-that has to accumulate one. `hop(..., norm=True)` rescales it to `[0, 1]`
-**within its own relation** — a 1-5 rating and a cosine similarity are both
-floats and mean nothing to each other.
+and *how much of it counts* is asked per query: after a hop it is the reached
+column's confidence, and `g.edges(...)` hands back the raw table when the raw
+number is the quantity you mean.
 
 ```python
 PageRank(weighted=True)                                  # a 5-star step carries more walker
@@ -272,12 +324,11 @@ with a visible answer — `len(where)` — rather than a marker object.
 
 ```python
 (g.nodes(seed=watchlist)
-   .hop("has_tag", to="tag", as_="shared", norm=True).filter(v.shared.score >= 0.9)
-   .hop("has_tag", to="rec", reverse=True, as_="carried", norm=True)
-   .filter(v.carried.score >= 0.9)
+   .hop(tag="has_tag").filter(v.tag.score >= 0.9)
+   .hop(rec="has_tag", reverse=True).filter(v.rec.score >= 0.9)
    .filter(~v.rec.is_in(watchlist))
-   .group_by(v.rec).agg(score=v.carried.score.sum(),
-                        via=v.tag.first())
+   .group_by(v.rec).agg(score=v.rec.score.sum(),
+                        through=v.tag.first())
    .top(10))
 ```
 
@@ -296,21 +347,15 @@ itself with alongside the sum that ranked it.
 There is no `Path` object, because the columns already are one:
 
 ```python
-g.nodes(seed=seeds).hop(to="mid").hop(to="rec", type="movie")
-# columns: seed, mid, mid.score, mid.rel, rec, rec.score, rec.rel
+g.nodes(seed=seeds).hop(mid="*").hop(rec="*").filter(v.rec.type == "movie")
+# columns: seed, mid, rec   -- and v.mid.via, v.rec.score, ... on each
 ```
 
-Explaining a result is a projection — `row["seed.label"]`, `row["rec.rel"]` —
-rather than unpacking an alternating tuple of keys and relations. Two routes to
-the same node are two frames, and `concat` puts them together; the column one
-branch lacks comes back null, which is exactly what "reached the other way"
-means.
-
-```python
-direct = g.nodes(seed=seeds).hop(to="rec", type="movie")
-bridge = g.nodes(seed=seeds).hop(to="mid").hop(to="rec", type="movie")
-jb.concat(direct, bridge)
-```
+Explaining a result is a projection — `row["seed.label"]`, `v.rec.via` — rather
+than unpacking an alternating tuple of keys and relations. Two routes to the
+same node are two frames, and `concat` puts them together; the column one branch
+lacks comes back null, which is exactly what "reached the other way" means. Or,
+in one verb that folds between the steps, `paths` (below).
 
 ## Ranking is a column, and the arithmetic is written down
 
@@ -556,17 +601,16 @@ every film scores against every tag — so `build.py` takes 0.3 as the relevance
 at which an edge starts existing, and a query narrows it from there:
 
 ```python
-(g.nodes(seed="movie").attrs(seed="title").filter(v.seed.title == "Blade Runner")
-   .hop("has_tag", to="tag", as_="strong", norm=True).filter(v.strong.score >= 0.95)
-   .hop("has_tag", to="rec", reverse=True, as_="carried", norm=True)
-   .filter(v.carried.score >= 0.95).filter(v.rec != v.seed)
-   .group_by(v.rec).agg(score=v.carried.score.sum(), via=v.tag.first())
-   .top(4).attrs(rec="title").labels("via"))
+(g.nodes(seed="movie").filter(v.seed.title == "Blade Runner")
+   .hop(tag="has_tag").filter(v.tag.score >= 0.95)
+   .hop(rec="has_tag", reverse=True).filter(v.rec.score >= 0.95, v.rec != v.seed)
+   .group_by(v.rec).agg(score=v.rec.score.sum(), through=v.tag.first())
+   .top(4).labels("rec", "through"))
 ```
 
 ```
 ┌────────────────────┬──────────┬─────────────────┐
-│ rec.title          ┆ score    ┆ via.label       │
+│ rec.label          ┆ score    ┆ through.label   │
 ╞════════════════════╪══════════╪═════════════════╡
 │ Oblivion           ┆ 8.865    ┆ dystopic future │
 │ Matrix, The        ┆ 7.856071 ┆ cyberpunk       │
@@ -636,11 +680,12 @@ rather than once per edge: 2.78 M edges load in ~1.1 s.
 ### Several lengths at once
 
 ```python
-g.nodes(seed=found).paths(to="rec", type="movie", hops=(1, 2), through="person")
+g.nodes(seed=found).paths(v.rec.type == "movie", rec="*", hops=(1, 2), through="person")
 ```
 
 Each length is a branch, the branches are concatenated diagonally, and a `hops`
-column says which one a row came from. It is a verb rather than sugar over
+column says which one a row came from. Conditions given to it are applied to
+each branch *before* its rows are built. It is a verb rather than sugar over
 `hop` + `concat` because of the fold between the steps: two routes that meet at
 an intermediate carry identical rows onward, and dropping one is what the old
 engine's memoized sub-path search was for. `keep_via=True` keeps the walk as
@@ -650,16 +695,14 @@ would collapse are the answer.
 ### What a relation can say without being walked
 
 ```python
-.degree("has_genre", of="movie")            # -> movie.has_genre_count
-.having("directed_by", where=people)        # directs one of these
-.missing("has_interact", where=watched)     # has not seen any of these
+.filter(v.movie.has_genre.count() >= 2)     # its arity, as a fact about the graph
+.filter(v.movie.directed_by.is_in(people))  # an edge to one of these exists
 ```
 
-`degree` is a fact about the graph — the same number whatever the query asked,
-which is what tells it apart from `group_by(...).agg(count)`. `having` never
-expands the frame: with no `where` it reads the graph's own count, and with one
-it walks the *given* set backwards and collects what reaches it, so the cost is
-the degree of `where`. Pass the smaller side.
+The count is a fact about the graph — the same number whatever the query asked,
+which is what tells it apart from `group_by(...).agg(count)`. Neither expands
+the frame: existence with a set walks the *given* side backwards and collects
+what reaches it, so the cost is the degree of that set. Pass the smaller one.
 
 ```
 jerboas/

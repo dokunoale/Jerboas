@@ -29,14 +29,13 @@ def candidates(graph, users, k):
     twice. Without it the middle of the walk is the product of three degrees.
     """
     watched = (graph.nodes(user=users)
-               .hop("has_interact", to="seen", type="movie")
+               .hop(seen="has_interact")
                .select("user", "seen"))
 
     reached = (watched
-               .hop("has_interact", to="peer", type="user", reverse=True,
-                    from_="seen", as_="by")
+               .hop(peer="has_interact", reverse=True, from_="seen")
                .select("user", "peer").unique(["user", "peer"])
-               .hop("has_interact", to="rec", type="movie", from_="peer")
+               .hop(rec="has_interact", from_="peer")
                .select("user", "rec").unique(["user", "rec"]))
 
     return (reached

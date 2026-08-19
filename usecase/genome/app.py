@@ -31,7 +31,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 import jerboas as jb
-from jerboas import v
+from jerboas import SCORE, shadow, v
 
 DATA_DIR = "./data/genome"
 
@@ -69,7 +69,7 @@ def resolve(graph, titles):
     wanted = [filed_as(title.strip()) for title in titles if title and title.strip()]
     if not wanted:
         return None
-    return graph.nodes(seed="movie").like(v.seed.title, wanted, k=1).select("seed")
+    return graph.nodes(seed="movie").filter(v.seed.title.like(wanted, k=1)).select("seed")
 
 
 def shared(graph, seeds, strength):
@@ -79,13 +79,13 @@ def shared(graph, seeds, strength):
     so the two cannot drift apart -- where they used to be two queries repeating
     the same pattern in the hope of agreeing.
 
-    The tag weight is normalized on the way out of the hop, because a sum of
-    unbounded scores is arithmetic on a scale nobody chose."""
+    A tag's relevance arrives as the confidence of the column it revealed --
+    `v.tag.score`, on the [0, 1] scale of its own relation, because a sum of
+    unbounded scores is arithmetic on a scale nobody chose. Both filters are
+    written after their hop and applied before its rows are built."""
     return (graph.nodes(seed=seeds)
-            .hop("has_tag", to="tag", as_="strong", norm=True)
-            .filter(v.strong.score >= strength)
-            .hop("has_tag", to="rec", reverse=True, as_="carried", norm=True)
-            .filter(v.carried.score >= strength)
+            .hop(tag="has_tag").filter(v.tag.score >= strength)
+            .hop(rec="has_tag", reverse=True).filter(v.rec.score >= strength)
             .filter(~v.rec.is_in(seeds)))                 # already on the list
 
 
@@ -101,7 +101,7 @@ def suggest(graph, watchlist, k, strength):
 
     ranked = (matches
               .group_by(v.rec)
-              .agg(score=v.carried.score.sum(),
+              .agg(score=v.rec.score.sum(),
                    # the evidence, strongest tag first: an aggregate collapses
                    # the rows it was computed from, so what explains a film is
                    # gathered in the same breath as what ranks it.
@@ -109,7 +109,8 @@ def suggest(graph, watchlist, k, strength):
                    # Deduplicated, unlike the score: a tag shared with two of
                    # your films is twice the evidence, and the same word twice
                    # in a list of reasons is a bug.
-                   shared=v.tag.expr.sort_by(pl.col("carried.score"), descending=True)
+                   shared=v.tag.expr.sort_by(pl.col(shadow(SCORE, "rec")),
+                                              descending=True)
                                     .unique(maintain_order=True).head(5))
               .top(k)
               .attrs(rec=["title", "year"]))

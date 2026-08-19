@@ -323,7 +323,7 @@ def test_scores_each_row_against_its_own_seed(small_graph, fitted):
     model, path = fitted
     loaded = type(model).load(path, small_graph)
     frame = (small_graph.nodes(seed=["person.0", "person.1"])
-             .hop("directed_by", to="rec", reverse=True)
+             .hop(rec="directed_by", reverse=True)
              .with_columns(score=loaded.on("rec", "seed")))
     assert len(frame) == 3 and frame.pl["score"].null_count() == 0
 

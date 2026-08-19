@@ -58,8 +58,8 @@ def seeds(graph, wanted):
     for type_, names in wanted.items():
         asked = [name.strip() for name in (names or []) if name and name.strip()]
         if asked:
-            frames.append(graph.nodes(seed=type_).labels("seed")
-                          .like(v.seed.label, asked)
+            frames.append(graph.nodes(seed=type_)
+                          .filter(v.seed.label.like(asked))
                           .select("seed"))
     return concat(*frames) if frames else None
 
@@ -72,7 +72,7 @@ def expanded(graph, found):
     named the walk is undirected, so the bridge closes whichever way the edges
     happen to be stored; `hops` says which branch a row came from, and the fold
     between the steps is why a two-hop bridge over 15 000 nodes stays small."""
-    return graph.nodes(seed=found).paths(to="rec", type="movie", hops=(1, 2))
+    return graph.nodes(seed=found).paths(v.rec.type == "movie", rec="*", hops=(1, 2))
 
 
 def rank_films(graph, model, found, exclude, k):
@@ -95,7 +95,8 @@ def rank_films(graph, model, found, exclude, k):
             .sort("score", descending=True)
             .unique("rec")
             .head(k)
-            .labels("rec", "seed"))
+            .labels("rec", "seed")
+            .with_columns(**{"rec.via": v.rec.via}))
 
 
 def explain(row):
@@ -107,7 +108,7 @@ def explain(row):
     seed = row["seed.label"]
     if row["hops"] > 1:
         return f"shares something with {seed}"
-    relation = str(row["rec.rel"] or "").lstrip("~").replace("_", " ")
+    relation = str(row["rec.via"] or "").lstrip("~").replace("_", " ")
     return f"{relation} {seed}"
 
 
