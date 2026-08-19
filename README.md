@@ -717,6 +717,28 @@ the walk that connected each result to your seeds. It needs
 
 50 ms a request, graph and checkpoint held in memory.
 
+`spotify` is the third one, on the Million Playlist Dataset: name a few songs
+and it answers with five more that belong beside them. There is no playlist node
+for what you brought — what stands in for it is the crowd of real playlists that
+already contain your songs.
+
+```
+-> ['Toxic -- Britney Spears', 'Bad Romance -- Lady Gaga']
+
+0.86  ...Baby One More Time    Britney Spears    [447 playlists]
+0.85  Poker Face               Lady Gaga         [530]
+0.85  Womanizer                Britney Spears    [433]
+0.84  Hollaback Girl           Gwen Stefani      [646]
+```
+
+Three signals, and the query says how much each counts: the **graph** finds the
+candidates, the **count** is the evidence (damped — twice as many playlists is
+not twice as good an answer), and the **model** is the taste. On its own the
+factorization is a poor recommender on this data, and the use case says why; as
+a re-ranker over songs the crowd already agrees on, it is what separates *the
+same artists* from *the same decade*. 0.2–1 s a request on the 100 000-playlist
+cut, and it needs `pip install -e '.[api]'` plus the dataset below.
+
 The MovieLens graph used by that use case and the benchmarks is **not** included:
 GroupLens' usage licence states that "the user may not redistribute the data
 without separate permission", and the IMDb-derived files are non-commercial-use

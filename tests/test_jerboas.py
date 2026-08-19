@@ -181,8 +181,12 @@ def test_a_node_with_no_such_edge_drops_out(small_graph):
     assert len(small_graph.nodes("genre").hop(person="directed_by")) == 0
 
 
-def test_an_unknown_relation_matches_nothing(small_graph):
-    assert len(small_graph.nodes("movie").hop(person="produced_by")) == 0
+def test_an_unknown_relation_is_refused(small_graph):
+    """Walking one matches nothing, which is a defensible answer to a question
+    about a relation that exists elsewhere and an indefensible one to a typo --
+    and a hop names its relation on purpose."""
+    with pytest.raises(ValueError, match="no relation 'produced_by'"):
+        small_graph.nodes("movie").hop(person="produced_by")
 
 
 def test_a_hop_needs_at_least_one_named_step(small_graph):
@@ -303,6 +307,14 @@ def test_names_resolve_column_then_attribute_then_relation(tmp_path):
 def test_a_name_that_is_neither_says_so(small_graph):
     with pytest.raises(ValueError, match="no attribute 'plot'.*no relation"):
         small_graph.nodes("movie").filter(v.movie.plot == "x")
+
+
+def test_row_wise_maths_shapes_a_score(small_graph):
+    """A count is not a weight until something has flattened it."""
+    frame = (small_graph.nodes(user="user").hop(rec="has_interact")
+             .group_by(v.rec).agg(n=pl.len().cast(pl.Float64))
+             .with_columns(score=v.n.log1p()))
+    assert frame.pl["score"].to_list() == [pytest.approx(np.log1p(2))] * 3
 
 
 def test_expressions_combine_and_refuse_to_be_bool(small_graph):
@@ -836,6 +848,44 @@ def test_weight_ranks_by_the_weight_the_data_put_on_a_node(small_graph):
     weights = dict(zip(names(frame), frame.pl["w"].to_list()))
     assert weights["movie.0"] == 8.0                          # rated 5 and 3
     assert weights["movie.1"] == 5.0                          # rated 1 and 4
+
+
+def test_a_factorization_can_be_told_what_to_learn_from(small_graph):
+    """A factorization of everything is a factorization of mostly nothing when
+    the long tail is long enough, and which part of it to keep is a claim about
+    the data that only the caller can make."""
+    liked = small_graph.edges("has_interact").filter(v.score >= 4)
+    narrow = MatrixFactorization(factors=2, iterations=3, user="user.0", where=liked)
+    whole = MatrixFactorization(factors=2, iterations=3, user="user.0")
+    frame = small_graph.nodes("movie")
+    assert (frame.with_columns(mf=narrow.on("movie")).pl["mf"].to_list()
+            != frame.with_columns(mf=whole.on("movie")).pl["mf"].to_list())
+
+
+def test_what_it_learns_from_may_run_either_way(small_graph):
+    """`g.edges("has_interact")` runs user to movie and its reverse runs the
+    other way; the pair is sorted rather than assumed."""
+    forwards = small_graph.edges("has_interact")
+    backwards = forwards.rename({"source": "target", "target": "source"})
+    frame = small_graph.nodes("movie")
+    one = MatrixFactorization(factors=2, iterations=3, user="user.0", where=forwards)
+    other = MatrixFactorization(factors=2, iterations=3, user="user.0", where=backwards)
+    assert (frame.with_columns(mf=one.on("movie")).pl["mf"].to_list()
+            == frame.with_columns(mf=other.on("movie")).pl["mf"].to_list())
+
+
+def test_a_fitted_factorization_re_aims_without_refitting(small_graph):
+    """Fitting costs seconds and choosing what to compare against costs nothing,
+    so a service fits once at startup and re-aims per request."""
+    model = DiffusedMatrixFactorization(factors=2, iterations=3)
+    model.fit(small_graph)
+    cache = model.__dict__["_strategy_cache"]
+    aimed = model.seeded(small_graph.nodes(seed=["movie.0"]))
+    assert aimed.__dict__["_strategy_cache"] is cache        # shared, not copied
+    assert aimed.to is not None and model.to is None
+    frame = small_graph.nodes("movie").with_columns(d=aimed.on("movie"))
+    assert len(cache) == len(model.__dict__["_strategy_cache"])   # nothing refitted
+    assert frame.pl["d"].to_list()[0] > 0                          # movie.0 against itself
 
 
 def test_matrix_factorization_needs_to_be_told_whose_taste(small_graph):

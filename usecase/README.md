@@ -8,6 +8,7 @@ graph, a query or a model, because that is the part worth writing twice.
 usecase/
   coldstart/app.py     recommend films from people, genres or titles you name
   genome/app.py        recommend films that belong beside a watchlist
+  spotify/app.py       five songs to add to a handful you name
 ```
 
 The two answer the same question from opposite ends, which is the point of

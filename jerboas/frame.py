@@ -215,9 +215,10 @@ class Frame:
             raise ValueError(
                 "the last step of a hop must be named: where the walk ends is "
                 "what the frame holds. hop(..., rec=\"has_genre\")")
-        for _spec, name in steps:
+        for spec, name in steps:
             if name is not None:
                 self._claim(name)
+            self._known(spec)
 
         budget = row_budget()
         if budget is not None and self._produces(steps[0][0]) > budget:
@@ -271,6 +272,19 @@ class Frame:
         last = steps[-1][1]
         return Frame(graph, None, variables, pending=Pending(base, rows, added, last),
                      via=via)
+
+    def _known(self, spec):
+        """Refuse a step over a relation the graph has never seen.
+
+        Walking one matches nothing, which is a defensible answer to a question
+        about a relation that exists elsewhere and an indefensible one to a
+        typo -- and a hop names its relation on purpose, so a name the graph
+        does not have is the second."""
+        for name, _backwards in (_relations(spec) or ()):
+            if self.graph.relation_code(name) is None:
+                raise ValueError(
+                    f"no relation {name!r} in this graph; it has: "
+                    f"{', '.join(self.graph.relations)}")
 
     def _produces(self, spec):
         """Exactly how many rows one step out of this frame would make.

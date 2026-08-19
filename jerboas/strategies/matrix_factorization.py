@@ -1,9 +1,14 @@
 """Implicit-feedback matrix factorization, and its diffused variant.
 
 Both read the user-item matrix as a block slice of the relation matrix the
-Graph already holds, rather than assembling their own CSR from the adjacency."""
+Graph already holds, rather than assembling their own CSR from the adjacency --
+or, with `where`, from a frame of the interactions they are allowed to learn
+from."""
+
+import copy
 
 import numpy as np
+import scipy.sparse as sp
 
 from ..core import Strategy
 
@@ -31,7 +36,7 @@ class MatrixFactorization(Strategy):
 
     def __init__(self, factors=8, iterations=20, regularization=0.05, seed=42,
                  item_type="movie", user_type="user", relation="has_interact",
-                 weighted=False, user=None):
+                 weighted=False, user=None, where=None):
         self.factors = factors
         self.iterations = iterations
         self.regularization = regularization
@@ -41,27 +46,57 @@ class MatrixFactorization(Strategy):
         self.relation = relation
         self.weighted = weighted
         self.user = user                 # one user for the whole frame, if named
+        self.where = where               # the interactions it may learn from
 
     def fit(self, graph):
         self._graph = graph
-        self._last_fit = self.cached(graph, "factors", lambda: self._compute_factors(graph))
+        key = ("factors", None if self.where is None else id(self.where))
+        self._last_fit = self.cached(graph, key, lambda: self._compute_factors(graph))
         return self._last_fit
 
     def _compute_factors(self, graph):
         """The user-item matrix is the interaction relation restricted to the two
         type blocks -- a slice of a matrix the Graph already holds, where this
-        used to be a hand-built CSR with its own index arrays."""
+        used to be a hand-built CSR with its own index arrays.
+
+        `where` narrows it to a frame of interactions, the same way `train`
+        narrows what a model may learn from. It is not a nicety: a factorization
+        of everything is a factorization of mostly nothing when the long tail is
+        long enough, and which part of the tail to keep is a claim about the
+        data that only the caller can make."""
         users = graph.block(self.user_type)
         items = graph.block(self.item_type)
         weights = "raw" if self.weighted else None
-        matrix = graph.relation_matrix(self.relation, weights)[users[0]:users[1],
-                                                               items[0]:items[1]]
+        if self.where is not None:
+            matrix = self._from_frame(graph, users, items)
+        else:
+            matrix = graph.relation_matrix(self.relation, weights)[users[0]:users[1],
+                                                                   items[0]:items[1]]
         matrix = matrix.tocsr()
         if not self.weighted:
             matrix.data.fill(1.0)  # CSR sums duplicate entries; feedback stays binary
         matrix.sort_indices()
         user_factors, item_factors = self._factorize(matrix)
         return users, items, user_factors, item_factors
+
+    def _from_frame(self, graph, users, items):
+        """The interactions a frame of edges holds, as the same sparse matrix.
+
+        Either endpoint may be on either side -- `g.edges("contains")` runs
+        playlist to song and its reverse runs the other way -- so the pair is
+        sorted into (user, item) rather than assumed."""
+        frame = self.where.pl if hasattr(self.where, "pl") else self.where
+        source = frame["source"].to_numpy()
+        target = frame["target"].to_numpy()
+        forwards = (source >= users[0]) & (source < users[1])
+        user_ids = np.where(forwards, source, target) - users[0]
+        item_ids = np.where(forwards, target, source) - items[0]
+        keep = ((user_ids >= 0) & (user_ids < users[1] - users[0])
+                & (item_ids >= 0) & (item_ids < items[1] - items[0]))
+        data = (frame["score"].to_numpy() if self.weighted and "score" in frame.columns
+                else np.ones(len(source)))
+        return sp.csr_matrix((data[keep], (user_ids[keep], item_ids[keep])),
+                             shape=(users[1] - users[0], items[1] - items[0]))
 
     def scores(self, graph, columns):
         """on("item") with `user=` given, or on("item", "user") per row."""
@@ -138,6 +173,20 @@ class DiffusedMatrixFactorization(MatrixFactorization):
     def __init__(self, *args, to=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.to = to
+
+    def seeded(self, to):
+        """The same fitted factors, aimed at a different seed set.
+
+        Fitting costs seconds and choosing what to compare against costs
+        nothing, so a service fits once at startup and calls this per request.
+        The cache is shared rather than copied, which is what makes the second
+        call free -- and shared read-only, so concurrent requests do not tread
+        on each other."""
+        clone = copy.copy(self)
+        clone.to = to
+        clone.__dict__["_strategy_cache"] = self.__dict__.setdefault(
+            "_strategy_cache", {})
+        return clone
 
     def embeddings(self, graph):
         # both halves come out of one cache entry: recomputing on a cache hit is
