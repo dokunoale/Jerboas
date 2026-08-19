@@ -62,7 +62,10 @@ a table cannot get from being a table:
 | verb | what it does |
 |---|---|
 | `hop` | one traversal: one result row per edge, and the edge's own columns beside it |
+| `paths` | several lengths of walk in one frame, folded between the steps |
 | `like` | graded membership over a text column — the search box |
+| `degree` | a node's arity, as a fact about the graph |
+| `having` / `missing` | whether such an edge exists, without walking it |
 | `attrs` | a stored attribute as a column |
 | `labels` | the column a person reads, per the graph's `readable` map |
 
@@ -72,13 +75,13 @@ is finite and documented rather than caught by `__getattr__`, and `.pl` hands
 back the DataFrame for anything not on it. `.to_polars()`, `.to_pandas()` and
 `np.asarray(frame)` need no adapter, because there is nothing to adapt.
 
-## A variable is a column name
+## A variable is a column name, resolved late
 
 ```python
 from jerboas import v
 
 v.rec              # the column "rec"
-v.rec.year         # the column "rec.year", as a polars expression
+v.rec.year         # the column "rec.year"
 v.rec.year >= 1990
 ```
 
@@ -87,8 +90,29 @@ they are the same string, so there is no rule to learn about when two
 identical-looking references are one thing and when they are two — and a frame
 prints the variables it is holding, because they are its headers.
 
-`v.x` is sugar: strings work everywhere it does (`top(10, by="score")`), and
-`col("rec.sum")` spells out a name that collides with a method.
+What makes it more than sugar is *when* the name is decided. Nothing becomes a
+polars expression where it is written: `v.movie.has_genre >= 2` is a little tree
+of names, and the Frame — the only thing that knows the graph — resolves it. A
+name resolves in this order, and the order is the whole rule:
+
+1. **a column the frame already has**
+2. **an attribute of that variable's type** — read out of the graph, on demand
+3. **a relation of the graph** — arity with `.count()`, existence with `.is_in(...)`
+
+```python
+.filter(v.movie.year >= 1990)                 # no .attrs() first: it is read
+.filter(v.movie.has_genre.count() >= 2)       # a relation's arity
+.filter(v.movie.directed_by.is_in(people))    # the edge exists, unexpanded
+```
+
+A filter filters rows, not columns: what it read to decide is taken off again,
+so the frame's shape does not change under it. `.attrs(movie="year")` is how a
+column stays.
+
+When a type has an attribute named like a relation, the tie is refused rather
+than guessed, and `v.movie.attr.knows` / `v.movie.rel.knows` say which. `.expr`
+drops out to raw polars — the column by that exact name, unresolved — and plain
+strings still work wherever a name is wanted (`top(10, by="score")`).
 
 ## Membership is graded
 
@@ -166,26 +190,36 @@ users who watched the same film reach the same neighbours, and carrying that row
 twice is what the old engine's memoized sub-path search existed to avoid.
 
 **The walk is the cheap half.** The expensive half is `frame[rows]`, which drags
-every column the frame already has into every new row. `select` away what the
-next step does not need, and say in advance what the step is allowed to land on:
+every column the frame already has into every new row. So `select` away what the
+next step does not need — and write the filter, because a hop does not build its
+rows until something needs them:
+
+```python
+frame.hop("has_genre", to="rec", reverse=True).filter(v.rec.year >= 1990)
+```
+
+The predicate reaches the Frame before it reaches polars, and everything it
+reads is about the node just reached, so it is applied to the arrays the walk
+produced rather than to the rows they would have become. This is the compiler's
+old admission mask, obtained by writing an ordinary filter — and it pays in
+proportion to what the frame is carrying: on a MovieLens hop it is **24% faster
+on a 14-column frame** and a wash on a 2-column one, which is the same cost
+model read from the other side.
+
+`hop(where=...)` says it explicitly, for a set of nodes that is not a predicate:
 
 ```python
 recent = g.nodes("movie").attrs(movie="year").filter(v.movie.year >= 1990)
-
-frame.hop("has_genre", to="rec", reverse=True, where=recent)   # never built
-frame.hop("has_genre", to="rec", reverse=True).filter(...)     # built, then dropped
+frame.hop("has_genre", to="rec", reverse=True, where=recent)
 ```
-
-`where` is the compiler's old admission mask, back where it belongs: same rows,
-34% less time on a MovieLens hop admitting 3% of what it walked, tapering to
-nothing as the admission widens.
 
 There is deliberately **no** such parameter for the edge's weight. It was
 written, measured and removed: filtering the weight array before building the
 frame beats polars' own comparison only below about 1% selectivity, and costs
 twice as much at 39%. A knob whose right setting requires knowing the
 selectivity curve is worse than no knob — so a weight stays a column, and
-`.filter(v.x.score >= 3)` after the hop is both the spelling and the fast path.
+`.filter(v.x.score >= 3)` after the hop is both the spelling and the fast path
+(it is pushed too, being about the step).
 
 ## Edges carry a weight, and a weight is a column
 
@@ -580,13 +614,41 @@ chunk — and the ids come from `dict.fromkeys`, which deduplicates in C and in
 first-seen order at once. What is left in Python runs once per *distinct node*
 rather than once per edge: 2.78 M edges load in ~1.1 s.
 
+### Several lengths at once
+
+```python
+g.nodes(seed=found).paths(to="rec", type="movie", hops=(1, 2), through="person")
+```
+
+Each length is a branch, the branches are concatenated diagonally, and a `hops`
+column says which one a row came from. It is a verb rather than sugar over
+`hop` + `concat` because of the fold between the steps: two routes that meet at
+an intermediate carry identical rows onward, and dropping one is what the old
+engine's memoized sub-path search was for. `keep_via=True` keeps the walk as
+`via_1`, `via_2`, … — and then nothing can be folded, because the columns that
+would collapse are the answer.
+
+### What a relation can say without being walked
+
+```python
+.degree("has_genre", of="movie")            # -> movie.has_genre_count
+.having("directed_by", where=people)        # directs one of these
+.missing("has_interact", where=watched)     # has not seen any of these
+```
+
+`degree` is a fact about the graph — the same number whatever the query asked,
+which is what tells it apart from `group_by(...).agg(count)`. `having` never
+expands the frame: with no `where` it reads the graph's own count, and with one
+it walks the *given* set backwards and collects what reaches it, so the cost is
+the degree of `where`. Pass the smaller side.
+
 ```
 jerboas/
   core.py         Strategy, and the Signal that aims one at columns
   graph.py        the data: integer ids, CSR adjacency, typed columns, nodes()/edges()
   frame.py        the query: a polars frame that knows its graph
   traverse.py     one hop, as a gather over CSR slices
-  expr.py         v / col -- a variable is a column name
+  expr.py         v / col -- names, resolved by the frame that has the graph
   fuzzy.py        graded membership over a text column
   columns.py      typed, nullable attribute columns
   keys.py         Key -- a node, outside the frame

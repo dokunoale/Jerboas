@@ -242,6 +242,122 @@ def test_a_hop_cannot_overwrite_an_existing_variable(small_graph):
         walked.hop("has_genre", to="movie", reverse=True)
 
 
+# --- a name is resolved late, by the frame that has the graph ----------------
+
+def test_an_attribute_is_read_on_demand(small_graph):
+    """No `.attrs()` first: the predicate reaches the frame unresolved, and the
+    frame knows `year` is a column of a movie."""
+    assert names(small_graph.nodes("movie").filter(v.movie.year >= 1999)) == ["movie.2"]
+
+
+def test_a_filter_filters_rows_and_not_columns(small_graph):
+    """What it read to decide is not left behind: the frame's shape does not
+    change under a filter, and `.attrs()` is how a column stays."""
+    frame = small_graph.nodes("movie").filter(v.movie.year >= 1994)
+    assert frame.columns == ["movie"]
+    kept = small_graph.nodes("movie").attrs(movie="year").filter(v.movie.year >= 1994)
+    assert kept.columns == ["movie", "movie.year"]
+
+
+def test_a_relation_answers_how_many(small_graph):
+    """`movie.has_genre.count()` -- the arity the old spelling had, resolved
+    because the frame can tell a relation from a column."""
+    assert names(small_graph.nodes("movie").filter(v.movie.has_genre.count() >= 1)) \
+        == ["movie.0", "movie.1", "movie.2"]
+    assert len(small_graph.nodes("movie").filter(v.movie.has_genre.count() >= 2)) == 0
+
+
+def test_a_relation_answers_whether_any(small_graph):
+    """And existence, without walking the edge into rows."""
+    who = small_graph.nodes(seed=["person.0"])
+    assert names(small_graph.nodes("movie").filter(v.movie.directed_by.is_in(who))) \
+        == ["movie.0", "movie.1"]
+    assert names(small_graph.nodes("movie").filter(~v.movie.directed_by.is_in(who))) \
+        == ["movie.2"]
+
+
+def test_a_relation_has_no_value_of_its_own(small_graph):
+    with pytest.raises(TypeError, match="ask how many with .count"):
+        small_graph.nodes("movie").filter(v.movie.has_genre >= 2)
+
+
+def test_names_resolve_column_then_attribute_then_relation(tmp_path):
+    """The order is the whole rule, and a tie is refused rather than guessed."""
+    edges = tmp_path / "a.knows"
+    edges.write_text("source\ttarget\nperson.0\tperson.1\nperson.1\tperson.0\n")
+    attrs = tmp_path / "a.person"
+    attrs.write_text("id\tknows\n0\t7\n1\t3\n")           # an attribute named like the relation
+    graph = Graph(edges=[str(edges)], attrs=[str(attrs)])
+
+    with pytest.raises(ValueError, match="both an attribute .* and a relation"):
+        graph.nodes("person").filter(v.person.knows >= 1)
+    assert len(graph.nodes("person").filter(v.person.attr.knows >= 5)) == 1
+    assert len(graph.nodes("person").filter(v.person.rel.knows.count() >= 1)) == 2
+
+
+def test_a_name_that_is_neither_says_so(small_graph):
+    with pytest.raises(ValueError, match="no attribute 'plot'.*no relation"):
+        small_graph.nodes("movie").filter(v.movie.plot == "x")
+
+
+def test_expressions_combine_and_refuse_to_be_bool(small_graph):
+    frame = small_graph.nodes("movie").filter(
+        (v.movie.year == 1994) & (v.movie.has_genre.count() >= 1))
+    assert names(frame) == ["movie.0", "movie.1"]
+    with pytest.raises(TypeError, match="no truth value"):
+        bool(v.movie.year >= 1990)
+
+
+def test_raw_polars_still_passes_through(small_graph):
+    """`.expr` is the way out: the column by that exact name, unresolved."""
+    frame = small_graph.nodes("movie").attrs(movie="year")
+    assert len(frame.filter(pl.col("movie.year") >= 1999)) == 1
+    assert len(frame.filter(v.movie.year.expr >= 1999)) == 1
+
+
+def test_signals_still_combine_by_arithmetic(small_graph):
+    frame = (small_graph.nodes("movie")
+             .with_columns(pr=PageRank().on("movie").norm())
+             .with_columns(score=0.5 * v.pr + 0.5 * v.pr))
+    assert frame.pl["score"].to_list() == frame.pl["pr"].to_list()
+
+
+# --- a filter after a hop lands on the rows that were not built --------------
+
+def test_a_pushed_filter_gives_what_an_eager_one_would(small_graph):
+    """The whole point: same answer, applied before the rows exist."""
+    def hop():
+        return small_graph.nodes("user").hop("has_interact", to="rec", type="movie")
+
+    eager = hop()
+    eager.pl                                        # force the rows into being
+    assert (names(hop().filter(v.rec.year >= 1999), "rec")
+            == names(eager.filter(v.rec.year >= 1999), "rec"))
+
+
+def test_a_predicate_about_the_old_frame_is_not_pushed(small_graph):
+    """It cannot be: the rows it speaks about are the ones being built."""
+    frame = (small_graph.nodes(user="user").attrs(user="id")
+             .hop("has_interact", to="rec", type="movie")
+             .filter(v.rec.year >= 1994, v.user.id == 0))
+    assert sorted(names(frame, "rec")) == ["movie.0", "movie.1"]
+
+
+def test_a_mixed_predicate_keeps_both_halves(small_graph):
+    """One pushable, one not, in the same call."""
+    frame = (small_graph.nodes(user="user")
+             .hop("has_interact", to="rec", type="movie")
+             .filter((v.rec.year >= 1994) & (v.has_interact.score >= 4)))
+    assert len(frame) == 3
+
+
+def test_pushing_survives_the_edge_columns(small_graph):
+    frame = (small_graph.nodes(user="user")
+             .hop("has_interact", to="rec", type="movie")
+             .filter(v.has_interact.score >= 4))
+    assert sorted(frame.pl["has_interact.score"].to_list()) == [4.0, 5.0, 5.0]
+
+
 # --- paths: several lengths, one frame ---------------------------------------
 
 def test_paths_walks_more_than_one_length(small_graph):
@@ -417,11 +533,11 @@ def test_an_anti_join_drops_the_pairs_that_exist(small_graph):
     assert names(unseen) == ["movie.2"]
 
 
-def test_a_string_cannot_be_resolved_inside_an_expression(small_graph):
-    """An expression has no graph to look a name up in, and quietly matching
-    nothing would be worse than saying so."""
-    with pytest.raises(TypeError, match="no graph to look a name up in"):
-        small_graph.nodes("movie").filter(v.movie.is_in(["movie.0"]))
+def test_a_source_key_resolves_inside_an_expression(small_graph):
+    """The predicate reaches the frame unresolved, and the frame has the graph
+    -- so a name the graph can look up is a name that works here."""
+    assert names(small_graph.nodes("movie").filter(v.movie.is_in(["movie.0"]))) \
+        == ["movie.0"]
 
 
 # --- group_by: an aggregate is written out -----------------------------------
