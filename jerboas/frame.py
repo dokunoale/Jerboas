@@ -524,6 +524,89 @@ class Frame:
         return self._wrap(self._df.unique(subset=columns, keep=keep,
                                           maintain_order=maintain_order))
 
+    def coherent(self, column=None, *, by, through, connection="meet", passes=3):
+        """One row per group, choosing the combination most connected to itself.
+
+        A name resolved on its own has only its own popularity to go on. A *set*
+        of names has more: the things somebody names together tend to sit near
+        each other, so the assignment to prefer is the one whose choices are
+        most connected. `Wonderwall` beside `Champagne Supernova` is Oasis;
+        `Wonderwall` beside `Come Pick Me Up` is Ryan Adams -- neither is the
+        more popular in the abstract, and what decides is the company.
+
+            candidates.coherent(by=v.asked, through=reverse("contains"))
+
+        `by` groups the candidates -- `v.x.needle` is what a search leaves for
+        exactly this -- and `through` is one step to where two of them *meet*:
+        two songs are connected by the playlists holding both. So the connection
+        is one hop and a self-join rather than a walk out and back, which is the
+        difference between a second and a minute -- the way back multiplies by
+        everything else the meeting place holds, and then throws all of it away.
+
+        `connection` is what that meeting is worth, and the default is that they
+        met at all. Counting the meetings instead, or dividing that count by how
+        far each candidate reaches, are both worse -- measured, on real
+        playlists, by giving back the titles of songs the playlist held and
+        seeing how many resolve to the songs it actually held:
+
+            titles      most played     meet      count    count/reach
+                 3            66.7%    100.0%     91.7%          75.0%
+                16            81.2%     98.4%     89.1%          77.5%
+
+        Counting favours the popular, since a song in seventeen hundred
+        playlists meets more of everything; dividing the count overshoots the
+        other way, handing the choice to whichever obscure candidate shares a
+        large fraction of its few neighbours. Whether two candidates keep
+        company at all is neither, and it is the thing being asked.
+
+        The choice itself is `k**n` combinations, so it is not enumerated:
+        starting from the frame's own order, each group takes the candidate best
+        connected to what the others currently hold, repeatedly. Two or three
+        passes settle it, and the result is a local maximum rather than the
+        maximum -- which is the usual trade and worth saying out loud.
+
+        **When the graph says nothing the frame's order decides**, so sorting by
+        whatever you would have used alone -- popularity, closeness -- makes
+        this an improvement on that rather than a replacement for it.
+        """
+        node = self._var(column)
+        groups = self._df[name_of(by)].to_list()
+        rows = self._df.height
+        if rows <= 1:
+            return self
+
+        weights = self._connections(node, through, rows, connection)
+        chosen = _assign(groups, weights, passes)
+        return self._wrap(self._df[sorted(chosen)])
+
+    def _connections(self, node, through, rows, connection="count"):
+        """How often each pair of candidates meets, as a dense (rows, rows)
+        matrix -- small, being one per name times a handful.
+
+        One step out to the meeting places and a self-join there. Walking back
+        would visit everything else those places hold, which is a million rows
+        to keep a few hundred."""
+        marked = self._wrap(self._df.with_row_index(_ROW))
+        met = marked.hop(**{_MEET: through}).pl.select([_ROW, _MEET])
+        paired = (met.join(met, on=_MEET, suffix="_other")
+                  .group_by([_ROW, _ROW + "_other"]).len())
+        weights = np.zeros((rows, rows))
+        for one, other, count in paired.rows():
+            if one != other:
+                weights[one, other] = 1.0 if connection == "meet" else count
+        if connection == "meet":
+            return weights
+
+        if connection == "count":
+            return weights                  # what the crowd said, popularity and all
+        if connection not in ("share", "damped"):
+            raise ValueError(f"unknown connection {connection!r}; expected "
+                             f"'share', 'damped' or 'count'")
+        reach = self._step_degree(through)[self._df[node].to_numpy()].astype(float)
+        power = 0.5 if connection == "share" else 0.25
+        scale = np.outer(reach, reach) ** power
+        return np.divide(weights, scale, out=np.zeros_like(weights), where=scale > 0)
+
     def confidence(self, rule="min", into="confidence"):
         """Every column's confidence, reduced to one number per row.
 
@@ -892,6 +975,38 @@ def _aligned(frames):
                   if dtype == pl.Null and name in known]
         out.append(frame.pl.with_columns(recast) if recast else frame.pl)
     return out
+
+
+_ROW, _MEET = "__coherent_row", "__coherent_meet"
+
+
+def _assign(groups, weights, passes):
+    """One row per group, hill-climbing on how connected the choices are.
+
+    Starts from the first row of each group, which is why the frame's own order
+    is the fallback: with nothing connected, nothing moves."""
+    order, members = [], {}
+    for row, group in enumerate(groups):
+        if group not in members:
+            members[group] = []
+            order.append(group)
+        members[group].append(row)
+    chosen = {group: rows[0] for group, rows in members.items()}
+    if len(order) < 2:
+        return set(chosen.values())
+
+    for _pass in range(passes):
+        moved = False
+        for group in order:
+            others = [chosen[one] for one in order if one != group]
+            scores = [weights[row, others].sum() for row in members[group]]
+            best = members[group][int(np.argmax(scores))]
+            if best != chosen[group]:
+                chosen[group] = best
+                moved = True
+        if not moved:
+            break
+    return set(chosen.values())
 
 
 def _walk(graph, nodes, spec):

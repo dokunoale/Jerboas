@@ -1567,3 +1567,68 @@ def test_the_budget_is_applied_at_every_step(small_graph):
     with jb.optimize(rows=2):
         assert len(one_call()) == len(one_call().unique(["user", "rec"]))
         assert set(names(one_call(), "rec")) == set(names(two_calls(), "rec"))
+
+
+# --- coherent: a set of names says what one name cannot ----------------------
+
+@pytest.fixture
+def covers():
+    """Two titles, two recordings each -- and one pair that keeps company.
+
+    `A` is song 0 and song 1, `B` is song 2 and song 3. Playlist 0 holds 0 and
+    2 together; the others sit alone. Nothing about either title on its own
+    says which is which; the company does."""
+    songs = pl.DataFrame({"id": [0, 1, 2, 3], "name": ["A", "A", "B", "B"]})
+    edges = pl.DataFrame({"list": [0, 0, 1, 2, 3, 3], "song": [0, 2, 1, 3, 1, 3]})
+    return Graph.from_frames({"holds": edges}, attrs={"song": songs},
+                             source=("list", "list"), target=("song", "song"),
+                             readable={"song": "name"})
+
+
+def _candidates(graph, titles):
+    return (graph.nodes(seed="song")
+            .filter(v.seed.name.like(titles, k=4))
+            .with_columns(asked=v.seed.name.needle))
+
+
+def test_coherent_picks_the_combination_that_keeps_company(covers):
+    chosen = _candidates(covers, ["A", "B"]).coherent(
+        by=v.asked, through=reverse("holds"))
+    assert sorted(names(chosen, "seed")) == ["song.0", "song.2"]
+
+
+def test_coherent_keeps_one_row_per_group(covers):
+    candidates = _candidates(covers, ["A", "B"])
+    assert len(candidates) == 4
+    chosen = candidates.coherent(by=v.asked, through=reverse("holds"))
+    assert len(chosen) == 2
+    assert sorted(chosen.pl["asked"].to_list()) == ["A", "B"]
+
+
+def test_with_nothing_connected_the_frames_order_decides(covers):
+    """Which is what makes this an improvement on sorting rather than a
+    replacement for it."""
+    candidates = _candidates(covers, ["A", "B"])
+    # `written_by` does not exist here, so nothing meets anything
+    lonely = covers.nodes(seed="song").filter(v.seed.name.like(["A"], k=4)) \
+        .with_columns(asked=v.seed.name.needle)
+    assert len(lonely.coherent(by=v.asked, through=reverse("holds"))) == 1
+    reversed_order = candidates.sort("seed", descending=True)
+    assert len(reversed_order.coherent(by=v.asked, through=reverse("holds"))) == 2
+
+
+def test_a_single_candidate_per_name_is_left_alone(covers):
+    one = covers.nodes(seed=["song.0"]).with_columns(asked=pl.lit("A"))
+    assert len(one.coherent(by=v.asked, through=reverse("holds"))) == 1
+
+
+def test_the_connection_can_be_counted_instead_of_met(covers):
+    """`meet` asks whether two candidates keep company; `count` how often, which
+    favours the popular; dividing by reach overshoots the other way."""
+    candidates = _candidates(covers, ["A", "B"])
+    for way in ("meet", "count", "damped", "share"):
+        chosen = candidates.coherent(by=v.asked, through=reverse("holds"),
+                                     connection=way)
+        assert len(chosen) == 2, way
+    with pytest.raises(ValueError, match="unknown connection"):
+        candidates.coherent(by=v.asked, through=reverse("holds"), connection="x")

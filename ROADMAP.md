@@ -137,36 +137,42 @@ honest.
 
 ---
 
-## 5. Resolving a set of names by what connects them — half done
+## 5. Resolving a set of names by what connects them — done
 
-**The problem.** A name with several equally-close matches is decided by
-something outside the query -- popularity in `usecase/spotify`, load order
-before that. `Wonderwall` is Oasis and also Ryan Adams covering Oasis, and
-neither is the right answer in the abstract.
+`v.x.name.needle` says which of the things searched for a row is an answer to,
+and `Frame.coherent(by=..., through=...)` keeps one row per group: the
+combination of candidates that keep the most company with each other, two
+candidates keeping company when something the graph knows holds both.
 
-**What exists.** `v.x.name.needle` -- which of the things searched for a row is
-an answer to, as a provenance of the column beside its confidence, and a value
-rather than a column when there is only one. It is what makes the candidates
-groupable, so a set of names resolves in one query rather than one each, and it
-is the input the rest of this needs.
+Measured by handing back the titles of real Spotify playlists and counting how
+many resolve to the songs those playlists actually held:
 
-**What does not.** The choice itself. A *set* of names carries information one
-name does not: songs somebody names together tend to sit in the same playlists,
-films together in the same tastes. So keep every candidate rather than one --
-`needle` already groups them -- ask the graph for the pairwise connection
-between candidates, which is one two-hop query returning the whole matrix, and
-choose one candidate per name to maximise the total. `k**n` by brute force; a
-few passes of coordinate ascent in practice. Closeness stops mattering at that
-point: what decides is the company, not the spelling.
+| titles | most played | coherent |
+|---:|---:|---:|
+| 3 | 66.7% | **100.0%** |
+| 16 | 81.2% | **98.4%** |
 
-**Why it belongs here rather than in a use case.** Every service on this library
-begins by turning names into nodes, and every one of them has this problem. And
-it is the smallest real instance of what the library is for: a graph used for
-*resolution*, not only for retrieval.
+Two things that cost several wrong turns and are worth keeping written down.
+**Whether** two candidates keep company beats **how often** (89.1% at sixteen),
+which beats dividing that count by how far each reaches (77.5%): counting
+favours the popular, dividing overshoots to the obscure, and the question being
+asked is neither. And the connection is one hop to where they *meet* plus a
+self-join, not a walk out and back -- the way back visits everything else the
+meeting place holds and then throws all of it away.
 
-**The cheap escape, worth having anyway.** Let a caller pin a name with a
-separator -- `"Wonderwall\tOasis"` -- which turns a guess into a constraint.
-It composes with the above rather than replacing it.
+What is left is cost: the pool for each name comes from `like`, which scans
+every stored value, and that is most of a request. A name whose right answer is
+not in the pool at all -- Oasis' `Wonderwall` is filed as `Wonderwall -
+Remastered` and the exact-titled ones are eight covers -- is still out of reach,
+which is what the separator below is for.
+
+## 5b. A closeness that ranks how tightly a title contains
+
+`like` scores any containment 1.0, so `Toxicity` ties with `Toxic` and
+`Wonderwall - Remastered` ties with `Wonderwall`. The information exists --
+`fuzzy.closest` takes the shortest containing match first -- and is thrown away
+rather than becoming part of the score. Until it is, widening a pool to reach a
+long title also fills it with near-misses.
 
 ## 6. Smaller things, each already known
 

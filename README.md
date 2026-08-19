@@ -246,15 +246,23 @@ hop walked, `~has_interact` for a step taken against the stored direction;
 `v.person.label.needle` is which of the things you searched for a row is an
 answer to; and `v.rec.type` is the node type its ids fall in.
 
-That last pair is what lets a set of names be resolved in one query rather than
-one each:
+That last pair is what lets a set of names resolve **each other**. `coherent`
+keeps one candidate per name — the combination that keeps the most company:
 
 ```python
 (g.nodes(seed="song")
-   .filter(v.seed.name.like(["Toxic", "Bad Romance"], k=8))
+   .filter(v.seed.name.like(["Wonderwall", "Come Pick Me Up"], k=8))
    .with_columns(asked=v.seed.name.needle, seen=v.seed.contains.count())
-   .sort(["seen"], descending=True).unique("asked"))      # the one the crowd means
+   .sort("seen", descending=True)                  # the fallback, when nothing connects
+   .coherent(by=v.asked, through=reverse("contains")))
 ```
+
+A name alone has only its own popularity to go on. A set of them has more: two
+songs keep company when a playlist holds both, so `Wonderwall` beside
+`Champagne Supernova` is Oasis and beside `Come Pick Me Up` is Ryan Adams —
+neither being the more popular in the abstract. Handing back the titles of real
+playlists and counting how many resolve to the songs those playlists held:
+**100% against 66.7%** at three titles, **98.4% against 81.2%** at sixteen.
 
 None of these is a column. They are attributes of one, kept in shadow
 columns polars keeps aligned for free, hidden from `columns` and from `print`,
