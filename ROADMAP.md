@@ -110,13 +110,31 @@ fold, and when to batch.
 
 **What exists.** `jb.optimize(batch=n)` defers one hop -- several steps of it --
 and the conditions about where it lands, then runs the walk a batch of source
-rows at a time. A query that the kernel kills eagerly completes in a bounded
-2.6 GB. The answer is identical and the peak is a batch instead of the lot.
+rows at a time. A query the kernel kills eagerly completes in a bounded 2.6 GB,
+with the same answer.
 
-**What does not.** A planner: nothing chooses the batch size, the direction to
-expand from, or when to fold, and nothing is deferred across two hops written as
-two calls. The degrees the graph already knows are still an estimate nobody
-reads.
+**What does not, and it is most of it.**
+
+*The batch is in the wrong unit.* Source rows are not what a walk costs: a
+genre's films number between 2 and 1 053 on MovieLens, so five hundred rows can
+mean a thousand results or half a million. Time and memory also move apart --
+batch 500 is 109 s and 3.2 GB, batch 2 000 is 203 s and 2.6 GB -- so there is
+not even one number to tune towards.
+
+*The spelling changes the plan.* Only a hop written as one call is deferred, so
+`.hop(a=..., b=...)` and `.hop(a=...).hop(b=...)` are different plans for the
+same walk -- and the second is the better one here, 1.6 GB against 3.2 GB,
+because it batches over the already-reduced middle. Nothing knows that.
+
+*It bounds the walk, not the answer.* Surviving rows accumulate and are
+concatenated at the end, so a query whose result does not fit is not helped, and
+the concat costs a second copy of it.
+
+**The first fix, and it is small.** The graph knows every node's degree, so an
+expansion's exact size is `degree[nodes].sum()` -- 16 807 190 for the walk above,
+known before taking a step. Batching by output rows would be exact rather than a
+guess. After that: deferring across hops so spelling stops mattering, and
+streaming the result instead of accumulating it.
 
 ---
 
