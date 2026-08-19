@@ -1367,19 +1367,19 @@ def test_chunked_slices_the_frame(small_graph):
 # --- optimize: the walk described, then taken a batch at a time --------------
 
 def test_optimize_gives_the_answer_the_eager_walk_would(small_graph):
-    """The whole promise: the same rows, a batch at a time."""
+    """The whole promise: the same rows, a slice at a time."""
     def query():
         return (small_graph.nodes(user="user").hop(rec="has_interact")
                 .filter(v.rec.year >= 1994))
 
     eager = query()
-    with jb.optimize(batch=1):
+    with jb.optimize(rows=1):
         deferred = query()
     assert deferred.raw.sort(["user", "rec"]).equals(eager.raw.sort(["user", "rec"]))
 
 
 def test_optimize_carries_the_confidence_through_the_batches(small_graph):
-    with jb.optimize(batch=1):
+    with jb.optimize(rows=1):
         frame = small_graph.nodes(user="user").hop(rec="has_interact")
     assert frame.hidden == ["__jb_score__rec"]
     assert sorted(frame.with_columns(s=v.rec.score).pl["s"].to_list()) \
@@ -1389,7 +1389,7 @@ def test_optimize_carries_the_confidence_through_the_batches(small_graph):
 def test_a_condition_joins_the_walk_it_is_written_after(small_graph):
     """Which is the point: the batch a walk runs in is the batch it filters, so
     what the condition rejects is never built at all."""
-    with jb.optimize(batch=1):
+    with jb.optimize(rows=1):
         frame = small_graph.nodes(user="user").hop(rec="has_interact")
         assert frame._plan is not None and not frame._plan.predicates
         narrowed = frame.filter(v.rec.year >= 1999)
@@ -1398,18 +1398,38 @@ def test_a_condition_joins_the_walk_it_is_written_after(small_graph):
 
 
 def test_a_condition_about_anything_else_runs_the_walk_first(small_graph):
-    with jb.optimize(batch=1):
+    with jb.optimize(rows=1):
         frame = (small_graph.nodes(user="user").attrs(user="id")
                  .hop(rec="has_interact").filter(v.user.id == 0))
     assert sorted(names(frame, "rec")) == ["movie.0", "movie.1"]
 
 
-def test_a_walk_that_fits_in_one_batch_is_not_deferred(small_graph):
+def test_a_walk_inside_the_budget_is_not_deferred(small_graph):
     """Describing a walk that would be taken whole costs a plan and saves
-    nothing."""
-    with jb.optimize(batch=1000):
+    nothing -- and what it would produce is known before it is taken."""
+    with jb.optimize(rows=1000):
         frame = small_graph.nodes(user="user").hop(rec="has_interact")
     assert frame._plan is None
+
+
+def test_the_budget_is_what_a_step_produces(small_graph):
+    """Not what it is given: six interactions out of three users is six rows,
+    so a budget of six fits and a budget of five does not."""
+    users = small_graph.nodes(user="user")
+    assert users._produces("has_interact") == 6
+    with jb.optimize(rows=6):
+        assert users.hop(rec="has_interact")._plan is None
+    with jb.optimize(rows=5):
+        assert users.hop(rec="has_interact")._plan is not None
+
+
+def test_slices_are_cut_where_the_walk_grows(small_graph):
+    """A slice out of a hub is shorter than one out of a leaf, which is the
+    reason to count what a step makes rather than what it is handed."""
+    users = small_graph.nodes(user="user")
+    pieces = list(users._slices("has_interact", 2))
+    assert [len(one) for one in pieces] == [1, 1, 1]      # two edges each
+    assert [len(one) for one in users._slices("has_interact", 4)] == [2, 1]
 
 
 def test_several_steps_are_one_plan(small_graph):
@@ -1418,21 +1438,36 @@ def test_several_steps_are_one_plan(small_graph):
         return small_graph.nodes(user="user").hop("has_interact", rec="~has_interact")
 
     eager = query()
-    with jb.optimize(batch=1):
+    with jb.optimize(rows=1):
         deferred = query()
     assert len(deferred) == len(eager)
     assert set(names(deferred, "rec")) == set(names(eager, "rec"))
 
 
 def test_the_context_puts_it_back(small_graph):
-    from jerboas.optimize import batch_size
-    assert batch_size() is None
-    with jb.optimize(batch=7):
-        assert batch_size() == 7
-    assert batch_size() is None
+    from jerboas.optimize import row_budget
+    assert row_budget() is None
+    with jb.optimize(rows=7):
+        assert row_budget() == 7
+    assert row_budget() is None
 
 
-def test_a_batch_of_nothing_is_refused():
+def test_a_budget_of_nothing_is_refused():
     with pytest.raises(ValueError, match="at least one row"):
-        with jb.optimize(batch=0):
+        with jb.optimize(rows=0):
             pass
+
+
+def test_the_budget_is_applied_at_every_step(small_graph):
+    """Which is what makes the spelling stop mattering: one hop of two steps
+    and two hops of one are cut against the same middles."""
+    def one_call():
+        return small_graph.nodes(user="user").hop("has_interact", rec="~has_interact")
+
+    def two_calls():
+        return (small_graph.nodes(user="user").hop(mid="has_interact")
+                .select("user", "mid").hop(rec="~has_interact"))
+
+    with jb.optimize(rows=2):
+        assert len(one_call()) == len(one_call().unique(["user", "rec"]))
+        assert set(names(one_call(), "rec")) == set(names(two_calls(), "rec"))

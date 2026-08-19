@@ -637,41 +637,45 @@ before any filter can reduce it. On a small frame that is nothing; on a large on
 it is the whole problem.
 
 ```python
-with jb.optimize(batch=100_000):
+with jb.optimize(rows=5_000_000):
     frame = (watched.hop(peer="~has_interact", rec="has_interact")
                     .filter(v.rec.is_in(wanted)))
 ```
 
 Inside `optimize` a hop describes itself instead of taking place, the filters
 written after it join the description, and the whole of it runs when something
-reads the frame — a batch of source rows at a time, each walked, filtered and
-reduced before the next one starts. The answer is the same; the peak is a batch
-instead of the lot. On MovieLens the query above is killed by the kernel eagerly
-and completes in a bounded 2.6 GB with a batch of 2 000.
+reads the frame — in slices, each walked, filtered and reduced before the next
+one starts. The answer is the same; the peak is a slice instead of the lot. On
+MovieLens the query above is killed by the kernel eagerly and completes in
+1.9 GB deferred.
 
-It is a peephole with a ceiling, not a planner, and the difference shows. It
-defers one hop written as one call and the conditions about where it lands;
-anything else runs the walk first. So **how you spell a walk changes what it
-costs**: the two-hop query above, written as `.hop(peer=...).hop(rec=...)`
-instead, runs in 1.6 GB and 89 s rather than 3.2 GB and 109 s — because the
-second call batches over the already-reduced middle while one call only ever
-batches over the source. Neither spelling is reliably better, and nothing here
-knows which is.
+**`rows` is a budget on what a step produces, and it is not an estimate.** The
+graph keeps every node's degree, so the exact size of an expansion is
+`degree[nodes].sum()` before a step is taken — 16 807 190 for the walk above.
+The slices are cut where that running total crosses the budget, so a slice out
+of a hub is shorter than one out of a leaf, and a walk that fits inside the
+budget is not deferred at all.
 
-Nor does anything choose the batch. It is counted in *source rows*, which is not
-what a walk costs: on this graph a genre's films number between 2 and 1 053, so
-five hundred rows can mean a thousand results or half a million. And the two
-things you would tune for move apart — batch 500 takes 109 s and 3.2 GB, batch
-2 000 takes 203 s and 2.6 GB.
+The budget is applied again at **every** step, which is what makes the spelling
+stop mattering: `.hop(a=..., b=...)` and `.hop(a=...).hop(b=...)` are the same
+walk and now cost the same, because either way the second step is cut against
+the middle it actually landed on.
 
-Two more things follow from batching: a predicate that aggregates sees its batch
-rather than the whole result, and the answer is accumulated rather than streamed,
-so a query whose *result* does not fit is not helped at all.
+| | | |
+|---|---:|---:|
+| one call, `rows=5M` | 97 s | 1.95 GB |
+| two calls, `rows=5M` | 101 s | 2.42 GB |
+| one call, `rows=1M` | 80 s | 3.13 GB |
+| one call, `rows=20M` | — | killed |
 
-What would fix it is not far away: the graph already knows every node's degree,
-so the exact size of an expansion is `degree[nodes].sum()` — 16 807 190 for the
-walk above, computable before taking a step. Batching by output rows would be
-exact rather than a guess, and that is the first thing a planner here should do.
+Below a floor the budget stops buying anything, because what is left is the
+answer itself: the surviving slices are accumulated rather than streamed. They
+are concatenated without a rechunk, so the result exists once rather than twice,
+but a query whose *answer* does not fit is still not helped. That, and choosing
+the budget for you, is what a planner would add.
+
+One more thing follows from working in slices: a predicate that aggregates
+(`>= v.rec.score.mean()`) sees its slice rather than the whole result.
 
 ## Install
 

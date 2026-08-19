@@ -84,59 +84,34 @@ convenience, and it lands on the existing design without bending it.
 
 ---
 
-## 3. `jb.optimize`: laziness and a planner — half done
+## 3. `jb.optimize`: laziness and a planner — the batching done, the planner not
 
-**The problem.** Every verb materialises. The one exception is the peephole
-that lets a filter written after a hop apply to the arrays the hop produced —
-useful, measured at −24% on a wide frame, and not a planner. A two-hop wildcard
-over a large graph still exhausts memory unless the caller writes `unique()`
-between the steps and batches the input by hand, as `benchmark/run.py` does.
+**What exists.** `jb.optimize(rows=n)` defers a hop and the conditions about
+where it lands, then runs the walk in slices. The budget is on what a step
+*produces* and is exact rather than estimated -- the graph keeps every node's
+degree, so an expansion's size is `degree[nodes].sum()` before a step is taken.
+Slices are cut where that running total crosses the budget, so a slice out of a
+hub is shorter than one out of a leaf, a walk that fits is not deferred at all,
+and the budget is applied again at every step -- which is what makes
+`.hop(a=..., b=...)` and `.hop(a=...).hop(b=...)` cost the same. A query the
+kernel kills eagerly completes in 1.9 GB.
 
-**The shape.** Opt-in, so the eager path stays the one that is easy to reason
-about:
+**What does not.**
 
-```python
-from jerboas import optimize
+*Nothing chooses the budget.* The default is a number, not a decision. A planner
+would pick it from the memory it is allowed and the width of the rows.
 
-with optimize():
-    ...                      # verbs build a plan; it runs at the first read
-```
+*The answer is accumulated, not streamed.* The slices are concatenated without a
+rechunk, so the result exists once rather than twice, but a walk whose *answer*
+does not fit is still not helped -- and below a floor a smaller budget buys
+nothing, because what is left is the answer.
 
-**What a planner would have that others do not.** The graph knows its degrees,
-per relation and per direction, for free (`graph.degree` is memoized). That is a
-cardinality estimate no join optimizer over anonymous tables can get, and it is
-what would let the planner choose which end of a pattern to expand from, when to
-fold, and when to batch.
+*Nothing chooses the direction.* Which end of a pattern to expand from is a
+choice with a large cost difference and nobody makes it, though the degrees that
+would decide it are the same ones the slicing already reads.
 
-**What exists.** `jb.optimize(batch=n)` defers one hop -- several steps of it --
-and the conditions about where it lands, then runs the walk a batch of source
-rows at a time. A query the kernel kills eagerly completes in a bounded 2.6 GB,
-with the same answer.
-
-**What does not, and it is most of it.**
-
-*The batch is in the wrong unit.* Source rows are not what a walk costs: a
-genre's films number between 2 and 1 053 on MovieLens, so five hundred rows can
-mean a thousand results or half a million. Time and memory also move apart --
-batch 500 is 109 s and 3.2 GB, batch 2 000 is 203 s and 2.6 GB -- so there is
-not even one number to tune towards.
-
-*The spelling changes the plan.* Only a hop written as one call is deferred, so
-`.hop(a=..., b=...)` and `.hop(a=...).hop(b=...)` are different plans for the
-same walk -- and the second is the better one here, 1.6 GB against 3.2 GB,
-because it batches over the already-reduced middle. Nothing knows that.
-
-*It bounds the walk, not the answer.* Surviving rows accumulate and are
-concatenated at the end, so a query whose result does not fit is not helped, and
-the concat costs a second copy of it.
-
-**The first fix, and it is small.** The graph knows every node's degree, so an
-expansion's exact size is `degree[nodes].sum()` -- 16 807 190 for the walk above,
-known before taking a step. Batching by output rows would be exact rather than a
-guess. After that: deferring across hops so spelling stops mattering, and
-streaming the result instead of accumulating it.
-
----
+*A predicate that aggregates sees its slice.* A planner would know which
+predicates are row-local and refuse to defer the others; this one assumes.
 
 ## 4. Reducing several confidences to one — done
 

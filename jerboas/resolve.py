@@ -314,42 +314,59 @@ def take(values, keep):
 class Plan:
     """A walk described but not taken, and the conditions about where it lands.
 
-    Held only inside `optimize`. Executing it runs the same eager hop and the
-    same filters, a batch of source rows at a time, and stacks the results --
-    so the answer is what it would have been and the peak is one batch's
-    expansion rather than the whole walk's.
+    Held only inside `optimize`. Running it takes the same walk and applies the
+    same conditions, in slices cut by what a step produces -- and cut again at
+    every step, so a walk written as one hop and the same walk written as two
+    cost the same. The answer is what it would have been; the peak is a slice.
     """
 
-    __slots__ = ("base", "variables", "via", "steps", "predicates", "batch")
+    __slots__ = ("frame", "steps", "budget", "predicates")
 
-    def __init__(self, base, variables, via, steps, batch, predicates=()):
-        self.base = base                # the frame before the walk
-        self.variables = variables      # what the base's columns hold
-        self.via = via
+    def __init__(self, frame, steps, budget, predicates=()):
+        self.frame = frame              # the frame the walk leaves from
         self.steps = steps              # [(relation spec, column or None)]
-        self.predicates = list(predicates)   # conditions about where it lands
-        self.batch = batch
+        self.budget = budget            # rows one step may produce at a time
+        self.predicates = list(predicates)
 
     def narrowed(self, predicates):
         """The same plan, with more said about where the walk may land."""
-        return Plan(self.base, self.variables, self.via, self.steps, self.batch,
+        return Plan(self.frame, self.steps, self.budget,
                     self.predicates + list(predicates))
 
-    def build(self, frame_of):
-        """Run it. `frame_of` makes a Frame of one slice of the base, which is
-        what keeps every rule about hopping and filtering in one place rather
-        than in two."""
-        through = [spec for spec, name in self.steps if name is None]
-        named = {name: spec for spec, name in self.steps if name is not None}
-        parts = []
-        for start in range(0, max(self.base.height, 1), self.batch):
-            slice_ = self.base.slice(start, self.batch)
-            if not slice_.height:
-                continue
-            part = frame_of(slice_).hop(*through, **named)
-            if self.predicates:
-                part = part.filter(*self.predicates)
-            parts.append(part.raw)
-        if not parts:                      # an empty base still has a schema
-            return frame_of(self.base.clear()).hop(*through, **named).raw
-        return parts[0] if len(parts) == 1 else pl.concat(parts, how="vertical")
+    def build(self):
+        return _run(self.frame, _groups(self.steps), self.predicates, self.budget)
+
+
+def _groups(steps):
+    """The steps in runs that each end at a named one.
+
+    A step nobody named produces no column, so it cannot end a run: what folds
+    two routes through it is the named step after it. Python already puts the
+    unnamed ones first, so the first run is all of them plus one, and the rest
+    are one apiece."""
+    first = next(i for i, (_spec, name) in enumerate(steps) if name is not None)
+    return [steps[:first + 1]] + [[one] for one in steps[first + 1:]]
+
+
+def _run(frame, groups, predicates, budget):
+    """One run of steps at a time, each in slices, recursing for the rest."""
+    group, rest = groups[0], groups[1:]
+    parts = []
+    for piece in frame._slices(group[0][0], budget):
+        part = piece._hop_eager(group)
+        if rest:
+            part = _run(part, rest, predicates, budget)
+            parts.append(part)
+            continue
+        if predicates:
+            part = part.filter(*predicates)
+        parts.append(part.raw)
+    if not parts:
+        empty = frame._wrap(frame._df.clear())._hop_eager(group)
+        return _run(empty, rest, predicates, budget) if rest else empty.raw
+    if len(parts) == 1:
+        return parts[0]
+    # rechunk=False keeps the slices' own buffers instead of copying them into
+    # one: the answer exists once rather than twice, which on a walk whose
+    # result is most of its cost is the difference between finishing and not
+    return pl.concat(parts, how="vertical", rechunk=False)

@@ -29,7 +29,7 @@ from . import traverse
 from .expr import (SCORE, VIA, Col, Expr, direction, is_shadow, name_of,
                    reverse, shadow, shadowed)
 from .keys import Key
-from .optimize import batch_size
+from .optimize import row_budget
 from .resolve import Pending, Plan, Resolver, take
 
 RELATION = "relation"
@@ -71,8 +71,7 @@ class Frame:
         refusal."""
         if self._plan is not None:
             plan, self._plan = self._plan, None
-            self._data = plan.build(lambda data: Frame(
-                self.graph, data, plan.variables, via=plan.via))
+            self._data = plan.build()
         if self._pending is not None:
             self._data = self._pending.build()
             self._pending = None
@@ -216,24 +215,27 @@ class Frame:
             raise ValueError(
                 "the last step of a hop must be named: where the walk ends is "
                 "what the frame holds. hop(..., rec=\"has_genre\")")
-        graph = self.graph
-        base = self._df
-        source = self._rightmost()
         for _spec, name in steps:
             if name is not None:
                 self._claim(name)
 
-        batch = batch_size()
-        if batch is not None and batch < base.height:
-            # described rather than taken: the walk runs when something reads
-            # the frame, a batch of source rows at a time (see optimize.py)
+        budget = row_budget()
+        if budget is not None and self._produces(steps[0][0]) > budget:
+            # described rather than taken: the walk runs when something reads the
+            # frame, in slices cut by what each step produces (see optimize.py)
             variables = dict(self.vars)
             for spec, name in steps:
                 if name is not None:
                     variables[name] = self._target_type(spec)
-            return Frame(graph, None, variables,
-                         plan=Plan(base, dict(self.vars), dict(self.via), steps, batch))
+            return Frame(self.graph, None, variables, via=dict(self.via),
+                         plan=Plan(self, steps, budget))
+        return self._hop_eager(steps)
 
+    def _hop_eager(self, steps):
+        """The walk itself, taken here and now."""
+        graph = self.graph
+        base = self._df
+        source = self._rightmost()
         rows = np.arange(base.height, dtype=np.int64)
         nodes = base[source].to_numpy()
         added, variables, via = {}, dict(self.vars), dict(self.via)
@@ -269,6 +271,48 @@ class Frame:
         last = steps[-1][1]
         return Frame(graph, None, variables, pending=Pending(base, rows, added, last),
                      via=via)
+
+    def _produces(self, spec):
+        """Exactly how many rows one step out of this frame would make.
+
+        Not an estimate: a node's degree is a number the graph keeps, so the
+        size of an expansion is known before a step is taken. It is what decides
+        whether a walk is worth deferring, and where its slices are cut."""
+        nodes = self._df[self._rightmost()].to_numpy()
+        return int(self._step_degree(spec)[nodes].sum())
+
+    def _step_degree(self, spec):
+        """Per node, how many edges one step would follow."""
+        relations = _relations(spec)
+        if relations is None:                 # any relation, either way
+            return self.graph.degree(None, False) + self.graph.degree(None, True)
+        total = None
+        for name, backwards in relations:
+            counts = self.graph.degree(name, backwards)
+            total = counts if total is None else total + counts
+        return total
+
+    def _slices(self, spec, budget):
+        """This frame cut so one step out of each piece makes about `budget`
+        rows. A slice out of a hub is shorter than one out of a leaf, which is
+        the whole reason to count what a step produces rather than what it is
+        given."""
+        nodes = self._df[self._rightmost()].to_numpy()
+        expansion = self._step_degree(spec)[nodes].astype(np.int64)
+        running = np.cumsum(expansion)
+        if not len(running) or running[-1] <= budget:
+            yield self
+            return
+        # cut wherever the running total crosses another budget's worth, and
+        # never leave a slice empty: a node bigger than the budget on its own is
+        # a slice of one, which is as small as a walk can be made
+        marks = np.arange(budget, int(running[-1]), budget)
+        edges = np.unique(np.searchsorted(running, marks, side="left") + 1)
+        starts = np.concatenate([[0], edges])
+        stops = np.concatenate([edges, [len(expansion)]])
+        for start, stop in zip(starts.tolist(), stops.tolist()):
+            if stop > start:
+                yield self._wrap(self._df.slice(start, stop - start))
 
     def _rightmost(self):
         """The column of nodes furthest to the right -- where a walk leaves from.
@@ -597,7 +641,7 @@ class Frame:
              else stays).append(one)
         if not joins:
             return self, stays
-        return Frame(self.graph, None, self.vars, via=self.via,
+        return Frame(self.graph, None, dict(self.vars), via=dict(self.via),
                      plan=plan.narrowed(joins)), stays
 
     # --- pushing a predicate into a hop that has not built its rows ----------
