@@ -25,7 +25,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 import jerboas as jb
-from jerboas import PageRank, TransD, train, concat, v
+from jerboas import PageRank, TransD, concat, train, v
 
 DATA_DIR = "./data/movielens"
 CHECKPOINT = "./checkpoints/ml.transd.npz"
@@ -65,15 +65,14 @@ def seeds(graph, wanted):
 
 
 def expanded(graph, found):
-    """Every film within two hops of a seed, and how it was reached.
+    """Every film within two hops of a seed, and how far away it was.
 
     A candidate reaches a liked attribute directly (1 hop) or through a bridge
-    node (2 hops). `hop` with no relation is undirected, so the bridge closes
-    whichever way the edges happen to be stored -- and the columns of the frame
-    *are* the walk, which is what the explanation reads."""
-    direct = graph.nodes(seed=found).hop(to="rec", type="movie")
-    bridge = graph.nodes(seed=found).hop(to="mid").hop(to="rec", type="movie")
-    return concat(direct, bridge)
+    node (2 hops), and `paths` walks both lengths in one frame. With no relation
+    named the walk is undirected, so the bridge closes whichever way the edges
+    happen to be stored; `hops` says which branch a row came from, and the fold
+    between the steps is why a two-hop bridge over 15 000 nodes stays small."""
+    return graph.nodes(seed=found).paths(to="rec", type="movie", hops=(1, 2))
 
 
 def rank_films(graph, model, found, exclude, k):
@@ -103,12 +102,12 @@ def explain(row):
     """How a film connects to what the caller named.
 
     The walk is not a string to parse or a Path object to unpack -- it is the
-    row: `seed` is what was liked, `mid` is the bridge when there was one, and
-    `rec.rel` names the edge that closed it."""
+    row: `seed` is what was liked, `hops` is how far it was, and `rec.rel` names
+    the edge that arrived."""
     seed = row["seed.label"]
-    if row.get("mid") is not None:
+    if row["hops"] > 1:
         return f"shares something with {seed}"
-    relation = str(row.get("rec.rel") or "").lstrip("~").replace("_", " ")
+    relation = str(row["rec.rel"] or "").lstrip("~").replace("_", " ")
     return f"{relation} {seed}"
 
 

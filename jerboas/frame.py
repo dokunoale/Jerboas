@@ -181,7 +181,7 @@ class Frame:
         added = [pl.Series(target, targets.astype(np.int32)),
                  pl.Series(f"{edge}.score", weights)]
         if relation is None:
-            added.append(pl.Series(f"{edge}.rel", self._names(codes)))
+            added.append(pl.Series(f"{edge}.rel", self._names(codes), dtype=pl.String))
         variables = dict(self.vars)
         variables[target] = type
         return self._wrap(data.with_columns(added), variables)
@@ -203,6 +203,120 @@ class Frame:
             reached = admissible[targets]
             keep = reached if keep is None else (keep & reached)
         return keep
+
+    def paths(self, relation=None, *, to, hops=(1, 2), type=None, where=None,
+              through=None, keep_via=False, from_=None):
+        """Walks of more than one length, as one frame.
+
+            .paths(to="rec", type="movie", hops=(1, 2))
+            .paths(to="rec", type="movie", hops=(1, 2), through="person")
+
+        `hops` is an inclusive range of lengths, or an int for exactly one. Each
+        length is a branch, the branches are concatenated diagonally, and a
+        `hops` column says which one a row came from -- so "one hop or two" is
+        one frame rather than two and a concat.
+
+        The reason it is a verb and not sugar is the `unique` between the steps.
+        A two-hop walk expands the first hop by the degree of the second, and two
+        sources reaching the same intermediate carry the same rows onward: that
+        product is what makes a naive bridge query exhaust memory, and folding it
+        is what the old engine's memoized sub-path search was for. So by default
+        the intermediates are dropped and deduplicated at every level.
+
+        `keep_via=True` keeps them, as `via_1`, `via_2`, ... -- and then nothing
+        can be deduplicated, because the columns that would collapse are the
+        answer. Use it when the walk itself is what you are after.
+
+        `type` and `where` admit the *destination*; `through` admits the
+        intermediates, and takes a type name as well as a set of nodes."""
+        low, high = (hops, hops) if isinstance(hops, int) else hops
+        if low < 1 or high < low:
+            raise ValueError(f"hops must be a length or an increasing range, got {hops!r}")
+        wanted = range(low, high + 1)
+        arrival = [to, f"{to}.score"] + ([] if relation is not None else [f"{to}.rel"])
+
+        chain, branches = self, []
+        for step in range(1, high + 1):
+            start = None if step > 1 else from_
+            if step in wanted:                       # a branch that ends here
+                branch = chain.hop(relation, to=to, type=type, where=where,
+                                   as_=to, from_=start)
+                if not keep_via:
+                    # what got here is not what this branch is about: keep where
+                    # it started and where it arrived, and fold the routes
+                    branch = branch.select(*self.columns, *arrival).unique()
+                branches.append(branch.with_columns(hops=pl.lit(step, dtype=pl.Int32)))
+            if step == high:
+                break
+            chain = chain.hop(relation, to=f"via_{step}", as_=f"via_{step}", from_=start,
+                              where=through if not isinstance(through, str) else None,
+                              type=through if isinstance(through, str) else None)
+            if not keep_via:
+                # the fold: two routes that met here carry identical rows from
+                # now on, and only one of them is worth walking
+                chain = chain.select(*self.columns, f"via_{step}").unique()
+        return concat(*branches) if branches else self.head(0)
+
+    def degree(self, relation=None, *, of=None, reverse=None, as_=None):
+        """How many edges a node has, as a column.
+
+        A fact about the graph, not about what this frame matched -- the same
+        number whatever the query asked, which is exactly what distinguishes it
+        from `group_by(...).agg(count)`. Read off a per-node array the graph
+        computes once, so it costs a gather.
+
+            .degree("has_genre", of="movie")     # -> movie.has_genre_count
+        """
+        var = self._source_var(of)
+        counts = self._degrees(relation, reverse)
+        name = as_ or f"{var}.{relation or 'edge'}_count"
+        ids = self._df[var].to_numpy()
+        return self._wrap(self._df.with_columns(pl.Series(name, counts[ids])))
+
+    def having(self, relation=None, *, where=None, reverse=None, of=None, absent=False):
+        """Keep the rows whose node has such an edge -- without walking it.
+
+            .having("directed_by")                     # directs anything at all
+            .having("directed_by", where=people)       # directs one of these
+            .missing("has_interact", where=watched)    # the negation
+
+        This is a filter, not a traversal: no row is added and none of the frame
+        is expanded. With no `where` it reads the node's arity off the graph's
+        own count. With one, it walks the *given* set backwards and collects
+        what reaches it -- so the cost is the degree of `where`, not of the
+        frame. Pass the smaller side.
+        """
+        var = self._source_var(of)
+        if reverse is None and relation is not None:
+            reverse = False
+        if where is None:
+            admissible = self._degrees(relation, reverse) > 0
+        else:
+            # the same edge, read from the other end: what has an edge into this
+            # set is what this set reaches when walked the other way
+            back = None if reverse is None else not reverse
+            _rows, targets, _codes, _weights = traverse.expand(
+                self.graph, self.graph.ids_of(where), relation, back)
+            admissible = np.zeros(self.graph.n_nodes, dtype=bool)
+            admissible[targets] = True
+        keep = admissible[self._df[var].to_numpy()]
+        return self._wrap(self._df.filter(pl.Series(~keep if absent else keep)))
+
+    def missing(self, relation=None, *, where=None, reverse=None, of=None):
+        """The rows `having` would have dropped."""
+        return self.having(relation, where=where, reverse=reverse, of=of, absent=True)
+
+    def _degrees(self, relation, reverse):
+        """Per-node arity, in the direction a hop would have read.
+
+        A named relation counts forwards unless told otherwise; the wildcard has
+        no natural direction and counts both, the way it walks both."""
+        graph = self.graph
+        if reverse is None and relation is not None:
+            reverse = False
+        if reverse is None:
+            return graph.degree(relation, False) + graph.degree(relation, True)
+        return graph.degree(relation, reverse)
 
     def like(self, column, needles, k=1, cutoff=0.6):
         """Keep the k rows closest to each needle, and say how close they were.
@@ -513,8 +627,27 @@ def concat(*frames, how="diagonal"):
     variables = {}
     for frame in frames:
         variables.update(frame.vars)
-    data = pl.concat([frame.pl for frame in frames], how=how)
-    return Frame(frames[0].graph, data, variables)
+    return Frame(frames[0].graph, pl.concat(_aligned(frames), how=how), variables)
+
+
+def _aligned(frames):
+    """The frames with their empty columns typed like the ones that have rows.
+
+    A branch that matched nothing still has to line up with one that did, and an
+    empty column of unknown type is polars' Null -- which refuses to stack onto
+    a String. So a column that is Null in one frame takes the type another frame
+    gives it."""
+    known = {}
+    for frame in frames:
+        for name, dtype in frame.pl.schema.items():
+            if dtype != pl.Null and name not in known:
+                known[name] = dtype
+    out = []
+    for frame in frames:
+        recast = [pl.col(name).cast(known[name]) for name, dtype in frame.pl.schema.items()
+                  if dtype == pl.Null and name in known]
+        out.append(frame.pl.with_columns(recast) if recast else frame.pl)
+    return out
 
 
 def _expr(item):

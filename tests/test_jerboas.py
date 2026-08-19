@@ -242,6 +242,125 @@ def test_a_hop_cannot_overwrite_an_existing_variable(small_graph):
         walked.hop("has_genre", to="movie", reverse=True)
 
 
+# --- paths: several lengths, one frame ---------------------------------------
+
+def test_paths_walks_more_than_one_length(small_graph):
+    """One hop out of a film reaches its people, genres and viewers; two reach
+    the other films they connect to."""
+    frame = small_graph.nodes(seed=["movie.0"]).paths(to="rec", hops=(1, 2))
+    lengths = dict(frame.pl.group_by("hops").len().rows())
+    assert set(lengths) == {1, 2}
+    reached = names(frame.filter(v.hops == 2), "rec")
+    assert "movie.1" in reached                      # same director, same genre
+
+
+def test_paths_says_how_far_each_row_went(small_graph):
+    frame = small_graph.nodes(seed=["movie.0"]).paths(to="rec", hops=1)
+    assert set(frame.pl["hops"].to_list()) == {1}
+
+
+def test_paths_folds_the_routes_it_is_not_asked_to_keep(tmp_path):
+    """Two intermediates reaching the same node the same way are one answer, and
+    carrying both is what makes a bridge query explode."""
+    path = tmp_path / "d.knows"
+    path.write_text("source\ttarget\n"
+                    "person.0\tperson.1\nperson.0\tperson.2\n"       # two routes...
+                    "person.1\tperson.3\nperson.2\tperson.3\n")      # ...to the same node
+    graph = Graph(edges=[str(path)])
+    seed = graph.nodes(seed=["person.0"])
+    folded = seed.paths("knows", to="rec", hops=2)
+    kept = seed.paths("knows", to="rec", hops=2, keep_via=True)
+    assert len(kept) == 2 and len(folded) == 1
+    assert names(folded, "rec") == ["person.3"]
+
+
+def test_paths_keeps_the_walk_when_asked(small_graph):
+    frame = small_graph.nodes(seed=["movie.0"]).paths(to="rec", type="movie",
+                                                      hops=2, keep_via=True)
+    assert "via_1" in frame.columns
+    assert frame.vars["via_1"] is None
+
+
+def test_paths_restricts_the_intermediates(small_graph):
+    seeds = small_graph.nodes(seed=["movie.0"])
+    through_user = seeds.paths(to="rec", type="movie", hops=2, through="user")
+    through_genre = seeds.paths(to="rec", type="movie", hops=2, through="genre")
+    # user.2 watched movie.0 and movie.2; genre.0 holds only movie.0 and movie.1
+    assert "movie.2" in names(through_user, "rec")
+    assert "movie.2" not in names(through_genre, "rec")
+
+
+def test_paths_refuses_a_backwards_range(small_graph):
+    with pytest.raises(ValueError, match="increasing range"):
+        small_graph.nodes("movie").paths(to="rec", hops=(3, 1))
+
+
+def test_an_empty_branch_still_lines_up(small_graph):
+    """A length that matched nothing has columns of unknown type, and they have
+    to stack onto the ones that did."""
+    frame = small_graph.nodes(seed=["genre.0"]).paths(to="rec", type="person",
+                                                      hops=(1, 2))
+    assert frame.pl.schema["rec.rel"] == pl.String
+    assert set(frame.pl["hops"].to_list()) == {2}       # a genre reaches no person in one
+
+
+# --- degree and existence: what a relation says without walking it -----------
+
+def test_degree_counts_the_graphs_own_edges(small_graph):
+    frame = small_graph.nodes("person").degree("directed_by", reverse=True)
+    counts = dict(zip(names(frame), frame.pl["person.directed_by_count"].to_list()))
+    assert counts == {"person.0": 2, "person.1": 1}
+
+
+def test_degree_is_a_fact_about_the_graph_not_the_frame(small_graph):
+    """Which is what tells it apart from group_by(...).agg(count): filtering the
+    frame first does not change it."""
+    whole = small_graph.nodes("person").degree("directed_by", reverse=True)
+    part = (small_graph.nodes("person").filter(v.person == small_graph.lookup("person.0"))
+            .degree("directed_by", reverse=True))
+    assert part.pl["person.directed_by_count"].to_list() == [
+        whole.pl["person.directed_by_count"].to_list()[0]]
+
+
+def test_degree_of_an_unknown_relation_is_zero(small_graph):
+    frame = small_graph.nodes("movie").degree("produced_by")
+    assert frame.pl["movie.produced_by_count"].to_list() == [0, 0, 0]
+
+
+def test_the_wildcard_degree_counts_both_directions(small_graph):
+    frame = small_graph.nodes(seed=["movie.0"]).degree()
+    # directed_by, has_genre out; two users in
+    assert frame.pl["seed.edge_count"].to_list() == [4]
+
+
+def test_having_keeps_what_has_the_edge(small_graph):
+    frame = small_graph.nodes("movie").having("has_interact", reverse=True)
+    assert sorted(names(frame)) == ["movie.0", "movie.1", "movie.2"]
+    none = small_graph.nodes("movie").having("produced_by")
+    assert len(none) == 0
+
+
+def test_having_narrows_to_a_set_without_walking_the_frame(small_graph):
+    who = small_graph.nodes(seed=["person.0"])
+    frame = small_graph.nodes("movie").having("directed_by", where=who)
+    assert names(frame) == ["movie.0", "movie.1"]
+    assert frame.columns == ["movie"]              # nothing was expanded
+
+
+def test_missing_is_the_negation(small_graph):
+    who = small_graph.nodes(seed=["person.0"])
+    assert names(small_graph.nodes("movie").missing("directed_by", where=who)) == ["movie.2"]
+
+
+def test_having_agrees_with_the_join_it_replaces(small_graph):
+    """"the films this user has not seen", the short way and the long way."""
+    who = small_graph.nodes(seed=["user.0"])
+    watched = who.hop("has_interact", to="movie").select("movie")
+    by_verb = small_graph.nodes("movie").missing("has_interact", where=who, reverse=True)
+    by_join = small_graph.nodes("movie").join(watched, on="movie", how="anti")
+    assert names(by_verb) == names(by_join) == ["movie.2"]
+
+
 # --- filtering: a predicate is an expression ---------------------------------
 
 def test_filter_on_an_attribute(small_graph):
