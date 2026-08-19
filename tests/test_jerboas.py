@@ -708,6 +708,52 @@ def test_like_keeps_the_measure_as_the_columns_confidence(small_graph):
     assert 0.6 < typo.pl["sim"].to_list()[0] < 1.0            # close, not contained
 
 
+def test_a_search_says_which_needle_a_row_answers(small_graph):
+    """The question a set of names asks that one name does not -- and the
+    grouping a tie-break needs is then a column rather than a loop."""
+    found = (small_graph.nodes("person").labels("person")
+             .filter(v.person.label.like(["Xavier", "Yara"]))
+             .with_columns(asked=v.person.label.needle))
+    assert dict(zip(names(found), found.pl["asked"].to_list())) \
+        == {"person.0": "Xavier", "person.1": "Yara"}
+
+
+def test_one_needle_is_a_value_and_not_a_column(small_graph):
+    """It says the same thing about every row, so nothing is allocated to say
+    it -- the rule confidence and provenance already follow."""
+    found = (small_graph.nodes("person").labels("person")
+             .filter(v.person.label.like("Xavier")))
+    assert found.hidden == ["__jb_score__person.label"]
+    assert found.with_columns(asked=v.person.label.needle).pl["asked"].to_list() \
+        == ["Xavier"]
+
+
+def test_a_column_nothing_searched_answers_nothing(small_graph):
+    frame = small_graph.nodes("person").labels("person")
+    assert frame.with_columns(asked=v.person.label.needle).pl["asked"].to_list() \
+        == [None, None]
+
+
+def test_the_needle_groups_the_candidates(small_graph):
+    """Which is what a set of names needs: several matches each, told apart."""
+    found = (small_graph.nodes("movie").labels("movie")
+             .filter(v.movie.label.like(["Alpha", "Gamma"], k=2))
+             .with_columns(asked=v.movie.label.needle))
+    counted = dict(found.group_by(v.asked).agg(n=v.movie.count()).pl.rows())
+    assert counted == {"Alpha": 1, "Gamma": 1}
+
+
+def test_a_row_two_needles_judge_alike_goes_to_the_first(small_graph):
+    """A tie the measure cannot break is not broken here either -- and the
+    alternative, admitting the row twice, would make a set of names return more
+    rows than it has answers."""
+    found = (small_graph.nodes("person").labels("person")
+             .filter(v.person.label.like(["Director", "Xavier"], k=2))
+             .with_columns(asked=v.person.label.needle))
+    assert len(found) == 2                                 # not three
+    assert set(found.pl["asked"].to_list()) == {"Director"}
+
+
 def test_a_blank_needle_admits_nothing(small_graph):
     """It is contained in everything, which would make a blank search the
     broadest one possible instead of the narrowest."""

@@ -36,13 +36,20 @@ from .keys import Key
 # the two escapes, for a type whose attribute is named like a relation
 ATTR, REL = "attr", "rel"
 
-# what every column carries besides its values. `score` is the confidence of
-# each row of that column -- the weight of the edge that revealed it, how close
-# a `like` judged it, 1.0 where nothing measured anything. `via` is the relation
-# a hop walked to reach it, and `type` the node type its ids fall in. A type
-# whose own attribute is called one of these is reached with v.x.attr.score.
-SCORE, VIA, TYPE = "score", "via", "type"
-PROVENANCE = (SCORE, VIA, TYPE)
+# What every column carries besides its values -- where each row came from, and
+# how much it is to be believed.
+#
+#   score    the confidence: the weight of the edge that revealed it, how close
+#            a `like` judged it, 1.0 where nothing measured anything
+#   via      the relation a hop walked to reach it
+#   needle   which of the things asked for this row is an answer to
+#   type     the node type its ids fall in
+#
+# A type whose own attribute is called one of these is reached with
+# v.x.attr.score. A provenance that says the same thing about every row is kept
+# as one value rather than as a column (see Frame.constants).
+SCORE, VIA, NEEDLE, TYPE = "score", "via", "needle", "type"
+PROVENANCE = (SCORE, VIA, NEEDLE, TYPE)
 
 # Every column carries a confidence, and where something measured one it is kept
 # under this prefix: an ordinary polars column, so filter, sort, join and

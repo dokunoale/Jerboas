@@ -242,10 +242,21 @@ confidence per row**, and `v.A.score` reads it whatever produced `A`:
 ```
 
 A column also remembers **how** it was reached — `v.tag.via` is the relation the
-hop walked, `~has_interact` for a step taken against the stored direction — and
-`v.rec.type` is the node type its ids fall in.
+hop walked, `~has_interact` for a step taken against the stored direction;
+`v.person.label.needle` is which of the things you searched for a row is an
+answer to; and `v.rec.type` is the node type its ids fall in.
 
-None of the three is a column. They are attributes of one, kept in shadow
+That last pair is what lets a set of names be resolved in one query rather than
+one each:
+
+```python
+(g.nodes(seed="song")
+   .filter(v.seed.name.like(["Toxic", "Bad Romance"], k=8))
+   .with_columns(asked=v.seed.name.needle, seen=v.seed.contains.count())
+   .sort(["seen"], descending=True).unique("asked"))      # the one the crowd means
+```
+
+None of these is a column. They are attributes of one, kept in shadow
 columns polars keeps aligned for free, hidden from `columns` and from `print`,
 and **not allocated at all when they say the same thing about every row**: on an
 unweighted graph, confidence costs nothing. They follow their column through

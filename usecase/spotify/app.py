@@ -64,15 +64,19 @@ def resolve(graph, names):
     closest stored titles rather than the equal one, and what it landed on comes
     back in the answer so a wrong guess is visible rather than silent.
 
-    One name at a time, and several matches each, because titles are not unique
-    and closeness cannot break the tie: `Wonderwall` is Oasis and also Ryan
-    Adams covering Oasis, both spelled identically. Which one somebody typing it
-    meant is a claim about this dataset -- the one in more playlists -- so the
-    use case makes it rather than the library guessing.
+    Several matches each, because titles are not unique and closeness cannot
+    break the tie: `Wonderwall` is Oasis and also Ryan Adams covering Oasis,
+    both spelled identically. Which one somebody typing it meant is a claim
+    about this dataset -- the one in more playlists -- so the use case makes it
+    rather than the library guessing.
 
-    That claim is the crude version of the right one, and the right one is a
-    graph question rather than a popularity one. **Not built** (see below), but
-    written down because it is the interesting part:
+    All the names in one query, because `v.seed.name.needle` says which of them
+    each row is an answer to: the grouping the tie-break needs is a column
+    rather than a loop.
+
+    That popularity tie-break is the crude version of the right one, and the
+    right one is a graph question rather than a popularity one. **Not built**,
+    but written down because it is the interesting part:
 
     A name resolved on its own has only its own popularity to go on. A *set* of
     names has more: the songs somebody names together tend to sit in the same
@@ -81,29 +85,29 @@ def resolve(graph, names):
     Oasis; `Wonderwall` beside `Come Pick Me Up` is Ryan Adams. Neither is more
     popular than the other in the abstract -- what decides is the company.
 
-    Concretely: keep every candidate rather than one, tagged with the name it
-    answers; ask the graph for the pairwise connection between candidates, which
-    is one two-hop query and returns the whole matrix at once; then choose one
-    candidate per name to maximise the total. The choice is `k**n` by brute
+    Concretely: keep every candidate rather than one, which the `needle` column
+    already groups; ask the graph for the pairwise connection between
+    candidates, which is one two-hop query and returns the whole matrix at once;
+    then choose one candidate per name to maximise the total. `k**n` by brute
     force and a few passes of coordinate ascent -- best candidate for each name
-    given the others, repeated -- in practice.
+    given the others, repeated -- in practice. Closeness stops mattering at that
+    point: what decides is the company, not the spelling.
 
     Until then there is a cheaper escape, also unbuilt: let a caller pin a title
     by writing the performer after a tab, `"Wonderwall\tOasis"`, which turns a
     guess into a constraint. The two compose rather than compete -- an explicit
     performer pins one name and the coherence resolves the rest."""
-    found = []
-    for name in (one.strip() for one in names):
-        if not name:
-            continue
-        matches = (graph.nodes(seed="song")
-                   .filter(v.seed.name.like(name, k=TIES))
-                   .with_columns(closeness=v.seed.name.score,
-                                 seen=v.seed.contains.count())
-                   .sort(["closeness", "seen"], descending=True).head(1))
-        if len(matches):
-            found.append(matches.select("seed"))
-    return jb.concat(*found) if found else None
+    wanted = [name.strip() for name in names if name and name.strip()]
+    if not wanted:
+        return None
+    return (graph.nodes(seed="song")
+            .filter(v.seed.name.like(wanted, k=TIES))
+            .with_columns(asked=v.seed.name.needle,
+                          closeness=v.seed.name.score,
+                          seen=v.seed.contains.count())
+            .sort(["closeness", "seen"], descending=True)
+            .unique("asked", keep="first")
+            .select("seed"))
 
 
 def candidates(graph, seeds):

@@ -64,11 +64,21 @@ def closest(needle, texts, k, cutoff):
 
 
 def best(needles, texts, k, cutoff):
-    """The k closest rows to each needle, folded: a row admitted by two needles
-    keeps the higher similarity, and is admitted once."""
+    """The k closest rows to each needle, as {row: (closeness, needle)}.
+
+    Folded: a row admitted by two needles is admitted once, keeping the higher
+    closeness and the needle that earned it. Which needle that is, is the
+    question a set of names asks that one name does not -- so it is answered
+    rather than counted and thrown away.
+
+    Two needles that judge a row *equally* well are a tie the measure cannot
+    break, and it is not broken here either: the first one asked keeps it. That
+    is arbitrary but it is at least stable, and the alternative -- admitting the
+    row twice -- would make a set of names return more rows than it has
+    answers."""
     found = {}
     for needle in needles:
         for row, score in closest(needle, texts, k, cutoff):
-            if score > found.get(row, 0.0):
-                found[row] = score
+            if score > found.get(row, (0.0, None))[0]:
+                found[row] = (score, needle)
     return found

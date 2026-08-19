@@ -137,19 +137,27 @@ honest.
 
 ---
 
-## 5. Resolving a set of names by what connects them
+## 5. Resolving a set of names by what connects them — half done
 
-**The problem.** `like` resolves one name at a time, so a name with several
-equally-close matches is decided by something outside the query -- popularity in
-`usecase/spotify`, load order before that. `Wonderwall` is Oasis and also Ryan
-Adams covering Oasis, and neither is the right answer in the abstract.
+**The problem.** A name with several equally-close matches is decided by
+something outside the query -- popularity in `usecase/spotify`, load order
+before that. `Wonderwall` is Oasis and also Ryan Adams covering Oasis, and
+neither is the right answer in the abstract.
 
-**The shape.** A *set* of names carries information one name does not: songs
-somebody names together tend to sit in the same playlists, films together in the
-same tastes. So keep every candidate rather than one, ask the graph for the
-pairwise connection between candidates -- one two-hop query, the whole matrix at
-once -- and choose one candidate per name to maximise the total. `k**n` by brute
-force; a few passes of coordinate ascent in practice.
+**What exists.** `v.x.name.needle` -- which of the things searched for a row is
+an answer to, as a provenance of the column beside its confidence, and a value
+rather than a column when there is only one. It is what makes the candidates
+groupable, so a set of names resolves in one query rather than one each, and it
+is the input the rest of this needs.
+
+**What does not.** The choice itself. A *set* of names carries information one
+name does not: songs somebody names together tend to sit in the same playlists,
+films together in the same tastes. So keep every candidate rather than one --
+`needle` already groups them -- ask the graph for the pairwise connection
+between candidates, which is one two-hop query returning the whole matrix, and
+choose one candidate per name to maximise the total. `k**n` by brute force; a
+few passes of coordinate ascent in practice. Closeness stops mattering at that
+point: what decides is the company, not the spelling.
 
 **Why it belongs here rather than in a use case.** Every service on this library
 begins by turning names into nodes, and every one of them has this problem. And

@@ -45,7 +45,7 @@ RELATION = "relation"
 class Frame:
     """A table of node ids, joined to the graph that gave them meaning."""
 
-    def __init__(self, graph, data, variables=None, pending=None, via=None,
+    def __init__(self, graph, data, variables=None, pending=None, constants=None,
                  plan=None):
         self.graph = graph
         self._data = (None if data is None else
@@ -53,9 +53,11 @@ class Frame:
         # {column: type or None} for the columns that hold node ids, in the
         # order they were introduced. A hop with no `from_` reads the last one.
         self.vars = dict(variables or {})
-        # {column: relation} for the steps that walked one relation for every
-        # row. A constant needs no array, but `v.x.via` should still answer
-        self.via = dict(via or {})
+        # {(kind, column): value} for the provenance that says the same thing
+        # about every row -- the one relation a named hop walked, the one needle
+        # a search asked for. A constant needs no array, and `v.x.via` should
+        # answer all the same
+        self.constants = dict(constants or {})
         # a hop that has walked but not built its rows yet (see resolve.Pending).
         # The only thing that reads it is `filter`, which may be able to apply
         # itself to the arrays instead of to the rows they would become
@@ -79,12 +81,14 @@ class Frame:
 
     # --- construction --------------------------------------------------------
 
-    def _wrap(self, data, variables=None):
+    def _wrap(self, data, variables=None, constants=None):
         variables = self.vars if variables is None else variables
+        constants = self.constants if constants is None else constants
         kept = {name: type_ for name, type_ in variables.items() if name in data.columns}
-        via = {name: relation for name, relation in self.via.items()
-               if name in data.columns}
-        return Frame(self.graph, data, kept, via=via)
+        held = {(kind, column): value
+                for (kind, column), value in constants.items()
+                if column in data.columns or column.partition(".")[0] in data.columns}
+        return Frame(self.graph, data, kept, constants=held)
 
     # --- what it is ----------------------------------------------------------
 
@@ -228,7 +232,7 @@ class Frame:
             for spec, name in steps:
                 if name is not None:
                     variables[name] = self._target_type(spec)
-            return Frame(self.graph, None, variables, via=dict(self.via),
+            return Frame(self.graph, None, variables, constants=dict(self.constants),
                          plan=Plan(self, steps, budget))
         return self._hop_eager(steps)
 
@@ -239,7 +243,8 @@ class Frame:
         source = self._rightmost()
         rows = np.arange(base.height, dtype=np.int64)
         nodes = base[source].to_numpy()
-        added, variables, via = {}, dict(self.vars), dict(self.via)
+        added, variables = {}, dict(self.vars)
+        constants = dict(self.constants)
 
         for spec, name in steps:
             walked, targets, codes, weights, single = _walk(graph, nodes, spec)
@@ -259,7 +264,8 @@ class Frame:
             if single is None and len(codes):
                 added[shadow(VIA, name)] = self._names(codes)
             elif single is not None:
-                via[name] = single           # every row walked the same relation
+                # every row walked the same relation, so one value says it
+                constants[(VIA, name)] = single
             variables[name] = self._one_type(nodes)
 
         if any(name is None for _spec, name in steps):
@@ -271,7 +277,7 @@ class Frame:
 
         last = steps[-1][1]
         return Frame(graph, None, variables, pending=Pending(base, rows, added, last),
-                     via=via)
+                     constants=constants)
 
     def _known(self, spec):
         """Refuse a step over a relation the graph has never seen.
@@ -472,7 +478,7 @@ class Frame:
         exprs = [_resolved(one, resolver) for one in _flat(predicates)]
         keyed = {name: _resolved(value, resolver) for name, value in named.items()}
         data = resolver.attach(frame._df).filter(*exprs, **keyed)
-        return frame._wrap(resolver.detach(data))
+        return resolver.wrap(resolver.detach(data))
 
     def with_columns(self, *exprs, **named):
         resolver = Resolver(self)
@@ -482,7 +488,7 @@ class Frame:
         # what was asked for stays; what was only read to compute it does not
         asked = set(named) | {one.meta.output_name() for one in columns
                               if isinstance(one, pl.Expr)}
-        return self._wrap(resolver.detach(data, keep=asked))
+        return resolver.wrap(resolver.detach(data, keep=asked))
 
     def select(self, *exprs, **named):
         """Choose columns. A column's confidence and provenance travel with it,
@@ -498,14 +504,14 @@ class Frame:
         # aggregates has no row to hang a per-row confidence on
         if carried and data.height == self._df.height:
             data = data.hstack(resolver.attach(self._df).select(carried))
-        return self._wrap(data)
+        return resolver.wrap(data)
 
     def sort(self, *by, descending=False, nulls_last=True):
         resolver = Resolver(self)
         columns = [_resolved(one, resolver) for one in _flat(by)]
         data = resolver.attach(self._df).sort(*columns, descending=descending,
                                               nulls_last=nulls_last)
-        return self._wrap(resolver.detach(data))
+        return resolver.wrap(resolver.detach(data))
 
     def unique(self, subset=None, keep="first", maintain_order=True):
         """Fold duplicate rows. The confidence of the row that is kept is kept
@@ -581,10 +587,9 @@ class Frame:
             if kind_column and kind_column[1] in mapping:
                 full[name] = shadow(kind_column[0], mapping[kind_column[1]])
         variables = {mapping.get(name, name): type_ for name, type_ in self.vars.items()}
-        renamed = self._wrap(self._df.rename(full), variables)
-        renamed.via = {mapping.get(name, name): relation
-                       for name, relation in self.via.items()}
-        return renamed
+        constants = {(kind, mapping.get(column, column)): value
+                     for (kind, column), value in self.constants.items()}
+        return self._wrap(self._df.rename(full), variables, constants)
 
     def join(self, other, on=None, how="inner", **kwargs):
         right = other._df if isinstance(other, Frame) else other
@@ -592,13 +597,11 @@ class Frame:
         variables = dict(self.vars)
         if isinstance(other, Frame):
             variables.update(other.vars)
-        joined = self._wrap(self._df.join(right, on=columns, how=how, **kwargs),
-                            variables)
+        constants = dict(self.constants)
         if isinstance(other, Frame):
-            joined.via = {name: relation
-                          for name, relation in {**other.via, **self.via}.items()
-                          if name in joined._df.columns}
-        return joined
+            constants = {**other.constants, **constants}
+        return self._wrap(self._df.join(right, on=columns, how=how, **kwargs),
+                          variables, constants)
 
     def group_by(self, *by, maintain_order=True, confidence="mean"):
         """Fold rows together. What becomes of their confidence is `confidence`:
@@ -636,12 +639,12 @@ class Frame:
         data = resolver.attach(self._df)
         if over is None:
             data = data.sort(ordering, descending=descending).head(n)
-            return self._wrap(resolver.detach(data))
+            return resolver.wrap(resolver.detach(data))
         groups = [name_of(one) for one in _flat([over])]
         ranked = ordering.rank("ordinal", descending=descending).over(groups)
         data = (data.filter(ranked <= n)
                 .sort(groups + [ordering], descending=[False] * len(groups) + [descending]))
-        return self._wrap(resolver.detach(data))
+        return resolver.wrap(resolver.detach(data))
 
     def _defer(self, predicates):
         """Hand a condition to a walk that has not happened, so the batch it
@@ -655,7 +658,8 @@ class Frame:
              else stays).append(one)
         if not joins:
             return self, stays
-        return Frame(self.graph, None, dict(self.vars), via=dict(self.via),
+        return Frame(self.graph, None, dict(self.vars),
+                     constants=dict(self.constants),
                      plan=plan.narrowed(joins)), stays
 
     # --- pushing a predicate into a hop that has not built its rows ----------
@@ -832,7 +836,7 @@ class _GroupBy:
         keyed.update(self._confidence())
         grouped = (resolver.attach(self.frame._df)
                    .group_by(self.by, maintain_order=self.maintain_order))
-        return self.frame._wrap(resolver.detach(grouped.agg(*columns, **keyed)))
+        return resolver.wrap(resolver.detach(grouped.agg(*columns, **keyed)))
 
     def len(self, name="len"):
         grouped = self.frame._df.group_by(self.by, maintain_order=self.maintain_order)

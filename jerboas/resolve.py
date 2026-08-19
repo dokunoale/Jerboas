@@ -20,8 +20,8 @@ import numpy as np
 import polars as pl
 
 from . import fuzzy
-from .expr import (ATTR, PROVENANCE, REL, SCORE, TYPE, VIA, Relation, path_of,
-                   shadow)
+from .expr import (ATTR, NEEDLE, PROVENANCE, REL, SCORE, TYPE, Relation,
+                   path_of, shadow)
 
 
 class Pending:
@@ -78,6 +78,7 @@ class Resolver:
         self.frame = frame
         self.extra = {}                    # name -> Series, for this verb only
         self.keep = {}                     # name -> Series, measured and kept
+        self.constants = {}                # (kind, column) -> one value for every row
 
     # -- the surface an Expr resolves against --
 
@@ -110,18 +111,32 @@ class Resolver:
         return pl.col(name)
 
     def like(self, column, needles, k, cutoff):
-        """The k closest rows to each needle, and the closeness kept as the
-        column's confidence -- one computation, so admission and weight cannot
-        disagree."""
+        """The k closest rows to each needle, and what the measure found kept.
+
+        Two things, and they cost one computation: the closeness becomes the
+        column's confidence, so admission and weight cannot disagree; and which
+        needle each row answers becomes the column's `needle`, because that is
+        the question a set of names asks and one name does not. With one needle
+        the answer is the same for every row, so it is a value rather than a
+        column."""
         name = str(column)
         values = self._values(name)
         texts = [(row, str(value).lower()) for row, value in enumerate(values)
                  if value is not None]
         found = fuzzy.best(needles, texts, k, cutoff)
+
         closeness = np.zeros(len(values))
-        for row, score in found.items():
+        asked = [None] * len(values)
+        for row, (score, needle) in found.items():
             closeness[row] = score
+            asked[row] = needle
         self.keep[shadow(SCORE, name)] = pl.Series(shadow(SCORE, name), closeness)
+        if len(needles) == 1:
+            self.constants[(NEEDLE, name)] = needles[0]
+        else:
+            self.keep[shadow(NEEDLE, name)] = pl.Series(
+                shadow(NEEDLE, name), asked, dtype=pl.Enum(list(dict.fromkeys(needles))))
+
         admitted = f"{name}.__like__"
         self.extra[admitted] = pl.Series(admitted, closeness > 0)
         return pl.col(admitted)
@@ -194,6 +209,12 @@ class Resolver:
 
     # -- attaching and detaching --
 
+    def wrap(self, data):
+        """The frame a verb hands back, carrying whatever the resolution learned
+        that holds for every row."""
+        return self.frame._wrap(data, constants={**self.frame.constants,
+                                                 **self.constants})
+
     def attach(self, data):
         added = list(self.keep.values()) + list(self.extra.values())
         return data.with_columns(added) if added else data
@@ -223,8 +244,9 @@ class Resolver:
         name = shadow(kind, column)
         if self._present(name):
             return pl.col(name)
-        if kind == VIA and column in self.frame.via:
-            return pl.lit(self.frame.via[column])     # one relation, every row
+        constant = self.frame.constants.get((kind, column))
+        if constant is not None:
+            return pl.lit(constant)                   # one value, every row
         # nothing measured this column, so nothing is in doubt about it
         return pl.lit(1.0) if kind == SCORE else pl.lit(None, dtype=pl.String)
 
