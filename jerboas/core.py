@@ -25,9 +25,15 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 
+from .expr import Expr
 
-class Signal:
-    """A strategy aimed at named columns. Passive: the Frame computes it."""
+
+class Signal(Expr):
+    """A strategy aimed at named columns. Passive: the Frame computes it.
+
+    An expression like any other, so a score is combined by arithmetic that is
+    written down -- `0.7 * kg.norm() + 0.3 * walk.norm()` -- rather than by a
+    rule the pipeline applies out of sight."""
 
     __slots__ = ("strategy", "columns", "normalized")
 
@@ -39,6 +45,12 @@ class Signal:
     def norm(self):
         """Min-max into [0, 1], so signals on different scales can be added."""
         return Signal(self.strategy, self.columns, normalized=True)
+
+    def resolve(self, ctx):
+        return ctx.signal(self)
+
+    def reads(self):
+        return ()          # it reads node ids, which no filter can be pushed past
 
     def values(self, graph, arrays):
         self.strategy.fit(graph)

@@ -120,7 +120,15 @@ class Expr:
     def __hash__(self):
         return id(self)
 
-    # -- the methods a name carries --
+
+class _Methods:
+    """The named questions an expression answers.
+
+    Deliberately not on `Col`: attribute access there is the column path, and a
+    method defined on the class would win the lookup and silently shadow every
+    column of that name -- `v.person.name` meaning something other than the
+    person's name. A `Col` reaches these by being called (see `_Field`), so the
+    two readings never compete."""
 
     def _call(self, method, *args, **kwargs):
         return _Method(self, method, args, kwargs)
@@ -178,31 +186,28 @@ class Expr:
 
 
 class Col(Expr):
-    """A name path: `v.rec` is ("rec",), `v.rec.year` is ("rec", "year")."""
+    """A name path: `v.rec` is ("rec",), `v.rec.year` is ("rec", "year").
+
+    Attribute access here means one thing only -- the path grows -- because a
+    column may be called anything, `name` and `count` and `min` included. What
+    would be a method elsewhere is reached by *calling* the name instead:
+    `v.x.sum` is the column `x.sum`, and `v.x.sum()` is the sum of `x`."""
 
     __slots__ = ("_path",)
 
     def __init__(self, path):
         self._path = tuple(path) if not isinstance(path, str) else tuple(path.split("."))
 
-    @property
-    def path(self):
-        return self._path
-
-    @property
-    def name(self):
-        return ".".join(self._path)
-
     def __getattr__(self, attr):
         if attr.startswith("_"):
             raise AttributeError(attr)
-        return Col(self._path + (attr,))
+        return _Field(self._path + (attr,), self)
 
     def __str__(self):
-        return self.name
+        return ".".join(self._path)
 
     def __repr__(self):
-        return f"v.{self.name}"
+        return f"v.{self}"
 
     def __hash__(self):
         return hash(self._path)
@@ -210,14 +215,43 @@ class Col(Expr):
     @property
     def expr(self):
         """Raw polars, unresolved: the column by this exact name, whatever the
-        graph might have said about it."""
-        return pl.col(self.name)
+        graph might have said about it. (A column actually named `expr` is
+        reached with `col("x.expr")`.)"""
+        return pl.col(str(self))
 
     def reads(self):
         return (self._path,)
 
     def resolve(self, ctx):
         return ctx.lookup(self._path)
+
+
+class _Field(Col):
+    """A name that is also, when called, the method of that name on its parent.
+
+    `v.person.name` is the column; `v.person.count()` is a count of `v.person`.
+    Which one it is, is decided by whether it is called -- so no method name is
+    ever unreachable as a column, and no column name ever hides a method."""
+
+    __slots__ = ("_parent",)
+
+    def __init__(self, path, parent):
+        super().__init__(path)
+        self._parent = parent
+
+    def __call__(self, *args, **kwargs):
+        method = self._path[-1]
+        if method == "is_in":
+            return _In(self._parent, *args, **kwargs)
+        if method == "contains":
+            return _Contains(self._parent, *args, **kwargs)
+        if method == "norm":
+            return _Norm(self._parent, *args, **kwargs)
+        if method not in _NAMED:
+            raise AttributeError(
+                f"{self._parent!r} has no method {method!r}; as a column it would "
+                f"be {str(self)!r}, which this frame does not have.")
+        return _Method(self._parent, method, args, kwargs)
 
 
 class _Vars:
@@ -260,7 +294,7 @@ class Relation:
 # The tree                                                                     #
 # --------------------------------------------------------------------------- #
 
-class _Binary(Expr):
+class _Binary(Expr, _Methods):
     __slots__ = ("op", "left", "right")
 
     def __init__(self, op, left, right):
@@ -278,7 +312,7 @@ class _Binary(Expr):
     __hash__ = Expr.__hash__
 
 
-class _Unary(Expr):
+class _Unary(Expr, _Methods):
     __slots__ = ("op", "operand")
 
     def __init__(self, op, operand):
@@ -296,7 +330,7 @@ class _Unary(Expr):
     __hash__ = Expr.__hash__
 
 
-class _Method(Expr):
+class _Method(Expr, _Methods):
     """A method on a name. `count` is the one that means something different on
     a relation: the graph's arity rather than the column's length."""
 
@@ -323,7 +357,7 @@ class _Method(Expr):
     __hash__ = Expr.__hash__
 
 
-class _Contains(Expr):
+class _Contains(Expr, _Methods):
     __slots__ = ("target", "text")
 
     def __init__(self, target, text):
@@ -339,7 +373,7 @@ class _Contains(Expr):
     __hash__ = Expr.__hash__
 
 
-class _In(Expr):
+class _In(Expr, _Methods):
     """Set membership, and the one place a name means two different questions.
 
     On a column it is the ordinary one. On a relation it asks whether an edge to
@@ -363,7 +397,7 @@ class _In(Expr):
     __hash__ = Expr.__hash__
 
 
-class _Norm(Expr):
+class _Norm(Expr, _Methods):
     __slots__ = ("target",)
 
     def __init__(self, target):
@@ -376,6 +410,11 @@ class _Norm(Expr):
         return norm(_expr(_side(self.target, ctx), "norm"))
 
     __hash__ = Expr.__hash__
+
+
+# the methods a name may be called as, beyond the three with their own nodes
+_NAMED = ("sum", "count", "n_unique", "mean", "min", "max", "std", "first", "last",
+          "abs", "alias", "is_null", "is_not_null", "is_between")
 
 
 def _reads(thing):
@@ -408,7 +447,7 @@ def norm(expr):
 def name_of(thing):
     """A column name from whatever names a column."""
     if isinstance(thing, Col):
-        return thing.name
+        return str(thing)
     if isinstance(thing, str):
         return thing
     if isinstance(thing, pl.Expr):

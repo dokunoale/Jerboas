@@ -114,6 +114,21 @@ than guessed, and `v.movie.attr.knows` / `v.movie.rel.knows` say which. `.expr`
 drops out to raw polars — the column by that exact name, unresolved — and plain
 strings still work wherever a name is wanted (`top(10, by="score")`).
 
+**A name is never shadowed by a method.** Attribute access always grows the
+path, so `v.person.name` is the person's name and `v.movie.count` is a column
+called `movie.count`. What would be a method elsewhere is reached by *calling*
+the name instead:
+
+```python
+v.person.name        # the column person.name
+v.rec.count()        # how many rec, in an aggregate
+v.carried.score.sum()
+```
+
+Without that rule a method on the class would win the attribute lookup and
+`v.person.name` would silently mean something else — which is the worst way for
+a query language to be wrong, since it returns an answer.
+
 ## Membership is graded
 
 A filter answers *yes* or *no*. `like` answers *how much*, in `[0, 1]`, and that
@@ -311,6 +326,10 @@ the matches is `agg`; none of those is a strategy, and none of them needs to be.
    .with_columns(score=0.6 * v.kg + 0.4 * v.pr)
    .top(10))
 ```
+
+A strategy's score is an expression like any other, so it composes with
+arithmetic and with columns: `0.7 * kg.norm() + 0.3 * v.similarity` is a
+sentence, not a special case.
 
 `on(...)` names the columns the strategy reads. The first is what is being
 scored; the rest are context — the user whose taste it is, the seed the row was

@@ -493,7 +493,28 @@ def test_col_and_v_are_the_same_column(small_graph):
 def test_two_spellings_of_a_variable_are_one_variable(small_graph):
     """The whole identity system: a variable is a name, so saying it twice says
     the same thing -- where two `Node("movie")` used to be two variables."""
-    assert v.rec.name == col("rec").name == "rec"
+    assert str(v.rec) == str(col("rec")) == "rec"
+    assert hash(v.rec) == hash(col("rec"))
+
+
+def test_a_method_name_is_still_reachable_as_a_column(small_graph):
+    """`v.person.name` is the person's name, not the string "person". A method
+    defined on the class would have shadowed every column called `name` --
+    silently, which is the worst way to be wrong."""
+    assert str(v.person.name) == "person.name"
+    assert str(v.movie.count) == "movie.count"
+    frame = small_graph.nodes("person").filter(v.person.name.contains("Xavier"))
+    assert names(frame) == ["person.0"]
+
+
+def test_calling_a_name_is_how_a_method_is_reached(small_graph):
+    """The two readings never compete: one is the column, the other is the
+    question asked of its parent."""
+    counted = (small_graph.nodes(user="user").hop("has_interact", to="rec")
+               .group_by(v.user).agg(n=v.rec.count()))
+    assert sorted(counted.pl["n"].to_list()) == [2, 2, 2]
+    with pytest.raises(AttributeError, match="no method 'nonesuch'"):
+        v.movie.nonesuch()
 
 
 def test_a_keyword_filter_compares_against_a_value(small_graph):

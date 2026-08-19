@@ -23,7 +23,7 @@ import numpy as np
 import polars as pl
 
 from . import fuzzy, traverse
-from .core import Signal
+
 from .expr import ATTR, REL, Col, Expr, Relation, name_of
 from .keys import Key
 
@@ -453,17 +453,19 @@ class Frame:
     def with_columns(self, *exprs, **named):
         resolver = _Resolver(self)
         columns = [_resolved(one, resolver) for one in _flat(exprs)]
-        keyed = {name: self._signal(name, value, resolver)
-                 for name, value in named.items()}
+        keyed = {name: _resolved(value, resolver) for name, value in named.items()}
         data = resolver.attach(self._df).with_columns(*columns, **keyed)
-        return self._wrap(resolver.detach(data))
+        # what was asked for stays; what was only read to compute it does not
+        asked = set(named) | {one.meta.output_name() for one in columns
+                              if isinstance(one, pl.Expr)}
+        return self._wrap(resolver.detach(data, keep=asked))
 
     def select(self, *exprs, **named):
+        # no detaching: a selection is already exactly what was asked for
         resolver = _Resolver(self)
         columns = [_resolved(one, resolver) for one in _flat(exprs)]
         keyed = {name: _resolved(value, resolver) for name, value in named.items()}
-        data = resolver.attach(self._df).select(*columns, **keyed)
-        return self._wrap(resolver.detach(data))
+        return self._wrap(resolver.attach(self._df).select(*columns, **keyed))
 
     def sort(self, *by, descending=False, nulls_last=True):
         resolver = _Resolver(self)
@@ -530,13 +532,6 @@ class Frame:
                                 + [descending]))
 
     # --- internals -----------------------------------------------------------
-
-    def _signal(self, name, value, resolver):
-        """A Signal is a strategy that has not met a graph yet; here it does."""
-        if isinstance(value, Signal):
-            arrays = tuple(self._df[column].to_numpy() for column in value.columns)
-            return pl.Series(name, value.values(self.graph, arrays), dtype=pl.Float64)
-        return _resolved(value, resolver)
 
     # --- pushing a predicate into a hop that has not built its rows ----------
 
@@ -779,11 +774,21 @@ class _Resolver:
 
     # -- attaching and detaching what was read on demand --
 
+    def signal(self, signal):
+        """A strategy's score, as a literal column the rest of an expression can
+        be arithmetic on."""
+        name = f"_signal_{len(self.extra)}"
+        arrays = tuple(self.frame._df[column].to_numpy() for column in signal.columns)
+        self.extra[name] = pl.Series(name, signal.values(self.frame.graph, arrays),
+                                     dtype=pl.Float64)
+        return pl.col(name)
+
     def attach(self, data):
         return data.with_columns(list(self.extra.values())) if self.extra else data
 
-    def detach(self, data):
-        stale = [name for name in self.extra if name in data.columns]
+    def detach(self, data, keep=()):
+        stale = [name for name in self.extra
+                 if name in data.columns and name not in keep]
         return data.drop(stale) if stale else data
 
     # -- internals --
