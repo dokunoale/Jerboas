@@ -567,6 +567,29 @@ On MovieLens (15 369 nodes, 127 k edges, of which 110 k pass the cold-start use
 case's training filter) TransD at `factors=64` is 1.97 M parameters, 7.9 MB, and
 trains in roughly a second per epoch on Apple MPS.
 
+## Breaking change in 0.2
+
+0.2 replaces the query API. `Graph` and the data format are unchanged, and so
+are the models and their checkpoints; everything between `g` and a result is
+different. `select/where/rank/top`, `Node`, `Edge`, `Path`, `Like`, `Has`, the
+`Condition`/`Ref`/`Engine` families and the pluggable engines are gone, and
+what replaces them is above. There is no compatibility layer: 0.1 queries do
+not run.
+
+| 0.1 | 0.2 |
+|---|---|
+| `g.select(rec).where(...)` | `g.nodes(rec="movie").filter(...)` |
+| `Node("movie")`, `Node()` | a column name |
+| `path == [a, Edge(), b]` | `.hop(b=())` |
+| `Like(node.name.is_in(x))` | `.filter(v.node.name.like(x))` |
+| `Has(a, "r", b)` / `~Has(...)` | `.filter(v.a.r.is_in(b))` |
+| `node.rel.count()` | `v.node.rel.count()` |
+| `rank(a, b)` | `.with_columns(score=0.6 * a.norm() + 0.4 * b.norm())` |
+| `Sum(edge.score)` | `.group_by(...).agg(score=v.x.score.sum())` |
+| `Score()` projection | the `score` column |
+| `Weight(how="min")` | `v.x.score`, and arithmetic |
+| `using(Greedy(k))` | `.top(k, by=..., over=...)` between two hops |
+
 ## Install
 
 ```bash

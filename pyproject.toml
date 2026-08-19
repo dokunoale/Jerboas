@@ -1,6 +1,6 @@
 [project]
 name = "jerboas"
-version = "0.1.0"
+version = "0.2.0"
 description = "A non-deterministic-first, ORM-like graph query library"
 readme = "README.md"
 requires-python = ">=3.10"
