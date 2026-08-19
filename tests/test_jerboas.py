@@ -1189,3 +1189,174 @@ def test_a_hop_expands_every_source_row(small_graph):
     assert len(frame) == 6
     assert sorted(names(frame, "user")) == ["user.0", "user.0", "user.1",
                                             "user.1", "user.2", "user.2"]
+
+
+# --- a graph out of frames ---------------------------------------------------
+
+@pytest.fixture
+def frame_graph():
+    """The fixture graph again, built from frames rather than from files."""
+    edges = pl.DataFrame({"user_id": [0, 0, 1, 1, 2, 2],
+                          "movie_id": [0, 1, 1, 2, 0, 2],
+                          "rating": [5.0, 1.0, 4.0, 2.0, 3.0, 5.0]})
+    kg = pl.DataFrame({"source": ["movie.0", "movie.1", "movie.2"],
+                       "relation": ["directed_by"] * 3,
+                       "target": ["person.0", "person.0", "person.1"]})
+    movies = pl.DataFrame({"id": [0, 1, 2], "title": ["Alpha", "Beta", "Gamma"],
+                           "year": [1994, 1994, 1999]})
+    assert kg is not None                          # the kg form has its own test
+    return Graph.from_frames(
+        {"has_interact": edges}, attrs={"movie": movies},
+        source=("user", "user_id"), target=("movie", "movie_id"), score="rating",
+        readable={"movie": "title"})
+
+
+def test_a_graph_can_be_built_from_frames(frame_graph):
+    """Anything polars reads is a graph -- which is what makes this a layer over
+    someone else's storage rather than a store."""
+    assert len(frame_graph.nodes("movie")) == 3
+    assert len(frame_graph.nodes("user")) == 3
+    assert frame_graph.relations == ["has_interact"]
+
+
+def test_a_column_of_ids_names_nodes_with_its_type(frame_graph):
+    """`("user", "user_id")` is what data from anywhere else looks like: the
+    type in the schema rather than in the value."""
+    walked = frame_graph.nodes(user="user").hop(rec="has_interact")
+    assert len(walked) == 6
+    assert set(names(walked, "rec")) == {"movie.0", "movie.1", "movie.2"}
+
+
+def test_attributes_and_weights_survive_the_trip(frame_graph):
+    frame = (frame_graph.nodes(user="user").hop(rec="has_interact")
+             .filter(v.rec.year >= 1999).with_columns(s=v.rec.score))
+    assert sorted(frame.pl["s"].to_list()) == [0.25, 1.0]        # a 2 and a 5
+    assert names(frame_graph.nodes("movie").labels("movie"), "movie") \
+        == ["movie.0", "movie.1", "movie.2"]
+
+
+def test_a_relation_column_names_the_relations(frame_graph):
+    kg = pl.DataFrame({"source": ["movie.0", "movie.1"],
+                       "relation": ["directed_by", "has_genre"],
+                       "target": ["person.0", "genre.0"]})
+    graph = Graph.from_frames(kg)
+    assert sorted(graph.relations) == ["directed_by", "has_genre"]
+
+
+def test_edges_that_name_no_relation_are_refused():
+    with pytest.raises(ValueError, match="name no relation"):
+        Graph.from_frames(pl.DataFrame({"source": ["a.0"], "target": ["a.1"]}))
+
+
+def test_a_missing_column_says_which(frame_graph):
+    with pytest.raises(ValueError, match="no column 'nope'"):
+        Graph.from_frames({"r": pl.DataFrame({"source": ["a.0"], "target": ["a.1"]})},
+                          source="nope")
+
+
+# --- vectors: nearness is graded membership, for embeddings ------------------
+
+@pytest.fixture
+def vector_graph():
+    rows = np.array([[1.0, 0.0], [0.9, 0.1], [0.0, 1.0], [-1.0, 0.0]], dtype=np.float32)
+    chunks = pl.DataFrame({"id": [0, 1, 2, 3], "text": list("abcd"),
+                           "embedding": [list(map(float, row)) for row in rows]})
+    edges = pl.DataFrame({"src": [0, 1, 2], "dst": [1, 2, 3]})
+    return Graph.from_frames({"follows": edges}, attrs={"chunk": chunks},
+                             source=("chunk", "src"), target=("chunk", "dst"),
+                             readable={"chunk": "text"})
+
+
+def test_a_list_column_is_a_vector_and_not_an_attribute(vector_graph):
+    """The dtype says which, so nothing has to be declared twice."""
+    assert vector_graph.vector("chunk", "embedding").shape == (4, 2)
+    assert "embedding" not in vector_graph.columns["chunk"]
+
+
+def test_near_admits_the_k_nearest(vector_graph):
+    found = vector_graph.nodes(chunk="chunk").filter(
+        v.chunk.embedding.near([1.0, 0.0], k=2))
+    assert sorted(names(found)) == ["chunk.0", "chunk.1"]
+
+
+def test_near_keeps_the_cosine_as_the_columns_confidence(vector_graph):
+    """The same shape as `like` over text, and for the same reason: admission
+    and weight are one measure."""
+    found = (vector_graph.nodes(chunk="chunk")
+             .filter(v.chunk.embedding.near([1.0, 0.0], k=2))
+             .with_columns(sim=v.chunk.embedding.score)
+             .sort("sim", descending=True))
+    assert found.pl["sim"].to_list() == [pytest.approx(1.0), pytest.approx(0.994, abs=1e-3)]
+
+
+def test_the_opposite_direction_is_no_confidence_rather_than_negative(vector_graph):
+    """Cosine below zero is not a weaker answer, it is the other way."""
+    found = (vector_graph.nodes(chunk="chunk")
+             .filter(v.chunk.embedding.near([1.0, 0.0], cutoff=0.0))
+             .with_columns(sim=v.chunk.embedding.score))
+    assert min(found.pl["sim"].to_list()) == 0.0
+    assert "chunk.3" in names(found)                  # admitted at zero, not below
+
+
+def test_a_cutoff_narrows_without_a_k(vector_graph):
+    found = vector_graph.nodes(chunk="chunk").filter(
+        v.chunk.embedding.near([1.0, 0.0], cutoff=0.5))
+    assert sorted(names(found)) == ["chunk.0", "chunk.1"]
+
+
+def test_several_query_vectors_are_several_questions(vector_graph):
+    """A row answers whichever it answers best."""
+    found = (vector_graph.nodes(chunk="chunk")
+             .filter(v.chunk.embedding.near([[1.0, 0.0], [0.0, 1.0]], k=3))
+             .with_columns(sim=v.chunk.embedding.score))
+    assert set(names(found)) == {"chunk.0", "chunk.1", "chunk.2"}
+    assert max(found.pl["sim"].to_list()) == pytest.approx(1.0)
+
+
+def test_near_needs_a_vector_column(vector_graph):
+    with pytest.raises(ValueError, match="no vector column 'text'"):
+        vector_graph.nodes(chunk="chunk").filter(v.chunk.text.near([1.0, 0.0]))
+
+
+def test_near_pushes_into_a_hop(vector_graph):
+    """Being a condition about the node just reached, it is applied before the
+    rows are built, like any other."""
+    walked = (vector_graph.nodes(chunk="chunk").head(1)
+              .hop(rec="follows").filter(v.rec.embedding.near([0.9, 0.1], k=1)))
+    assert names(walked, "rec") == ["chunk.1"]
+
+
+# --- one confidence out of several -------------------------------------------
+
+def test_confidence_reduces_the_columns_that_have_one(small_graph):
+    walked = (small_graph.nodes(user="user").hop(seen="has_interact")
+              .hop(peer="~has_interact"))
+    weakest = walked.confidence("min").pl["confidence"].to_list()
+    both = walked.confidence("product").pl["confidence"].to_list()
+    assert all(0.0 <= one <= 1.0 for one in weakest)
+    assert all(a <= b + 1e-9 for a, b in zip(both, weakest))
+
+
+def test_a_frame_nobody_doubted_reduces_to_certainty(small_graph):
+    frame = small_graph.nodes("movie").hop(person="directed_by")
+    assert frame.confidence().pl["confidence"].to_list() == [1.0, 1.0, 1.0]
+
+
+def test_an_unknown_reduction_says_so(small_graph):
+    with pytest.raises(ValueError, match="unknown confidence rule"):
+        small_graph.nodes("movie").hop(person="directed_by").confidence("whatever")
+
+
+# --- the frame hands out what it says it holds -------------------------------
+
+def test_pl_hides_the_bookkeeping_and_raw_does_not(small_graph):
+    frame = small_graph.nodes(user="user").hop(rec="has_interact")
+    assert frame.pl.columns == ["user", "rec"]
+    assert "__jb_score__rec" in frame.raw.columns
+
+
+def test_chunked_slices_the_frame(small_graph):
+    frame = small_graph.nodes(user="user").hop(rec="has_interact")
+    parts = list(frame.chunked(4))
+    assert [len(one) for one in parts] == [4, 2]
+    assert sum(len(one) for one in parts) == len(frame)

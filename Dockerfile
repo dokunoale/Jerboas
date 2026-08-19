@@ -12,11 +12,15 @@ WORKDIR /app
 # leaves a build/ directory behind and will not re-copy a source file that is no
 # older than the one already in it. Built in place, the stub's empty
 # __init__.py outlives the real one and ends up in the installed package.
+# EXTRAS picks what the image is for: serving a use case by default, or the
+# whole of it when the image is being built to run the tests (see test.sh).
+ARG EXTRAS=api,torch
+
 COPY pyproject.toml /tmp/deps/
 RUN cd /tmp/deps \
     && touch README.md LICENSE NOTICE \
     && mkdir jerboas && touch jerboas/__init__.py \
-    && pip install --no-cache-dir "/tmp/deps[api,torch]" \
+    && pip install --no-cache-dir "/tmp/deps[${EXTRAS}]" \
     && rm -rf /tmp/deps
 
 # Real source, installed without re-resolving dependencies. --force-reinstall

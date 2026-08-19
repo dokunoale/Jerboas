@@ -181,6 +181,50 @@ def _drain(parts):
     return joined
 
 
+def _matrix(series):
+    """A column of lists as one (n, d) float32 block."""
+    values = series.to_numpy()
+    if values.dtype == object:                    # ragged or lazily typed
+        values = np.stack([np.asarray(one, dtype=np.float32) for one in values])
+    return np.ascontiguousarray(values, dtype=np.float32)
+
+
+def _normalize(block):
+    """Rows scaled to unit length; a zero row stays zero rather than becoming a
+    direction it never had."""
+    lengths = np.linalg.norm(block, axis=1, keepdims=True)
+    return block / np.where(lengths > 0, lengths, 1.0)
+
+
+def _edge_frames(edges):
+    """(relation or None, frame) pairs, however the edges were given."""
+    if isinstance(edges, dict):
+        return list(edges.items())
+    if isinstance(edges, (list, tuple)):
+        return [(None, one) for one in edges]
+    return [(None, edges)]
+
+
+def _node_keys(frame, spec):
+    """A column of source keys, from a column that holds them or from a column
+    of ids and the type they belong to.
+
+    The concatenation runs in polars rather than in Python: it is the one thing
+    here that happens once per edge."""
+    if isinstance(spec, str):
+        if spec not in frame.columns:
+            raise ValueError(f"no column {spec!r} in these edges; it has: "
+                             f"{', '.join(frame.columns)}")
+        return frame[spec].cast(pl.String).to_list()
+    type_, column = spec
+    if column not in frame.columns:
+        raise ValueError(f"no column {column!r} in these edges; it has: "
+                         f"{', '.join(frame.columns)}")
+    return frame.select(
+        pl.concat_str([pl.lit(f"{type_}."), pl.col(column).cast(pl.String)])
+    ).to_series().to_list()
+
+
 def _weights(column):
     """A score column as floats. An empty cell is an edge nobody scored, which
     is not the same as an edge scored zero."""
@@ -195,6 +239,12 @@ class Graph:
         self.kg = kg
         self.edge_files = edges or []
         self.attr_files = attrs or []
+        self._prepare(renumber, readable)
+        self._load()
+        self._finalize()
+
+    def _prepare(self, renumber, readable):
+        """The mutable state a build needs, whether it reads files or frames."""
         self.renumber = renumber         # ids are not positions: assign them here
         # {type: column a person reads}. Declared, never inferred -- see labels()
         self.readable = dict(readable or {})
@@ -218,9 +268,15 @@ class Graph:
         self._e_weight = []
 
         self._attr_rows = {}             # type -> (column names, {provisional id: values})
-
-        self._load()
-        self._finalize()
+        # type -> {name: (provisional ids, matrix)}. A vector is not a column:
+        # it has no value a row can print and no order to sort by, and what a
+        # query asks of one is nearness. Kept as one (n, d) float32 block per
+        # type, so scoring a candidate set is a matmul and not a gather of lists
+        self._vector_rows = {}
+        # a frame build sets neither, and _load reads both as "nothing to read"
+        self.kg = getattr(self, "kg", None)
+        self.edge_files = getattr(self, "edge_files", [])
+        self.attr_files = getattr(self, "attr_files", [])
 
     # --- loading -------------------------------------------------------------
 
@@ -270,6 +326,93 @@ class Graph:
         self._e_rel.append(codes)
         self._e_tgt.append(self._ids_of(targets))
         self._e_weight.append(np.ones(len(sources)) if weights is None else weights)
+
+    # --- building from frames rather than from files -------------------------
+
+    @classmethod
+    def from_frames(cls, edges, attrs=None, *, source="source", target="target",
+                    relation="relation", score="score", renumber=False,
+                    readable=None):
+        """A graph out of whatever polars can read.
+
+            Graph.from_frames({"has_interact": pl.read_parquet("ratings.parquet")},
+                              attrs={"movie": movies},
+                              source=("user", "user_id"),
+                              target=("movie", "movie_id"))
+
+        `edges` is one frame carrying a relation column, or a mapping from
+        relation name to a frame that needs none. `attrs` maps a type to a frame
+        whose first column (or `id` column) is the node id and whose rest are
+        attributes.
+
+        A column may name nodes two ways. Given a column name, its values are
+        source keys -- `movie.123`, the format the files use. Given a
+        `(type, column)` pair, the values are ids of that type and the key is
+        built from them, which is what data from anywhere else looks like: a
+        `user_id` column and a `movie_id` column, with the type in the schema
+        rather than in the value.
+
+        Everything else is the file loader's: ids are positions unless
+        `renumber=True`, and the graph is complete when it exists -- which is
+        why this takes what it needs in one call rather than being built up.
+        """
+        graph = cls.__new__(cls)
+        graph._prepare(renumber, readable)
+        for name, frame in _edge_frames(edges):
+            graph._stage_frame(frame, name, source, target, relation, score)
+        for type_, frame in (attrs or {}).items():
+            graph._stage_attrs(frame, type_)
+        graph._finalize()
+        return graph
+
+    def _stage_frame(self, frame, name, source, target, relation, score):
+        """One frame of edges, as the four columns the loader stages."""
+        frame = frame.pl if hasattr(frame, "pl") else frame
+        sources = _node_keys(frame, source)
+        targets = _node_keys(frame, target)
+        if name is not None:
+            codes = np.full(len(sources), self._relation(name), dtype=np.int32)
+        elif relation in frame.columns:
+            codes = self._codes_of(frame[relation].to_list())
+        else:
+            raise ValueError(
+                f"these edges name no relation: give `edges` as a mapping from "
+                f"relation to frame, or add a {relation!r} column")
+        weights = (frame[score].to_numpy().astype(np.float64)
+                   if score in frame.columns else None)
+        self._stage(sources, codes, targets, weights)
+
+    def _stage_attrs(self, frame, type_):
+        """One frame of attributes: the id column, then the rest by name.
+
+        A column of lists is a vector rather than an attribute -- the dtype
+        says which, so nothing has to be declared twice."""
+        frame = frame.pl if hasattr(frame, "pl") else frame
+        identity = ID if ID in frame.columns else frame.columns[0]
+        vectors = [name for name, dtype in frame.schema.items()
+                   if name != identity and dtype.base_type() in (pl.List, pl.Array)]
+        names = [name for name in frame.columns
+                 if name != identity and name not in vectors]
+        keys = [f"{type_}.{one}" for one in frame[identity].to_list()]
+        if vectors:
+            nodes = np.fromiter((self._intern(key) for key in keys),
+                                dtype=np.int64, count=len(keys))
+            block = self._vector_rows.setdefault(type_, {})
+            for name in vectors:
+                block[name] = (nodes, _matrix(frame[name]))
+        values = [[None if one is None else str(one) for one in frame[name].to_list()]
+                  for name in names]
+        rows = {self._intern(key): [column[row] for column in values]
+                for row, key in enumerate(keys)}
+        known = self._attr_rows.get(type_)
+        if known is None:
+            self._attr_rows[type_] = (names, rows)
+        else:                                            # a second frame for the type
+            known[0].extend(names)
+            for node, row in rows.items():
+                known[1].setdefault(node, []).extend(row)
+
+    # --- loading from files --------------------------------------------------
 
     def _load(self):
         if self.kg:
@@ -366,10 +509,12 @@ class Graph:
 
         self._build_adjacency()
         self._build_columns(sizes, sources)
+        self._build_vectors(sizes)
 
         # only the by-name lookup tables outlive the load
         self._e_src = self._e_rel = self._e_tgt = self._e_weight = None
         self._attr_rows = self._id = self._keys = self._new_of_old = None
+        self._vector_rows = None
 
     def _renumber(self, tags, raws, places):
         """Positions for a dataset whose ids are not positions, and the ids it
@@ -455,6 +600,36 @@ class Graph:
         indptr = np.zeros(self.n_nodes + 1, dtype=np.int64)
         np.cumsum(np.bincount(key, minlength=self.n_nodes), out=indptr[1:])
         return indptr, value[order], rel[order], weight[order]
+
+    def _build_vectors(self, sizes):
+        """Per type, {name: (size, d) float32} laid out by local id.
+
+        A node the frame had no row for keeps a zero vector, which is nearest to
+        nothing -- absence reads as "no answer", never as "here is one"."""
+        self.vectors = {}
+        for tag, type_ in enumerate(self.types):
+            staged = self._vector_rows.get(type_)
+            if not staged:
+                continue
+            low = int(self.start[tag])
+            table = {}
+            for name, (nodes, matrix) in staged.items():
+                block = np.zeros((int(sizes[tag]), matrix.shape[1]), dtype=np.float32)
+                block[self._new_of_old[nodes] - low] = matrix
+                table[name] = block
+            self.vectors[type_] = table
+
+    def vector(self, type_, name):
+        """One vector column, or None when the type has no such thing."""
+        return self.vectors.get(type_, {}).get(name)
+
+    def unit(self, type_, name):
+        """The same block with every row scaled to length one, so nearness is a
+        matmul. Memoized: normalising is O(n d) and the block never changes."""
+        block = self.vector(type_, name)
+        if block is None:
+            return None
+        return self.cached(("unit", type_, name), lambda: _normalize(block))
 
     def _build_columns(self, sizes, sources):
         """Per type, {attribute: Column} indexed by local id -- plus `id` and

@@ -19,13 +19,17 @@ makes `print(g.nodes("movie"))` a table rather than a plan -- and a hop has to
 read its source ids anyway, so laziness would only defer the cheap half.
 """
 
+import operator
+from functools import reduce
+
 import numpy as np
 import polars as pl
 
-from . import fuzzy, traverse
-from .expr import (ATTR, PROVENANCE, REL, SCORE, TYPE, VIA, Col, Expr, Relation,
-                   direction, name_of, path_of, reverse)
+from . import traverse
+from .expr import (SCORE, VIA, Col, Expr, direction, is_shadow, name_of,
+                   reverse, shadow, shadowed)
 from .keys import Key
+from .resolve import Pending, Resolver, take
 
 RELATION = "relation"
 
@@ -37,25 +41,6 @@ RELATION = "relation"
 #
 # Absent means 1.0. A graph with no weights and a query with no fuzzy matching
 # therefore allocate nothing at all.
-SHADOW = "__jb_"
-
-
-def shadow(kind, column):
-    return f"{SHADOW}{kind}__{column}"
-
-
-def is_shadow(name):
-    return name.startswith(SHADOW)
-
-
-def shadowed(name):
-    """(kind, column) of a shadow column, or None."""
-    if not is_shadow(name):
-        return None
-    kind, _, column = name[len(SHADOW):].partition("__")
-    return kind, column
-
-
 class Frame:
     """A table of node ids, joined to the graph that gave them meaning."""
 
@@ -97,7 +82,16 @@ class Frame:
 
     @property
     def pl(self):
-        """The polars DataFrame, for anything this class does not forward."""
+        """The polars DataFrame, for anything this class does not forward.
+
+        Without the shadows: they are attributes of columns rather than columns,
+        and a frame handed to something else should carry what it says it holds.
+        `.raw` is the whole thing, bookkeeping included."""
+        return self.visible
+
+    @property
+    def raw(self):
+        """The polars DataFrame exactly as it is, shadows and all."""
         return self._df
 
     def to_polars(self):
@@ -227,14 +221,14 @@ class Frame:
         for spec, name in steps:
             walked, targets, codes, weights, single = _walk(graph, nodes, spec)
             rows = rows[walked]
-            added = {column: _take(values, walked) for column, values in added.items()}
+            added = {column: take(values, walked) for column, values in added.items()}
             nodes = targets
             if name is None:
                 # nothing names these, so nothing tells two routes through them
                 # apart: keep one of each and carry that forward
                 keep = _distinct(graph, rows, nodes)
                 rows, nodes = rows[keep], nodes[keep]
-                added = {column: _take(values, keep) for column, values in added.items()}
+                added = {column: take(values, keep) for column, values in added.items()}
                 continue
             added[name] = nodes.astype(np.int32)
             if len(weights) and not (weights == 1.0).all():
@@ -250,10 +244,10 @@ class Frame:
             # row: two routes through an unnamed step are one answer
             keep = _folded(rows, [added[name] for _spec, name in steps if name])
             rows = rows[keep]
-            added = {column: _take(values, keep) for column, values in added.items()}
+            added = {column: take(values, keep) for column, values in added.items()}
 
         last = steps[-1][1]
-        return Frame(graph, None, variables, pending=_Pending(base, rows, added, last),
+        return Frame(graph, None, variables, pending=Pending(base, rows, added, last),
                      via=via)
 
     def _rightmost(self):
@@ -385,14 +379,14 @@ class Frame:
             frame, predicates = frame._pushdown(predicates)
         if not predicates and not named:
             return frame
-        resolver = _Resolver(frame)
+        resolver = Resolver(frame)
         exprs = [_resolved(one, resolver) for one in _flat(predicates)]
         keyed = {name: _resolved(value, resolver) for name, value in named.items()}
         data = resolver.attach(frame._df).filter(*exprs, **keyed)
         return frame._wrap(resolver.detach(data))
 
     def with_columns(self, *exprs, **named):
-        resolver = _Resolver(self)
+        resolver = Resolver(self)
         columns = [_resolved(one, resolver) for one in _flat(exprs)]
         keyed = {name: _resolved(value, resolver) for name, value in named.items()}
         data = resolver.attach(self._df).with_columns(*columns, **keyed)
@@ -404,7 +398,7 @@ class Frame:
     def select(self, *exprs, **named):
         """Choose columns. A column's confidence and provenance travel with it,
         because they are attributes of it and not columns of their own."""
-        resolver = _Resolver(self)
+        resolver = Resolver(self)
         columns = [_resolved(one, resolver) for one in _flat(exprs)]
         keyed = {name: _resolved(value, resolver) for name, value in named.items()}
         data = resolver.attach(self._df).select(*columns, **keyed)
@@ -418,16 +412,58 @@ class Frame:
         return self._wrap(data)
 
     def sort(self, *by, descending=False, nulls_last=True):
-        resolver = _Resolver(self)
+        resolver = Resolver(self)
         columns = [_resolved(one, resolver) for one in _flat(by)]
         data = resolver.attach(self._df).sort(*columns, descending=descending,
                                               nulls_last=nulls_last)
         return self._wrap(resolver.detach(data))
 
     def unique(self, subset=None, keep="first", maintain_order=True):
+        """Fold duplicate rows. The confidence of the row that is kept is kept
+        with it -- `keep="first"` by default and the order maintained, so which
+        row that is, is the one you can see rather than one of several.
+
+        To fold by a rule instead, `group_by(...).agg(...)`, which says what
+        becomes of a confidence rather than inheriting one."""
         columns = None if subset is None else [name_of(one) for one in _listed(subset)]
         return self._wrap(self._df.unique(subset=columns, keep=keep,
                                           maintain_order=maintain_order))
+
+    def confidence(self, rule="min", into="confidence"):
+        """Every column's confidence, reduced to one number per row.
+
+        Confidence does not compose on its own: `v.tag.score` is the step that
+        revealed `tag` and `v.rec.score` the step after, and a string similarity,
+        an edge weight and a model's plausibility are not the same measure. So
+        reducing them is a decision, and this is where it is written down.
+
+            .confidence("min")        # as certain as the least certain step
+            .confidence("product")    # independent evidence, multiplied
+            .confidence(lambda *scores: 0.7 * scores[0] + 0.3 * scores[1])
+
+        Columns nothing measured count as 1.0 and are left out, so a frame in
+        which nothing was in doubt reduces to 1.0 rather than to nothing."""
+        if not callable(rule) and rule not in _REDUCE:
+            raise ValueError(f"unknown confidence rule {rule!r}; expected one of "
+                             f"{sorted(_REDUCE)} or a callable")
+        scores = [pl.col(name) for name in self._df.columns if is_shadow(name)
+                  and shadowed(name)[0] == SCORE]
+        if not scores:
+            return self._wrap(self._df.with_columns(pl.lit(1.0).alias(into)))
+        reduced = rule(*scores) if callable(rule) else _REDUCE[rule](scores)
+        return self._wrap(self._df.with_columns(reduced.alias(into)))
+
+    def chunked(self, size):
+        """The frame in slices of `size` rows, as frames.
+
+        What a caller does by hand when a walk out of the whole thing would not
+        fit -- the benchmark expands its users a block at a time for exactly
+        this reason. A planner would choose the size; until there is one, the
+        caller does."""
+        for start in range(0, max(self._df.height, 1), size):
+            part = self._wrap(self._df.slice(start, size))
+            if len(part):
+                yield part
 
     def head(self, n):
         return self._wrap(self._df.head(n))
@@ -504,7 +540,7 @@ class Frame:
             by = "score" if "score" in self._df.columns else None
         if by is None:
             return self.head(n) if over is None else self
-        resolver = _Resolver(self)
+        resolver = Resolver(self)
         ordering = _resolved(by, resolver)
         if isinstance(ordering, str):          # polars reads a bare name as a column
             ordering = pl.col(ordering)
@@ -539,7 +575,7 @@ class Frame:
 
         narrow = Frame(self.graph, pending.narrow(),
                        {pending.var: self.vars.get(pending.var)})
-        resolver = _Resolver(narrow)
+        resolver = Resolver(narrow)
         exprs = [_resolved(one, resolver) for one in pushed]
         keep = (resolver.attach(narrow._df)
                 .select(_all(exprs).fill_null(False).alias("keep"))["keep"].to_numpy())
@@ -658,214 +694,13 @@ def _read(graph, type_, name, ids):
     return values, present
 
 
-class _Pending:
-    """A hop that has walked the graph but not yet built its rows.
-
-    The walk produced four parallel arrays; turning them into a frame means
-    taking every column the old frame had at `rows`, which is the expensive half
-    of a hop. Holding them one step lets a filter about the node just reached be
-    applied here -- to arrays -- instead of to rows that would then be dropped.
-
-    Nothing else is deferred: any other verb reads `_df` and pays for it. This
-    is a peephole, not a query planner."""
-
-    __slots__ = ("base", "rows", "added", "var")
-
-    def __init__(self, base, rows, added, var):
-        self.base = base            # the frame before the hop
-        self.rows = rows            # which base row each candidate came from
-        self.added = added          # {column: array} the step produced, shadows included
-        self.var = var              # the new node column
-
-    def narrow(self):
-        """Just what the step produced -- the frame a pushable predicate is
-        evaluated against."""
-        return pl.DataFrame({name: _series(name, values)
-                             for name, values in self.added.items()})
-
-    def masked(self, keep):
-        return _Pending(self.base, self.rows[keep],
-                        {name: _take(values, keep) for name, values in self.added.items()},
-                        self.var)
-
-    def build(self):
-        data = self.base[self.rows] if len(self.rows) else self.base.clear()
-        return data.with_columns([_series(name, values)
-                                  for name, values in self.added.items()])
-
-
-class _Resolver:
-    """What turns a name into a column, with the graph in hand.
-
-    Four answers, in this order: the provenance of a column (its confidence, the
-    relation that revealed it, the type its ids fall in), a column the frame
-    already has, an attribute of that variable's type, or a relation of the
-    graph. Only the first is free; the rest read one array out of the graph.
-
-    Two kinds of thing get attached to the frame. What was read only to decide
-    something is taken off again, because a filter filters rows and does not
-    quietly widen the frame. What was *measured* stays -- a `like`'s closeness
-    is the column's confidence from then on, and throwing it away would mean
-    computing it twice or, worse, differently."""
-
-    def __init__(self, frame):
-        self.frame = frame
-        self.extra = {}                    # name -> Series, for this verb only
-        self.keep = {}                     # name -> Series, measured and kept
-
-    # -- the surface an Expr resolves against --
-
-    def lookup(self, path):
-        name = ".".join(path)
-        if self._present(name):
-            return pl.col(name)
-        if len(path) >= 2 and path[-1] in PROVENANCE and path[-2] != ATTR:
-            return self._provenance(".".join(path[:-1]), path[-1])
-        if len(path) >= 2 and path[0] in self.frame.vars:
-            return self._below(path[0], path[1:])
-        raise ValueError(
-            f"no column {name!r}, and {path[0]!r} is not a node column of this "
-            f"frame -- it has: {', '.join(self.frame.columns)}")
-
-    def degree(self, relation):
-        name = f"{relation.var}.{relation.name}_count"
-        if name not in self.extra:
-            counts = self.frame._degrees(relation.name, None)
-            ids = self.frame._df[relation.var].to_numpy()
-            self.extra[name] = pl.Series(name, counts[ids])
-        return pl.col(name)
-
-    def exists(self, relation, values):
-        name = f"{relation.var}.{relation.name}_exists"
-        if name not in self.extra:
-            admissible = self.frame._reachable(relation.name, values, None)
-            ids = self.frame._df[relation.var].to_numpy()
-            self.extra[name] = pl.Series(name, admissible[ids])
-        return pl.col(name)
-
-    def like(self, column, needles, k, cutoff):
-        """The k closest rows to each needle, and the closeness kept as the
-        column's confidence -- one computation, so admission and weight cannot
-        disagree."""
-        name = str(column)
-        values = self._values(name)
-        texts = [(row, str(value).lower()) for row, value in enumerate(values)
-                 if value is not None]
-        found = fuzzy.best(needles, texts, k, cutoff)
-        closeness = np.zeros(len(values))
-        for row, score in found.items():
-            closeness[row] = score
-        self.keep[shadow(SCORE, name)] = pl.Series(shadow(SCORE, name), closeness)
-        admitted = f"{name}.__like__"
-        self.extra[admitted] = pl.Series(admitted, closeness > 0)
-        return pl.col(admitted)
-
-    def signal(self, signal):
-        """A strategy's score, as a literal column the rest of an expression can
-        be arithmetic on."""
-        name = f"_signal_{len(self.extra)}"
-        arrays = tuple(self.frame._df[column].to_numpy() for column in signal.columns)
-        self.extra[name] = pl.Series(name, signal.values(self.frame.graph, arrays),
-                                     dtype=pl.Float64)
-        return pl.col(name)
-
-    def membership(self, target, resolved, values):
-        """`is_in` over a column of nodes and over a column of values are two
-        questions, and only the frame can tell them apart.
-
-        A node column takes source keys, Keys and frames, all resolved against
-        the graph. Anything else takes its values as they are -- resolving
-        "Alpha" as a node key on a column of titles admitted nothing, which is
-        the worst way to be wrong."""
-        path = path_of(target)
-        nodes = (path is not None and len(path) == 1 and path[0] in self.frame.vars)
-        if nodes or hasattr(values, "ids"):
-            return resolved.is_in(self.frame.graph.ids_of(values))
-        return resolved.is_in(list(values))
-
-    # -- attaching and detaching --
-
-    def attach(self, data):
-        added = list(self.keep.values()) + list(self.extra.values())
-        return data.with_columns(added) if added else data
-
-    def detach(self, data, keep=()):
-        stale = [name for name in self.extra
-                 if name in data.columns and name not in keep]
-        return data.drop(stale) if stale else data
-
-    # -- internals --
-
-    def _present(self, name):
-        return (name in self.frame._df.columns or name in self.extra
-                or name in self.keep)
-
-    def _values(self, name):
-        """One column's values, materializing it first if it was only virtual."""
-        if name in self.frame._df.columns:
-            return self.frame._df[name].to_list()
-        if name not in self.extra:
-            self.lookup(tuple(name.split(".")))
-        return self.extra[name].to_list()
-
-    def _provenance(self, column, kind):
-        if kind == TYPE:
-            return self._types(column)
-        name = shadow(kind, column)
-        if self._present(name):
-            return pl.col(name)
-        if kind == VIA and column in self.frame.via:
-            return pl.lit(self.frame.via[column])     # one relation, every row
-        # nothing measured this column, so nothing is in doubt about it
-        return pl.lit(1.0) if kind == SCORE else pl.lit(None, dtype=pl.String)
-
-    def _types(self, column):
-        name = shadow(TYPE, column)
-        if name not in self.extra:
-            if column not in self.frame.vars:
-                raise ValueError(f"{column!r} does not hold nodes, so it has no type")
-            graph = self.frame.graph
-            ids = self.frame._df[column].to_numpy()
-            names = [graph.types[tag] for tag in graph._type_tag_of[ids].tolist()]
-            self.extra[name] = pl.Series(name, names, dtype=pl.Enum(graph.types))
-        return pl.col(name)
-
-    def _below(self, var, rest):
-        forced = None
-        if rest[0] in (ATTR, REL) and len(rest) > 1:
-            forced, rest = rest[0], rest[1:]
-        name = ".".join(rest)
-        if name == "label" and forced != REL:
-            # the column a person reads, per the graph's `readable` map -- the
-            # same one `labels()` names, so the two spellings cannot diverge
-            return self._gathered(var, None)
-        attribute = forced != REL and self.frame._has_attribute(var, name)
-        relation = forced != ATTR and name in self.frame.graph.relations
-        if attribute and relation and forced is None:
-            raise ValueError(
-                f"{var}.{name} is both an attribute of {self.frame.vars[var]} and a "
-                f"relation of the graph. Say which: v.{var}.{ATTR}.{name} or "
-                f"v.{var}.{REL}.{name}.")
-        if attribute:
-            return self._gathered(var, name)
-        if relation:
-            return Relation(var, name)
-        raise ValueError(
-            f"{var!r} has no attribute {name!r} and the graph has no relation by "
-            f"that name. Attributes: {', '.join(self.frame._attribute_names(var))}. "
-            f"Relations: {', '.join(self.frame.graph.relations)}.")
-
-    def _gathered(self, var, attribute):
-        name = f"{var}.{attribute if attribute is not None else 'label'}"
-        if name not in self.extra:
-            ids = self.frame._df[var].to_numpy()
-            values, present = self.frame._gather(var, attribute, ids)
-            series = pl.Series(name, values)
-            if present is not None:
-                series = pl.select(pl.when(pl.Series(present)).then(series)
-                                   .otherwise(None).alias(name)).to_series()
-            self.extra[name] = series
-        return pl.col(name)
+_REDUCE = {
+    "min": lambda scores: pl.min_horizontal(scores),
+    "max": lambda scores: pl.max_horizontal(scores),
+    "mean": lambda scores: pl.mean_horizontal(scores),
+    "product": lambda scores: reduce(operator.mul, scores),
+    "sum": lambda scores: pl.sum_horizontal(scores),
+}
 
 
 FOLD = {
@@ -887,7 +722,7 @@ class _GroupBy:
         self.confidence = confidence
 
     def agg(self, *exprs, **named):
-        resolver = _Resolver(self.frame)
+        resolver = Resolver(self.frame)
         columns = [_resolved(one, resolver) for one in _flat(exprs)]
         keyed = {name: _resolved(value, resolver) for name, value in named.items()}
         keyed.update(self._confidence())
@@ -1025,20 +860,6 @@ def _all(exprs):
     for one in exprs[1:]:
         combined = combined & one
     return combined
-
-
-def _series(name, values):
-    return values if isinstance(values, pl.Series) else pl.Series(
-        name, values, dtype=pl.String if isinstance(values, list) else None)
-
-
-def _take(values, keep):
-    """Index an array or a python column, by mask or by position."""
-    if not isinstance(values, list):
-        return values[keep]
-    if keep.dtype == bool:
-        return [value for value, take in zip(values, keep.tolist()) if take]
-    return [values[position] for position in keep.tolist()]
 
 
 def _expr(item):

@@ -56,8 +56,8 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 from .core import Strategy, Signal
-from .expr import SCORE, VIA, col, norm, reverse, v
-from .frame import Frame, concat, shadow
+from .expr import SCORE, VIA, col, norm, reverse, shadow, v
+from .frame import Frame, concat
 from .graph import Graph
 from .keys import Key
 from .strategies import (

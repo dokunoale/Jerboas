@@ -44,6 +44,31 @@ ATTR, REL = "attr", "rel"
 SCORE, VIA, TYPE = "score", "via", "type"
 PROVENANCE = (SCORE, VIA, TYPE)
 
+# Every column carries a confidence, and where something measured one it is kept
+# under this prefix: an ordinary polars column, so filter, sort, join and
+# group_by keep it aligned with its values without a line of code from us.
+# Hidden from `columns` and from `print`, because it is an attribute of a column
+# rather than a column -- `v.rec.score` is how it is read. Absent means 1.0, so
+# a graph with no weights and a query with no fuzzy matching allocate nothing.
+SHADOW = "__jb_"
+
+
+def shadow(kind, column):
+    return f"{SHADOW}{kind}__{column}"
+
+
+def is_shadow(name):
+    return name.startswith(SHADOW)
+
+
+def shadowed(name):
+    """(kind, column) of a shadow column, or None."""
+    if not is_shadow(name):
+        return None
+    kind, _, column = name[len(SHADOW):].partition("__")
+    return kind, column
+
+
 # How a step says it reads a relation backwards, and how `v.x.via` says it did.
 # One place, so the two cannot drift -- and so `reverse()` below can go on
 # meaning the same thing if the character ever changes.
@@ -444,6 +469,37 @@ class _Like(Expr, _Methods):
     __hash__ = Expr.__hash__
 
 
+class _Near(Expr, _Methods):
+    """Nearness over a vector column: the search box, for embeddings.
+
+    The same shape as `like` over text, and for the same reason -- admission
+    and weight are one measure. It admits the `k` nearest rows to each query
+    vector and keeps the cosine as the column's confidence, so
+    `v.chunk.embedding.score` is how near each surviving row was.
+
+    Cosine below zero is not a weaker answer, it is the opposite direction, so
+    it reads as no confidence at all rather than as a negative one."""
+
+    __slots__ = ("target", "query", "k", "cutoff")
+
+    def __init__(self, target, query, k=None, cutoff=0.0):
+        self.target = target
+        self.query = query
+        self.k = k
+        self.cutoff = cutoff
+
+    def reads(self):
+        return _reads(self.target)
+
+    def resolve(self, ctx):
+        if not isinstance(self.target, Col):
+            raise TypeError("near(...) reads a vector column: name one, "
+                            "`v.chunk.embedding.near(query)`")
+        return ctx.near(self.target, self.query, self.k, self.cutoff)
+
+    __hash__ = Expr.__hash__
+
+
 class _Norm(Expr, _Methods):
     __slots__ = ("target",)
 
@@ -470,6 +526,7 @@ _NAMED = ("sum", "count", "n_unique", "mean", "min", "max", "std", "first", "las
 _SPECIAL.update(is_in=lambda target, values: _In(target, values),
                 contains=lambda target, text: _Contains(target, text),
                 like=lambda target, *a, **k: _Like(target, *a, **k),
+                near=lambda target, *a, **k: _Near(target, *a, **k),
                 norm=lambda target: _Norm(target))
 
 
