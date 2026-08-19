@@ -24,7 +24,7 @@ import polars as pl
 
 from . import fuzzy, traverse
 from .expr import (ATTR, PROVENANCE, REL, SCORE, TYPE, VIA, Col, Expr, Relation,
-                   direction, name_of, reverse)
+                   direction, name_of, path_of, reverse)
 from .keys import Key
 
 RELATION = "relation"
@@ -362,8 +362,11 @@ class Frame:
         return [Key(graph, int(index)) for index in self.ids(variable)]
 
     def ids(self, variable=None):
-        """One column as an int array. Defaults to the first node column, which
-        is what makes a frame usable as a seed set anywhere ids are."""
+        """One column as an int array -- what makes a frame usable as a set of
+        nodes anywhere ids are.
+
+        With one column of nodes there is nothing to say; with several there is,
+        so it asks rather than picking one."""
         return self._df[self._var(variable)].to_numpy()
 
     # --- the forwarded verbs -------------------------------------------------
@@ -384,7 +387,8 @@ class Frame:
             return frame
         resolver = _Resolver(frame)
         exprs = [_resolved(one, resolver) for one in _flat(predicates)]
-        data = resolver.attach(frame._df).filter(*exprs, **_exprs_dict(named))
+        keyed = {name: _resolved(value, resolver) for name, value in named.items()}
+        data = resolver.attach(frame._df).filter(*exprs, **keyed)
         return frame._wrap(resolver.detach(data))
 
     def with_columns(self, *exprs, **named):
@@ -407,7 +411,9 @@ class Frame:
         carried = [name for name in self._df.columns
                    if is_shadow(name) and shadowed(name)[1] in data.columns
                    and name not in data.columns]
-        if carried:
+        # only when the selection kept the rows it was given: a selection that
+        # aggregates has no row to hang a per-row confidence on
+        if carried and data.height == self._df.height:
             data = data.hstack(resolver.attach(self._df).select(carried))
         return self._wrap(data)
 
@@ -439,8 +445,21 @@ class Frame:
         return self._wrap(self._df.drop(going))
 
     def rename(self, mapping):
+        """Rename columns, and with each one whatever hangs off it.
+
+        A shadow whose column was renamed would otherwise go on naming a column
+        that is not there: `v.rec.score` would read 1.0 and the measurement
+        would still be in the frame under the old name."""
+        full = dict(mapping)
+        for name in self._df.columns:
+            kind_column = shadowed(name)
+            if kind_column and kind_column[1] in mapping:
+                full[name] = shadow(kind_column[0], mapping[kind_column[1]])
         variables = {mapping.get(name, name): type_ for name, type_ in self.vars.items()}
-        return self._wrap(self._df.rename(mapping), variables)
+        renamed = self._wrap(self._df.rename(full), variables)
+        renamed.via = {mapping.get(name, name): relation
+                       for name, relation in self.via.items()}
+        return renamed
 
     def join(self, other, on=None, how="inner", **kwargs):
         right = other._df if isinstance(other, Frame) else other
@@ -448,10 +467,25 @@ class Frame:
         variables = dict(self.vars)
         if isinstance(other, Frame):
             variables.update(other.vars)
-        return self._wrap(self._df.join(right, on=columns, how=how, **kwargs), variables)
+        joined = self._wrap(self._df.join(right, on=columns, how=how, **kwargs),
+                            variables)
+        if isinstance(other, Frame):
+            joined.via = {name: relation
+                          for name, relation in {**other.via, **self.via}.items()
+                          if name in joined._df.columns}
+        return joined
 
-    def group_by(self, *by, maintain_order=True):
-        return _GroupBy(self, [name_of(one) for one in _flat(by)], maintain_order)
+    def group_by(self, *by, maintain_order=True, confidence="mean"):
+        """Fold rows together. What becomes of their confidence is `confidence`:
+        by default the mean of the rows folded in, so a group of rows nobody
+        doubted stays certain and a group of weak matches says so.
+
+        `"min"` reads a group as its weakest member, `"max"` as its best,
+        `"product"` as independent evidence multiplied, `None` drops it. A
+        callable is given the shadow's expression and returns whatever it
+        should become."""
+        return _GroupBy(self, [name_of(one) for one in _flat(by)], maintain_order,
+                        confidence)
 
     def top(self, n, by=None, descending=True, over=None):
         """The n best rows. `by` defaults to a `score` column when there is one,
@@ -462,7 +496,7 @@ class Frame:
         than a sort, so it costs one pass instead of one query per group:
 
             .top(10, by="score", over="user")
-            .hop(to="mid").top(5, by=v.pr, over="seed").hop(to="rec")
+            .hop(mid=()).top(5, by=v.pr, over="seed").hop(rec=())
 
         That second line is a beam search: keep the k most promising partial
         walks at each step and expand only those. It was an engine once."""
@@ -483,8 +517,6 @@ class Frame:
         data = (data.filter(ranked <= n)
                 .sort(groups + [ordering], descending=[False] * len(groups) + [descending]))
         return self._wrap(resolver.detach(data))
-
-    # --- internals -----------------------------------------------------------
 
     # --- pushing a predicate into a hop that has not built its rows ----------
 
@@ -516,9 +548,14 @@ class Frame:
     def _var(self, variable=None):
         if variable is not None:
             return name_of(variable)
-        if not self.vars:
-            raise ValueError("this frame has no node column")
-        return next(iter(self.vars))
+        nodes = [name for name in self._df.columns if name in self.vars]
+        if not nodes:
+            raise ValueError("this frame has no column of nodes")
+        if len(nodes) > 1:
+            raise ValueError(
+                f"this frame has {len(nodes)} columns of nodes -- "
+                f"{', '.join(nodes)} -- so which one is a question: name it.")
+        return nodes[0]
 
     def _free(self, name):
         """`name`, suffixed if the frame already has a column called that. Used
@@ -732,8 +769,19 @@ class _Resolver:
                                      dtype=pl.Float64)
         return pl.col(name)
 
-    def ids(self, values):
-        return self.frame.graph.ids_of(values)
+    def membership(self, target, resolved, values):
+        """`is_in` over a column of nodes and over a column of values are two
+        questions, and only the frame can tell them apart.
+
+        A node column takes source keys, Keys and frames, all resolved against
+        the graph. Anything else takes its values as they are -- resolving
+        "Alpha" as a node key on a column of titles admitted nothing, which is
+        the worst way to be wrong."""
+        path = path_of(target)
+        nodes = (path is not None and len(path) == 1 and path[0] in self.frame.vars)
+        if nodes or hasattr(values, "ids"):
+            return resolved.is_in(self.frame.graph.ids_of(values))
+        return resolved.is_in(list(values))
 
     # -- attaching and detaching --
 
@@ -820,25 +868,52 @@ class _Resolver:
         return pl.col(name)
 
 
-class _GroupBy:
-    """What `group_by` returns: only `agg` follows it, so this is all of it."""
+FOLD = {
+    "mean": lambda expr: expr.mean(),
+    "min": lambda expr: expr.min(),
+    "max": lambda expr: expr.max(),
+    "product": lambda expr: expr.product(),
+    "first": lambda expr: expr.first(),
+}
 
-    def __init__(self, frame, by, maintain_order):
+
+class _GroupBy:
+    """What `group_by` returns: only `agg` and `len` follow it."""
+
+    def __init__(self, frame, by, maintain_order, confidence="mean"):
         self.frame = frame
         self.by = by
         self.maintain_order = maintain_order
+        self.confidence = confidence
 
     def agg(self, *exprs, **named):
         resolver = _Resolver(self.frame)
         columns = [_resolved(one, resolver) for one in _flat(exprs)]
         keyed = {name: _resolved(value, resolver) for name, value in named.items()}
+        keyed.update(self._confidence())
         grouped = (resolver.attach(self.frame._df)
                    .group_by(self.by, maintain_order=self.maintain_order))
         return self.frame._wrap(resolver.detach(grouped.agg(*columns, **keyed)))
 
     def len(self, name="len"):
         grouped = self.frame._df.group_by(self.by, maintain_order=self.maintain_order)
-        return self.frame._wrap(grouped.len(name=name))
+        return self.frame._wrap(grouped.agg(pl.len().alias(name), **self._confidence()))
+
+    def _confidence(self):
+        """What the grouped columns' confidence becomes.
+
+        Only the columns being grouped on: everything else is leaving anyway, and
+        inventing a confidence for a column that did not exist before the
+        aggregation would be inventing one for a number nobody measured."""
+        if self.confidence is None:
+            return {}
+        fold = self.confidence if callable(self.confidence) else FOLD.get(self.confidence)
+        if fold is None:
+            raise ValueError(f"unknown confidence rule {self.confidence!r}; expected "
+                             f"one of {sorted(FOLD)}, a callable, or None")
+        return {shadow(SCORE, column): fold(pl.col(shadow(SCORE, column)))
+                for column in self.by
+                if shadow(SCORE, column) in self.frame._df.columns}
 
 
 def concat(*frames, how="diagonal"):

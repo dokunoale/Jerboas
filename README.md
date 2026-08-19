@@ -44,6 +44,20 @@ shape: (5, 4)
 
 That runs on a fresh clone: the example graph ships with the repo.
 
+## What it is for
+
+Jerboas is a retrieval layer for graphs, meant to be **general** and
+**model-aware**: the ranking is not something you bolt on after the query, it is
+part of it. One source and one step for retrieval *and* recommendation, with the
+models trained through the same library that serves them — so a graph can back a
+recommender, a graph RAG, an ordinary RAG whose retrieval and reasoning happen
+to run on a graph, or an LLM reasoning over one, without a different tool for
+each.
+
+That is why the query is a dataframe and not a language of its own: what comes
+out has to feed the rest of an ML stack, and what goes in has to be composable
+with it.
+
 ## The frame is a view of a dataframe that is already there
 
 The mental model, and everything else follows from it: a graph *is* a dataframe
@@ -212,7 +226,21 @@ hop walked, `~has_interact` for a step taken against the stored direction — an
 None of the three is a column. They are attributes of one, kept in shadow
 columns polars keeps aligned for free, hidden from `columns` and from `print`,
 and **not allocated at all when they say the same thing about every row**: on an
-unweighted graph, confidence costs nothing.
+unweighted graph, confidence costs nothing. They follow their column through
+`rename`, `select` and `drop`, because that is what being an attribute of it
+means.
+
+Folding rows folds their confidence, by the mean of what went in:
+
+```python
+.group_by(v.rec).agg(...)                       # mean, the default
+.group_by(v.rec, confidence="min").agg(...)     # as good as its weakest member
+.group_by(v.rec, confidence=None).agg(...)      # forget it
+```
+
+`"max"`, `"product"` and a callable are the rest. Only the grouped columns keep
+one: inventing a confidence for a number the aggregation just made up would be
+inventing one for something nobody measured.
 
 That per-relation scale is not a detail. A 1-5 rating and a cosine similarity
 are both floats and mean nothing to each other, so a confidence is min-maxed

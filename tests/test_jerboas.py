@@ -969,6 +969,59 @@ def test_renaming_follows_the_variable(small_graph):
     assert names(frame, "rec") == ["movie.0", "movie.1", "movie.2"]
 
 
+def test_renaming_takes_the_confidence_with_it(small_graph):
+    """A shadow left behind would name a column that is not there, and the
+    measurement would go on sitting in the frame under the old name."""
+    walked = small_graph.nodes(user="user").hop(rec="has_interact")
+    before = walked.with_columns(s=v.rec.score).pl["s"].to_list()
+    renamed = walked.rename({"rec": "film"})
+    assert renamed.with_columns(s=v.film.score).pl["s"].to_list() == before
+    assert renamed.hidden == ["__jb_score__film"]
+
+
+def test_renaming_takes_the_provenance_with_it(small_graph):
+    walked = small_graph.nodes("movie").hop(person="directed_by")
+    renamed = walked.rename({"person": "director"})
+    assert renamed.with_columns(r=v.director.via).pl["r"].to_list() \
+        == ["directed_by"] * 3
+
+
+def test_a_frame_of_several_node_columns_asks_which_one(small_graph):
+    """Naming it is a question with an answer; picking one is a guess."""
+    frame = small_graph.nodes(user="user").hop(rec="has_interact")
+    with pytest.raises(ValueError, match="which one is a question"):
+        frame.ids()
+    assert len(frame.ids("rec")) == len(frame)
+
+
+def test_is_in_over_values_is_not_over_nodes(small_graph):
+    """Resolving "Alpha" as a node key on a column of titles admitted nothing,
+    silently -- the worst way to be wrong."""
+    frame = small_graph.nodes("movie").attrs(movie="title")
+    assert names(frame.filter(v.movie.title.is_in(["Alpha", "Gamma"]))) \
+        == ["movie.0", "movie.2"]
+    assert names(frame.filter(v.movie.is_in(["movie.1"]))) == ["movie.1"]
+
+
+def test_a_group_folds_the_confidence_of_what_it_folded(small_graph):
+    """By the mean, so a group nobody doubted stays certain and a group of weak
+    matches says so."""
+    walked = small_graph.nodes(user="user").hop(rec="has_interact")
+    mean = walked.group_by(v.rec).agg(n=v.user.count())
+    worst = walked.group_by(v.rec, confidence="min").agg(n=v.user.count())
+    dropped = walked.group_by(v.rec, confidence=None).agg(n=v.user.count())
+    assert (mean.with_columns(s=v.rec.score).pl["s"].to_list()
+            > worst.with_columns(s=v.rec.score).pl["s"].to_list())
+    assert dropped.hidden == []
+    assert dropped.with_columns(s=v.rec.score).pl["s"].to_list() == [1.0, 1.0, 1.0]
+
+
+def test_an_unknown_confidence_rule_says_so(small_graph):
+    with pytest.raises(ValueError, match="unknown confidence rule"):
+        small_graph.nodes("movie").group_by(v.movie, confidence="whatever").agg(
+            n=v.movie.count())
+
+
 def test_selecting_away_a_node_column_forgets_the_variable(small_graph):
     frame = small_graph.nodes("movie").attrs(movie="title").select("movie.title")
     assert frame.vars == {}

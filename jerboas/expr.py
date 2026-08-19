@@ -161,73 +161,39 @@ class Expr:
 class _Methods:
     """The named questions an expression answers.
 
-    Deliberately not on `Col`: attribute access there is the column path, and a
-    method defined on the class would win the lookup and silently shadow every
-    column of that name -- `v.person.name` meaning something other than the
-    person's name. A `Col` reaches these by being called (see `_Field`), so the
-    two readings never compete."""
-
-    def _call(self, method, *args, **kwargs):
-        return _Method(self, method, args, kwargs)
+    Deliberately not defined one by one on `Col`: attribute access there is the
+    column path, and a method defined on the class would win the lookup and
+    silently shadow every column of that name -- `v.person.name` meaning
+    something other than the person's name. A `Col` reaches these by being
+    called instead (see `_Field`), through the same dispatch as here, so the two
+    readings never compete and never drift."""
 
     def __getattr__(self, name):
-        """The rest of the named questions, without a line each. Only the ones
-        in `_NAMED`: an expression is not a polars expression, and pretending
-        otherwise would hand polars a jerboas object to choke on."""
-        if name.startswith("_") or name not in _NAMED:
+        if name.startswith("_") or not _dispatchable(name):
             raise AttributeError(name)
-        return lambda *args, **kwargs: _Method(self, name, args, kwargs)
+        return lambda *args, **kwargs: _dispatch(self, name, args, kwargs)
 
-    def sum(self):
-        return self._call("sum")
 
-    def count(self):
-        return self._call("count")
+# The methods a name answers to. The three with their own nodes mean something
+# a polars expression does not: membership that may be about the graph, a
+# containment that casts first, a rescaling that has a rule about flat columns.
+# The rest are polars', called on whatever the name resolved to.
+_SPECIAL = {}                       # filled in below, once the nodes exist
+_NAMED = ("sum", "count", "n_unique", "mean", "min", "max", "std", "first", "last",
+          "abs", "alias", "is_null", "is_not_null", "is_between",
+          # the ones an aggregate reaches for, so a group can keep its evidence
+          # in the order the evidence deserves
+          "sort_by", "unique", "head", "tail", "cast", "fill_null", "round")
 
-    def n_unique(self):
-        return self._call("n_unique")
 
-    def mean(self):
-        return self._call("mean")
+def _dispatchable(name):
+    return name in _SPECIAL or name in _NAMED
 
-    def min(self):
-        return self._call("min")
 
-    def max(self):
-        return self._call("max")
-
-    def std(self):
-        return self._call("std")
-
-    def first(self):
-        return self._call("first")
-
-    def last(self):
-        return self._call("last")
-
-    def abs(self):
-        return self._call("abs")
-
-    def alias(self, name):
-        return self._call("alias", name)
-
-    def is_null(self):
-        return self._call("is_null")
-
-    def is_not_null(self):
-        return self._call("is_not_null")
-
-    def is_between(self, low, high):
-        return self._call("is_between", low, high)
-
-    def contains(self, text):
-        return _Contains(self, text)
-
-    def is_in(self, values):
-        return _In(self, values)
-
-    def norm(self):
-        return _Norm(self)
+def _dispatch(target, method, args, kwargs):
+    if method in _SPECIAL:
+        return _SPECIAL[method](target, *args, **kwargs)
+    return _Method(target, method, args, kwargs)
 
 
 class Col(Expr):
@@ -286,19 +252,11 @@ class _Field(Col):
 
     def __call__(self, *args, **kwargs):
         method = self._path[-1]
-        if method == "is_in":
-            return _In(self._parent, *args, **kwargs)
-        if method == "contains":
-            return _Contains(self._parent, *args, **kwargs)
-        if method == "like":
-            return _Like(self._parent, *args, **kwargs)
-        if method == "norm":
-            return _Norm(self._parent, *args, **kwargs)
-        if method not in _NAMED:
+        if not _dispatchable(method):
             raise AttributeError(
                 f"{self._parent!r} has no method {method!r}; as a column it would "
                 f"be {str(self)!r}, which this frame does not have.")
-        return _Method(self._parent, method, args, kwargs)
+        return _dispatch(self._parent, method, args, kwargs)
 
 
 class _Vars:
@@ -370,7 +328,12 @@ class _Unary(Expr, _Methods):
 
     def resolve(self, ctx):
         operand = _side(self.operand, ctx)
-        if isinstance(operand, Relation) and self.op == "__invert__":
+        if isinstance(operand, Relation):
+            if self.op != "__invert__":
+                raise TypeError(
+                    f"{operand.name!r} is a relation of the graph and has no value "
+                    f"to negate: `~v.x.{operand.name}.is_in(...)` asks for the "
+                    f"absence of such an edge.")
             return ~ctx.exists(operand, None)
         return getattr(operand, self.op)()
 
@@ -443,7 +406,10 @@ class _In(Expr, _Methods):
         target = _side(self.target, ctx)
         if isinstance(target, Relation):
             return ctx.exists(target, self.values)
-        return _expr(target, "is_in").is_in(ctx.ids(self.values))
+        # a set of nodes and a set of values are both `is_in`, and only the
+        # frame can tell which this is: resolving "Alpha" as a node key on a
+        # column of titles used to admit nothing, silently
+        return ctx.membership(self.target, _expr(target, "is_in"), self.values)
 
     __hash__ = Expr.__hash__
 
@@ -499,6 +465,17 @@ _NAMED = ("sum", "count", "n_unique", "mean", "min", "max", "std", "first", "las
           # the ones an aggregate reaches for, so a group can keep its evidence
           # in the order the evidence deserves
           "sort_by", "unique", "head", "tail", "cast", "fill_null", "round")
+
+
+_SPECIAL.update(is_in=lambda target, values: _In(target, values),
+                contains=lambda target, text: _Contains(target, text),
+                like=lambda target, *a, **k: _Like(target, *a, **k),
+                norm=lambda target: _Norm(target))
+
+
+def path_of(thing):
+    """The name path behind an expression, when it is just a name."""
+    return thing._path if isinstance(thing, Col) else None
 
 
 def _reads(thing):
