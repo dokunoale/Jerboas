@@ -68,7 +68,30 @@ def resolve(graph, names):
     and closeness cannot break the tie: `Wonderwall` is Oasis and also Ryan
     Adams covering Oasis, both spelled identically. Which one somebody typing it
     meant is a claim about this dataset -- the one in more playlists -- so the
-    use case makes it rather than the library guessing."""
+    use case makes it rather than the library guessing.
+
+    That claim is the crude version of the right one, and the right one is a
+    graph question rather than a popularity one. **Not built** (see below), but
+    written down because it is the interesting part:
+
+    A name resolved on its own has only its own popularity to go on. A *set* of
+    names has more: the songs somebody names together tend to sit in the same
+    playlists, so the assignment to prefer is the one whose chosen songs are
+    most connected to each other. `Wonderwall` beside `Champagne Supernova` is
+    Oasis; `Wonderwall` beside `Come Pick Me Up` is Ryan Adams. Neither is more
+    popular than the other in the abstract -- what decides is the company.
+
+    Concretely: keep every candidate rather than one, tagged with the name it
+    answers; ask the graph for the pairwise connection between candidates, which
+    is one two-hop query and returns the whole matrix at once; then choose one
+    candidate per name to maximise the total. The choice is `k**n` by brute
+    force and a few passes of coordinate ascent -- best candidate for each name
+    given the others, repeated -- in practice.
+
+    Until then there is a cheaper escape, also unbuilt: let a caller pin a title
+    by writing the performer after a tab, `"Wonderwall\tOasis"`, which turns a
+    guess into a constraint. The two compose rather than compete -- an explicit
+    performer pins one name and the coherence resolves the rest."""
     found = []
     for name in (one.strip() for one in names):
         if not name:

@@ -137,7 +137,30 @@ honest.
 
 ---
 
-## 5. Smaller things, each already known
+## 5. Resolving a set of names by what connects them
+
+**The problem.** `like` resolves one name at a time, so a name with several
+equally-close matches is decided by something outside the query -- popularity in
+`usecase/spotify`, load order before that. `Wonderwall` is Oasis and also Ryan
+Adams covering Oasis, and neither is the right answer in the abstract.
+
+**The shape.** A *set* of names carries information one name does not: songs
+somebody names together tend to sit in the same playlists, films together in the
+same tastes. So keep every candidate rather than one, ask the graph for the
+pairwise connection between candidates -- one two-hop query, the whole matrix at
+once -- and choose one candidate per name to maximise the total. `k**n` by brute
+force; a few passes of coordinate ascent in practice.
+
+**Why it belongs here rather than in a use case.** Every service on this library
+begins by turning names into nodes, and every one of them has this problem. And
+it is the smallest real instance of what the library is for: a graph used for
+*resolution*, not only for retrieval.
+
+**The cheap escape, worth having anyway.** Let a caller pin a name with a
+separator -- `"Wonderwall\tOasis"` -- which turns a guess into a constraint.
+It composes with the above rather than replacing it.
+
+## 6. Smaller things, each already known
 
 | | |
 |---|---|
