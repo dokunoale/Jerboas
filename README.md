@@ -22,7 +22,7 @@ g = jb.Graph(kg="data/example/example.kg",
 
 seeds = g.nodes(artist="artist").filter(v.artist.label.like("Golden", k=3))
 
-(g.nodes(seed=seeds).hop(song="performed_by", reverse=True)
+(g.nodes(seed=seeds).hop(song="~performed_by")
    .with_columns(score=PageRank(to=seeds).on("song"))
    .top(5).labels("song"))
 ```
@@ -226,9 +226,9 @@ There is no `directed_by_r`. Each edge is stored once, as an edge-labeled CSR
 plus its transpose, and direction belongs to the traversal:
 
 ```python
-.hop(person="directed_by")                    # movie -> person
-.hop(movie="directed_by", reverse=True)       # person -> the films they directed
-.hop(other="*")                               # wildcard: any relation, either way
+.hop(person="directed_by")           # movie -> person
+.hop(movie="~directed_by")           # person -> the films they directed
+.hop(other=())                       # any relation, either way
 ```
 
 The keyword is the name of the new column and its value is the relation walked
@@ -236,10 +236,49 @@ to fill it — the same shape as `g.nodes(rec="movie")`, where the keyword names
 and the value says what. That is the answer to "what is `rec`": it is `AS rec`,
 not `TO rec`.
 
-The wildcard walking both ways is what lets a two-hop bridge close —
-`.hop(mid="*").hop(rec="*")` — without duplicating every edge in memory to fake
-it. Which relation a wildcard walked comes back as `v.mid.via`; after a named
-hop it is the name you gave, since every row would carry the same word.
+`~name` is that relation read backwards — the spelling `v.x.via` prints, so what
+you write is what you later read. A step may also be a collection, meaning "any
+of these", and the **empty** collection means any relation at all: no constraint
+on the relation is the empty set of constraints.
+
+```python
+.hop(step=("has_genre", "~directed_by"))     # either, at this step
+```
+
+The empty step walking both ways is what lets a two-hop bridge close without
+duplicating every edge in memory to fake it. Which relation it walked comes back
+as `v.mid.via`.
+
+### Every argument is a step
+
+```python
+.hop((), rec="has_genre")            # any relation, then has_genre
+.hop(mid=(), rec=())                 # two steps, both kept
+```
+
+A **keyword** names the column the step's arrivals are kept in. A **positional**
+step is walked and not kept — and that is what lets it be *folded*: two routes
+that meet at an unnamed intermediate carry identical rows onward, and a row that
+differs only where nothing was named is not a different row. The memoized
+sub-path search the old engine needed is here a consequence of not having given
+something a name.
+
+The last step must be named, because where the walk ends is what the frame
+holds; Python already requires positional arguments to come first, so the rule
+costs nothing to obey.
+
+Walking leaves from the **rightmost column of nodes**. To leave from another,
+`select` it and `join` the result back — that is what working on a dataframe is
+for, and it is why there is no `from=`.
+
+Two lengths are two frames:
+
+```python
+direct = seeds.hop(rec=())
+bridge = seeds.hop((), rec=())
+jb.concat(direct.with_columns(hops=pl.lit(1)),
+          bridge.with_columns(hops=pl.lit(2)))
+```
 
 ### What a hop actually does
 
@@ -277,7 +316,7 @@ next step does not need — and write the filter, because a hop does not build i
 rows until something needs them:
 
 ```python
-frame.hop(rec="has_genre", reverse=True).filter(v.rec.year >= 1990)
+frame.hop(rec="~has_genre").filter(v.rec.year >= 1990)
 ```
 
 The predicate reaches the Frame before it reaches polars, and everything it
@@ -290,7 +329,7 @@ model read from the other side.
 
 This is why `hop` has no `where=`, no `type=` and no `norm=`: each of those was
 a condition wearing a parameter's clothes, and a condition written as one is
-both clearer and no slower.
+both clearer and no slower. What is left is steps, and nothing else.
 
 There is deliberately **no** parameter for the edge's weight either. It was
 written, measured and removed: filtering the weight array before building the
@@ -325,7 +364,7 @@ with a visible answer — `len(where)` — rather than a marker object.
 ```python
 (g.nodes(seed=watchlist)
    .hop(tag="has_tag").filter(v.tag.score >= 0.9)
-   .hop(rec="has_tag", reverse=True).filter(v.rec.score >= 0.9)
+   .hop(rec="~has_tag").filter(v.rec.score >= 0.9)
    .filter(~v.rec.is_in(watchlist))
    .group_by(v.rec).agg(score=v.rec.score.sum(),
                         through=v.tag.first())
@@ -347,7 +386,7 @@ itself with alongside the sum that ranked it.
 There is no `Path` object, because the columns already are one:
 
 ```python
-g.nodes(seed=seeds).hop(mid="*").hop(rec="*").filter(v.rec.type == "movie")
+g.nodes(seed=seeds).hop(mid=(), rec=()).filter(v.rec.type == "movie")
 # columns: seed, mid, rec   -- and v.mid.via, v.rec.score, ... on each
 ```
 
@@ -603,7 +642,7 @@ at which an edge starts existing, and a query narrows it from there:
 ```python
 (g.nodes(seed="movie").filter(v.seed.title == "Blade Runner")
    .hop(tag="has_tag").filter(v.tag.score >= 0.95)
-   .hop(rec="has_tag", reverse=True).filter(v.rec.score >= 0.95, v.rec != v.seed)
+   .hop(rec="~has_tag").filter(v.rec.score >= 0.95, v.rec != v.seed)
    .group_by(v.rec).agg(score=v.rec.score.sum(), through=v.tag.first())
    .top(4).labels("rec", "through"))
 ```
@@ -676,21 +715,6 @@ parallel columns with one `replace` and one `split` — two C loops over the who
 chunk — and the ids come from `dict.fromkeys`, which deduplicates in C and in
 first-seen order at once. What is left in Python runs once per *distinct node*
 rather than once per edge: 2.78 M edges load in ~1.1 s.
-
-### Several lengths at once
-
-```python
-g.nodes(seed=found).paths(v.rec.type == "movie", rec="*", hops=(1, 2), through="person")
-```
-
-Each length is a branch, the branches are concatenated diagonally, and a `hops`
-column says which one a row came from. Conditions given to it are applied to
-each branch *before* its rows are built. It is a verb rather than sugar over
-`hop` + `concat` because of the fold between the steps: two routes that meet at
-an intermediate carry identical rows onward, and dropping one is what the old
-engine's memoized sub-path search was for. `keep_via=True` keeps the walk as
-`via_1`, `via_2`, … — and then nothing can be folded, because the columns that
-would collapse are the answer.
 
 ### What a relation can say without being walked
 

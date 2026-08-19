@@ -85,7 +85,7 @@ def shared(graph, seeds, strength):
     written after their hop and applied before its rows are built."""
     return (graph.nodes(seed=seeds)
             .hop(tag="has_tag").filter(v.tag.score >= strength)
-            .hop(rec="has_tag", reverse=True).filter(v.rec.score >= strength)
+            .hop(rec="~has_tag").filter(v.rec.score >= strength)
             .filter(~v.rec.is_in(seeds)))                 # already on the list
 
 

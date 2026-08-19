@@ -21,6 +21,7 @@ the checkpoint is loaded once and only the seeds vary per request.
 import os
 from contextlib import asynccontextmanager
 
+import polars as pl
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
@@ -67,12 +68,17 @@ def seeds(graph, wanted):
 def expanded(graph, found):
     """Every film within two hops of a seed, and how far away it was.
 
-    A candidate reaches a liked attribute directly (1 hop) or through a bridge
-    node (2 hops), and `paths` walks both lengths in one frame. With no relation
-    named the walk is undirected, so the bridge closes whichever way the edges
-    happen to be stored; `hops` says which branch a row came from, and the fold
-    between the steps is why a two-hop bridge over 15 000 nodes stays small."""
-    return graph.nodes(seed=found).paths(v.rec.type == "movie", rec="*", hops=(1, 2))
+    A candidate reaches a liked attribute directly (one step) or through a bridge
+    node (two), so it is two frames and a concat. The bridge's middle step is not
+    named, which is what folds it: two attributes leading to the same film are
+    one answer, and that is why a two-hop bridge over 15 000 nodes stays small.
+
+    An empty step is any relation in either direction, so the bridge closes
+    whichever way the edges happen to be stored."""
+    seeds = graph.nodes(seed=found)
+    direct = seeds.hop(rec=()).with_columns(hops=pl.lit(1, dtype=pl.Int32))
+    bridge = seeds.hop((), rec=()).with_columns(hops=pl.lit(2, dtype=pl.Int32))
+    return concat(direct, bridge).filter(v.rec.type == "movie")
 
 
 def rank_films(graph, model, found, exclude, k):

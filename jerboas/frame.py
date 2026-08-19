@@ -59,13 +59,16 @@ def shadowed(name):
 class Frame:
     """A table of node ids, joined to the graph that gave them meaning."""
 
-    def __init__(self, graph, data, variables=None, pending=None):
+    def __init__(self, graph, data, variables=None, pending=None, via=None):
         self.graph = graph
         self._data = (None if data is None else
                       data if isinstance(data, pl.DataFrame) else pl.DataFrame(data))
         # {column: type or None} for the columns that hold node ids, in the
         # order they were introduced. A hop with no `from_` reads the last one.
         self.vars = dict(variables or {})
+        # {column: relation} for the steps that walked one relation for every
+        # row. A constant needs no array, but `v.x.via` should still answer
+        self.via = dict(via or {})
         # a hop that has walked but not built its rows yet (see _Pending). The
         # only thing that reads it is `filter`, which may be able to apply
         # itself to the arrays instead of to the rows they would become
@@ -86,7 +89,9 @@ class Frame:
     def _wrap(self, data, variables=None):
         variables = self.vars if variables is None else variables
         kept = {name: type_ for name, type_ in variables.items() if name in data.columns}
-        return Frame(self.graph, data, kept)
+        via = {name: relation for name, relation in self.via.items()
+               if name in data.columns}
+        return Frame(self.graph, data, kept, via=via)
 
     # --- what it is ----------------------------------------------------------
 
@@ -168,62 +173,98 @@ class Frame:
 
     # --- the graph verbs -----------------------------------------------------
 
-    def hop(self, *, reverse=None, from_=None, **step):
-        """One traversal: `hop(genre="has_genre")` reaches the genres of what the
-        frame holds and calls them `genre`.
+    def hop(self, *through, **named):
+        """Walk the graph. Every argument is one step, in order.
 
-        The keyword is the name of the new column and its value is the relation
-        walked to fill it -- the same shape as `g.nodes(rec="movie")`, where the
-        keyword names and the value says what. `"*"` is the wildcard: any
-        relation, and both directions, which is what closes a bridge without the
-        store holding every edge twice. A named relation reads forwards unless
-        `reverse=True`.
+            .hop(genre="has_genre")            # one step, kept as `genre`
+            .hop(person="~directed_by")        # the same relation, backwards
+            .hop((), rec="has_genre")          # any relation, then has_genre
+            .hop(step=("has_genre", "~directed_by"))   # either, at this step
 
-        Only the new column is added. What the step measured is the column's
-        confidence -- `v.genre.score`, the edge's weight on its own relation's
-        [0, 1] scale -- and which relation it walked is `v.genre.via`. Both are
-        attributes of the column rather than columns, and neither costs anything
-        when it says the same thing about every row.
+        A **keyword** names the column the step's arrivals are kept in. A
+        **positional** step is walked and not kept -- which is what lets it be
+        folded: two routes that meet at an unnamed intermediate carry identical
+        rows onward, and only one of them is worth continuing. That fold is the
+        old engine's memoized sub-path search, and here it is a consequence of
+        not having given something a name rather than a parameter.
 
-        Nothing else is a parameter, because nothing else is a fact about the
-        step. Which nodes are worth landing on is a condition, so it goes where
-        conditions go:
+        The last step must be named, because where the walk ends is what the
+        frame holds. Python already requires the positional ones to come first,
+        so the rule costs nothing to obey.
 
-            .hop(rec="has_genre", reverse=True).filter(v.rec.year >= 1990)
+        A step is a relation name, `~name` for the same relation read backwards
+        -- the spelling `v.x.via` prints -- or a collection of them for "any of
+        these". The empty collection is "any relation at all", in either
+        direction, which is what closes a bridge without the store holding every
+        edge twice.
 
-        and the filter reaches the frame before the rows are built, so what it
-        rejects is never built (see `filter`).
+        Walking leaves from the rightmost column of nodes. To leave from another,
+        `select` it and `join` the result back: that is what working on a
+        dataframe is for.
+
+        Only the named columns are added. What the step measured is each one's
+        confidence (`v.genre.score`) and which relation it walked is
+        `v.genre.via` -- attributes of a column rather than columns, costing
+        nothing when they say the same thing about every row.
         """
-        if len(step) != 1:
-            raise TypeError(
-                "hop(...) takes one keyword: the name of the new column, and the "
-                "relation that fills it -- hop(genre=\"has_genre\"), or "
-                "hop(mid=\"*\") for any relation either way.")
-        (target, relation), = step.items()
-        if relation in ("*", None):
-            relation = None
-        source = self._source_var(from_)
-        if reverse is None and relation is not None:
-            reverse = False                      # a named relation reads forwards
-        self._claim(target)
+        steps = [(spec, None) for spec in through]
+        steps += [(spec, name) for name, spec in named.items()]
+        if not named:
+            raise ValueError(
+                "the last step of a hop must be named: where the walk ends is "
+                "what the frame holds. hop(..., rec=\"has_genre\")")
+        graph = self.graph
+        base = self._df
+        source = self._rightmost()
+        for _spec, name in steps:
+            if name is not None:
+                self._claim(name)
 
-        nodes = self._df[source].to_numpy()
-        rows, targets, codes, weights = traverse.expand(
-            self.graph, nodes, relation, reverse, normalized=True)
+        rows = np.arange(base.height, dtype=np.int64)
+        nodes = base[source].to_numpy()
+        added, variables, via = {}, dict(self.vars), dict(self.via)
 
-        added = {target: targets.astype(np.int32)}
-        if len(weights) and not (weights == 1.0).all():
-            added[shadow(SCORE, target)] = weights
-        if relation is None and len(codes):
-            added[shadow(VIA, target)] = self._names(codes)
+        for spec, name in steps:
+            walked, targets, codes, weights, single = _walk(graph, nodes, spec)
+            rows = rows[walked]
+            added = {column: _take(values, walked) for column, values in added.items()}
+            nodes = targets
+            if name is None:
+                # nothing names these, so nothing tells two routes through them
+                # apart: keep one of each and carry that forward
+                keep = _distinct(graph, rows, nodes)
+                rows, nodes = rows[keep], nodes[keep]
+                added = {column: _take(values, keep) for column, values in added.items()}
+                continue
+            added[name] = nodes.astype(np.int32)
+            if len(weights) and not (weights == 1.0).all():
+                added[shadow(SCORE, name)] = weights
+            if single is None and len(codes):
+                added[shadow(VIA, name)] = self._names(codes)
+            elif single is not None:
+                via[name] = single           # every row walked the same relation
+            variables[name] = self._one_type(nodes)
 
-        variables = dict(self.vars)
-        variables[target] = self._one_type(targets)
-        # not built yet: a filter written next may be able to apply itself to
-        # these arrays, which is the difference between admitting a candidate
-        # and building a row only to drop it
-        return Frame(self.graph, None, variables,
-                     pending=_Pending(self._df, rows, added, target))
+        if any(name is None for _spec, name in steps):
+            # a row that differs only where nothing was named is not a different
+            # row: two routes through an unnamed step are one answer
+            keep = _folded(rows, [added[name] for _spec, name in steps if name])
+            rows = rows[keep]
+            added = {column: _take(values, keep) for column, values in added.items()}
+
+        last = steps[-1][1]
+        return Frame(graph, None, variables, pending=_Pending(base, rows, added, last),
+                     via=via)
+
+    def _rightmost(self):
+        """The column of nodes furthest to the right -- where a walk leaves from.
+
+        By the frame's own column order rather than by when a variable was
+        introduced, because that is the one a person reads off the print."""
+        for name in reversed(self._df.columns):
+            if name in self.vars:
+                return name
+        raise ValueError("hop(...) needs a column of nodes to leave from")
 
     def _one_type(self, targets):
         """The type these nodes are, when they are all of one -- read off the
@@ -232,59 +273,6 @@ class Frame:
             return None
         tags = np.unique(self.graph._type_tag_of[targets])
         return self.graph.types[int(tags[0])] if len(tags) == 1 else None
-
-    def paths(self, *predicates, hops=(1, 2), through=None, keep_via=False,
-              reverse=None, from_=None, **step):
-        """Walks of more than one length, as one frame.
-
-            .paths(v.rec.type == "movie", rec="*", hops=(1, 2))
-
-        The keyword names the destination the way `hop` does; `hops` is an
-        inclusive range of lengths, or an int for exactly one. Each length is a
-        branch, the branches are concatenated diagonally, and a `hops` column
-        says which one a row came from.
-
-        Any conditions given are applied to each branch *before* its rows are
-        built -- which is why they are passed here rather than written after:
-        a two-hop wildcard that keeps only movies should not build the rest.
-
-        The reason it is a verb and not sugar over hop+concat is the `unique`
-        between the steps. Two routes that meet at an intermediate carry
-        identical rows onward, and folding them is what the old engine's
-        memoized sub-path search was for. `keep_via=True` keeps the walk as
-        `via_1`, `via_2`, ... -- and then nothing can be folded, because the
-        columns that would collapse are the answer.
-
-        `through` admits the intermediates, by type name or by node set."""
-        if len(step) != 1:
-            raise TypeError("paths(...) takes one keyword: the name of the "
-                            "destination column, and the relation that fills it")
-        (target, relation), = step.items()
-        low, high = (hops, hops) if isinstance(hops, int) else hops
-        if low < 1 or high < low:
-            raise ValueError(f"hops must be a length or an increasing range, got {hops!r}")
-        wanted = range(low, high + 1)
-
-        chain, branches = self, []
-        for step_no in range(1, high + 1):
-            start = None if step_no > 1 else from_
-            if step_no in wanted:                    # a branch that ends here
-                branch = chain.hop(reverse=reverse, from_=start, **{target: relation})
-                branch = branch.filter(*predicates) if predicates else branch
-                if not keep_via:
-                    # what got here is not what this branch is about: keep where
-                    # it started and where it arrived, and fold the routes
-                    branch = branch.select(*self.columns, target).unique()
-                branches.append(branch.with_columns(hops=pl.lit(step_no, dtype=pl.Int32)))
-            if step_no == high:
-                break
-            name = f"via_{step_no}"
-            chain = chain.hop(reverse=reverse, from_=start, **{name: relation})
-            if through is not None:
-                chain = chain.filter(_through(name, through))
-            if not keep_via:
-                chain = chain.select(*self.columns, name).unique()
-        return concat(*branches) if branches else self.head(0)
 
     def _reachable(self, relation, where, reverse=None):
         """Which nodes of the graph have such an edge, as one boolean array.
@@ -532,13 +520,6 @@ class Frame:
             raise ValueError("this frame has no node column")
         return next(iter(self.vars))
 
-    def _source_var(self, from_):
-        if from_ is not None:
-            return name_of(from_)
-        if not self.vars:
-            raise ValueError("hop(...) needs a column of nodes to leave from")
-        return list(self.vars)[-1]          # the last one introduced
-
     def _free(self, name):
         """`name`, suffixed if the frame already has a column called that. Used
         only where a repeat is harmless -- a second `similarity` is a second
@@ -785,6 +766,8 @@ class _Resolver:
         name = shadow(kind, column)
         if self._present(name):
             return pl.col(name)
+        if kind == VIA and column in self.frame.via:
+            return pl.lit(self.frame.via[column])     # one relation, every row
         # nothing measured this column, so nothing is in doubt about it
         return pl.lit(1.0) if kind == SCORE else pl.lit(None, dtype=pl.String)
 
@@ -893,11 +876,57 @@ def _aligned(frames):
     return out
 
 
-def _through(column, through):
-    """What a `paths` intermediate is allowed to be: a type name, or a set."""
-    from .expr import v
-    return (v[column].type == through) if isinstance(through, str) \
-        else v[column].is_in(through)
+def _walk(graph, nodes, spec):
+    """One step, over whatever relations it names.
+
+    Returns the four arrays a traversal produces plus, when every row walked the
+    same relation the same way, the name of it -- a constant that needs no
+    column to say so."""
+    specs = _relations(spec)
+    if specs is None:                                   # any relation, either way
+        return traverse.expand(graph, nodes, None, None, normalized=True) + (None,)
+    parts = [traverse.expand(graph, nodes, name, reverse, normalized=True)
+             for name, reverse in specs]
+    single = None
+    if len(specs) == 1:
+        name, reverse = specs[0]
+        single = f"~{name}" if reverse else name
+    if len(parts) == 1:
+        return parts[0] + (single,)
+    return tuple(np.concatenate(column) for column in zip(*parts)) + (single,)
+
+
+def _relations(spec):
+    """A step's relations as [(name, reverse)], or None for the wildcard.
+
+    An empty collection is the wildcard: no constraint on the relation is the
+    empty set of constraints, which is also why there is no magic string."""
+    if isinstance(spec, str):
+        spec = (spec,)
+    specs = tuple(spec)
+    if not specs:
+        return None
+    return [(name[1:], True) if name.startswith("~") else (name, False)
+            for name in specs]
+
+
+def _distinct(graph, rows, nodes):
+    """The first of each (row, node) pair, in order -- the fold between steps."""
+    if not len(rows):
+        return np.zeros(0, dtype=np.int64)
+    key = rows * graph.n_nodes + nodes
+    _, first = np.unique(key, return_index=True)
+    return np.sort(first)
+
+
+def _folded(rows, columns):
+    """The first row of each distinct (source row, named columns) combination."""
+    if not len(rows):
+        return np.zeros(0, dtype=np.int64)
+    stacked = np.stack([rows] + [np.asarray(column, dtype=np.int64)
+                                 for column in columns])
+    _, first = np.unique(stacked, axis=1, return_index=True)
+    return np.sort(first)
 
 
 def _resolved(item, resolver):
@@ -930,9 +959,12 @@ def _series(name, values):
 
 
 def _take(values, keep):
-    if isinstance(values, list):
+    """Index an array or a python column, by mask or by position."""
+    if not isinstance(values, list):
+        return values[keep]
+    if keep.dtype == bool:
         return [value for value, take in zip(values, keep.tolist()) if take]
-    return values[keep]
+    return [values[position] for position in keep.tolist()]
 
 
 def _expr(item):

@@ -33,9 +33,9 @@ def candidates(graph, users, k):
                .select("user", "seen"))
 
     reached = (watched
-               .hop(peer="has_interact", reverse=True, from_="seen")
+               .hop(peer="~has_interact")
                .select("user", "peer").unique(["user", "peer"])
-               .hop(rec="has_interact", from_="peer")
+               .hop(rec="has_interact")
                .select("user", "rec").unique(["user", "rec"]))
 
     return (reached

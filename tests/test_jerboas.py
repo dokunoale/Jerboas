@@ -127,7 +127,7 @@ def test_hop_follows_a_named_relation_forwards(small_graph):
 def test_hop_reverse_walks_the_same_relation_backwards(small_graph):
     """There is no `directed_by_r`: one relation, and the direction belongs to
     the traversal."""
-    frame = small_graph.nodes("person").hop(movie="directed_by", reverse=True)
+    frame = small_graph.nodes("person").hop(movie="~directed_by")
     assert sorted(names(frame, "movie")) == ["movie.0", "movie.1", "movie.2"]
 
 
@@ -138,12 +138,12 @@ def test_forward_and_backward_are_not_interchangeable(small_graph):
 def test_the_wildcard_walks_both_directions(small_graph):
     """Which is what closes a bridge pattern without the store holding every
     edge twice."""
-    frame = small_graph.nodes(seed=["movie.0"]).hop(other="*")
+    frame = small_graph.nodes(seed=["movie.0"]).hop(other=())
     assert set(names(frame, "other")) == {"person.0", "genre.0", "user.0", "user.2"}
 
 
 def test_a_hop_names_the_relation_it_walked(small_graph):
-    frame = small_graph.nodes(seed=["movie.0"]).hop(other="*")
+    frame = small_graph.nodes(seed=["movie.0"]).hop(other=())
     walked = dict(zip(names(frame, "other"),
                       frame.with_columns(r=v.other.via).pl["r"].to_list()))
     assert walked["person.0"] == "directed_by"
@@ -159,17 +159,19 @@ def test_a_named_hop_knows_it_walked_one_relation(small_graph):
 
 
 def test_hop_filters_the_target_by_type(small_graph):
-    frame = small_graph.nodes(seed=["movie.0"]).hop(user="*").filter(v.user.type == "user")
+    frame = small_graph.nodes(seed=["movie.0"]).hop(user=()).filter(v.user.type == "user")
     assert sorted(names(frame, "user")) == ["user.0", "user.2"]
 
 
-def test_hop_leaves_from_the_last_column_and_from_names_another(small_graph):
+def test_a_hop_leaves_from_the_rightmost_column_of_nodes(small_graph):
     two = (small_graph.nodes("movie").hop(genre="has_genre")
-           .hop(sibling="has_genre", reverse=True))
+           .hop(sibling="~has_genre"))
     assert two.columns == ["movie", "genre", "sibling"]
-    back = (small_graph.nodes("movie").hop(genre="has_genre")
-            .hop(person="directed_by", from_="movie"))
-    assert set(names(back, "person")) == {"person.0", "person.1"}
+    # to leave from another, select it and join the result back -- which is
+    # what working on a dataframe is for
+    from_movie = (small_graph.nodes("movie").select("movie")
+                  .hop(person="directed_by"))
+    assert set(names(from_movie, "person")) == {"person.0", "person.1"}
 
 
 def test_a_node_with_no_such_edge_drops_out(small_graph):
@@ -180,33 +182,31 @@ def test_an_unknown_relation_matches_nothing(small_graph):
     assert len(small_graph.nodes("movie").hop(person="produced_by")) == 0
 
 
-def test_hop_needs_exactly_one_name(small_graph):
-    with pytest.raises(TypeError, match="takes one keyword"):
+def test_a_hop_needs_at_least_one_named_step(small_graph):
+    with pytest.raises(ValueError, match="last step of a hop must be named"):
         small_graph.nodes("movie").hop()
-    with pytest.raises(TypeError, match="takes one keyword"):
-        small_graph.nodes("movie").hop(a="has_genre", b="directed_by")
 
 
 def test_a_filter_admits_before_the_rows_are_built(small_graph):
     """The same rows a filter afterwards would leave, without building the ones
     it would have thrown away -- which is now the only spelling there is."""
-    ahead = (small_graph.nodes("person").hop(rec="directed_by", reverse=True)
+    ahead = (small_graph.nodes("person").hop(rec="~directed_by")
              .filter(v.rec.year >= 1999))
-    eager = small_graph.nodes("person").hop(rec="directed_by", reverse=True)
+    eager = small_graph.nodes("person").hop(rec="~directed_by")
     eager.pl
     assert names(ahead, "rec") == names(eager.filter(v.rec.year >= 1999), "rec")
 
 
 def test_membership_takes_any_way_of_naming_nodes(small_graph):
     keys = [small_graph["movie.0"], small_graph["movie.1"]]
-    frame = (small_graph.nodes("person").hop(rec="directed_by", reverse=True)
+    frame = (small_graph.nodes("person").hop(rec="~directed_by")
              .filter(v.rec.is_in(keys)))
     assert sorted(names(frame, "rec")) == ["movie.0", "movie.1"]
 
 
 def test_type_is_a_condition_like_any_other(small_graph):
     seen = small_graph.nodes(seed=["movie.0"])
-    frame = (small_graph.nodes("user").hop(rec="*")
+    frame = (small_graph.nodes("user").hop(rec=())
              .filter(v.rec.type == "movie", v.rec.is_in(seen)))
     assert set(names(frame, "rec")) == {"movie.0"}
 
@@ -225,7 +225,7 @@ def test_top_over_is_a_beam_when_it_sits_between_two_hops(small_graph):
     an engine once."""
     frame = (small_graph.nodes(user="user").hop(mid="has_interact")
              .top(1, by=v.mid.score, over="user")             # the beam
-             .hop(genre="has_genre", from_="mid"))
+             .hop(genre="has_genre"))
     assert len(frame) == 3
     assert set(names(frame, "mid")) == {"movie.0", "movie.1", "movie.2"}
 
@@ -235,13 +235,13 @@ def test_a_hop_cannot_land_on_a_column_already_there(small_graph):
     obvious name silently reading the other step."""
     walked = small_graph.nodes("movie").hop(genre="has_genre")
     with pytest.raises(ValueError, match="its own name"):
-        walked.hop(genre="has_genre", reverse=True)
+        walked.hop(genre="~has_genre")
 
 
 def test_a_hop_cannot_overwrite_the_column_it_left_from(small_graph):
     walked = small_graph.nodes("movie").hop(genre="has_genre")
     with pytest.raises(ValueError, match="its own name"):
-        walked.hop(movie="has_genre", reverse=True)
+        walked.hop(movie="~has_genre")
 
 
 # --- a name is resolved late, by the frame that has the graph ----------------
@@ -361,65 +361,66 @@ def test_the_steps_confidence_is_the_columns(small_graph):
     assert sorted(frame.with_columns(s=v.rec.score).pl["s"].to_list()) == [0.75, 1.0, 1.0]
 
 
-# --- paths: several lengths, one frame ---------------------------------------
+# --- several steps in one hop ------------------------------------------------
 
-def test_paths_walks_more_than_one_length(small_graph):
-    """One hop out of a film reaches its people, genres and viewers; two reach
+def test_a_hop_takes_several_steps(small_graph):
+    """One step out of a film reaches its people, genres and viewers; two reach
     the other films they connect to."""
-    frame = small_graph.nodes(seed=["movie.0"]).paths(rec="*", hops=(1, 2))
-    lengths = dict(frame.pl.group_by("hops").len().rows())
-    assert set(lengths) == {1, 2}
-    reached = names(frame.filter(v.hops == 2), "rec")
+    frame = small_graph.nodes(seed=["movie.0"]).hop((), rec=())
+    reached = names(frame.filter(v.rec.type == "movie"), "rec")
     assert "movie.1" in reached                      # same director, same genre
+    assert frame.columns == ["seed", "rec"]          # the middle was not named
 
 
-def test_paths_says_how_far_each_row_went(small_graph):
-    frame = small_graph.nodes(seed=["movie.0"]).paths(rec="*", hops=1)
-    assert set(frame.pl["hops"].to_list()) == {1}
+def test_the_last_step_must_be_named(small_graph):
+    """Where the walk ends is what the frame holds, so it needs a column."""
+    with pytest.raises(ValueError, match="last step of a hop must be named"):
+        small_graph.nodes("movie").hop("has_genre")
 
 
-def test_paths_folds_the_routes_it_is_not_asked_to_keep(tmp_path):
-    """Two intermediates reaching the same node the same way are one answer, and
-    carrying both is what makes a bridge query explode."""
+def test_an_unnamed_step_folds_the_routes_through_it(tmp_path):
+    """Nothing names the intermediate, so nothing tells two routes through it
+    apart -- and carrying both is what makes a bridge query explode."""
     path = tmp_path / "d.knows"
     path.write_text("source\ttarget\n"
                     "person.0\tperson.1\nperson.0\tperson.2\n"       # two routes...
                     "person.1\tperson.3\nperson.2\tperson.3\n")      # ...to the same node
     graph = Graph(edges=[str(path)])
     seed = graph.nodes(seed=["person.0"])
-    folded = seed.paths(rec="knows", hops=2)
-    kept = seed.paths(rec="knows", hops=2, keep_via=True)
+    folded = seed.hop("knows", rec="knows")
+    kept = seed.hop(mid="knows", rec="knows")
     assert len(kept) == 2 and len(folded) == 1
     assert names(folded, "rec") == ["person.3"]
 
 
-def test_paths_keeps_the_walk_when_asked(small_graph):
-    frame = small_graph.nodes(seed=["movie.0"]).paths(
-        v.rec.type == "movie", rec="*", hops=2, keep_via=True)
-    assert "via_1" in frame.columns
+def test_naming_a_step_keeps_it(small_graph):
+    frame = small_graph.nodes(seed=["movie.0"]).hop(via_1=(), rec=())
+    assert frame.columns == ["seed", "via_1", "rec"]
     assert frame.vars["via_1"] is None
 
 
-def test_paths_restricts_the_intermediates(small_graph):
+def test_a_step_may_name_several_relations(small_graph):
+    """A collection is "any of these"; `~` reads one backwards."""
+    both = small_graph.nodes(seed=["movie.0"]).hop(other=("directed_by", "has_genre"))
+    assert sorted(names(both, "other")) == ["genre.0", "person.0"]
+    back = small_graph.nodes("person").hop(movie="~directed_by")
+    assert sorted(names(back, "movie")) == ["movie.0", "movie.1", "movie.2"]
+
+
+def test_the_empty_collection_is_the_wildcard(small_graph):
+    """No constraint on the relation is the empty set of constraints."""
+    frame = small_graph.nodes(seed=["movie.0"]).hop(other=())
+    assert set(names(frame, "other")) == {"person.0", "genre.0", "user.0", "user.2"}
+
+
+def test_lengths_are_unioned_by_concat(small_graph):
+    """Two lengths are two frames. The column one branch lacks comes back null,
+    which is exactly what "reached the other way" means."""
     seeds = small_graph.nodes(seed=["movie.0"])
-    through_user = seeds.paths(v.rec.type == "movie", rec="*", hops=2, through="user")
-    through_genre = seeds.paths(v.rec.type == "movie", rec="*", hops=2, through="genre")
-    # user.2 watched movie.0 and movie.2; genre.0 holds only movie.0 and movie.1
-    assert "movie.2" in names(through_user, "rec")
-    assert "movie.2" not in names(through_genre, "rec")
-
-
-def test_paths_refuses_a_backwards_range(small_graph):
-    with pytest.raises(ValueError, match="increasing range"):
-        small_graph.nodes("movie").paths(rec="*", hops=(3, 1))
-
-
-def test_an_empty_branch_still_lines_up(small_graph):
-    """A length that matched nothing has columns of unknown type, and they have
-    to stack onto the ones that did."""
-    frame = small_graph.nodes(seed=["genre.0"]).paths(
-        v.rec.type == "person", rec="*", hops=(1, 2))
-    assert set(frame.pl["hops"].to_list()) == {2}   # a genre reaches no person in one
+    direct = seeds.hop(rec=()).with_columns(hops=pl.lit(1))
+    bridge = seeds.hop((), rec=()).with_columns(hops=pl.lit(2))
+    both = concat(direct, bridge).filter(v.rec.type == "movie")
+    assert set(both.pl["hops"].to_list()) == {2}     # a film reaches no film in one
 
 
 # --- degree and existence: what a relation says without walking it -----------
@@ -586,7 +587,7 @@ def _shared(graph, seeds):
     """Candidates reached from the seeds through a shared tag."""
     return (graph.nodes(seed=seeds)
             .hop(tag="has_tag")
-            .hop(rec="has_tag", reverse=True)
+            .hop(rec="~has_tag")
             .filter(~v.rec.is_in(graph.ids_of(seeds))))
 
 
@@ -687,7 +688,7 @@ def test_an_exact_match_beats_a_longer_container(tmp_path):
 
 def test_concat_unions_two_routes(small_graph):
     direct = small_graph.nodes(seed=["movie.0"]).hop(genre="has_genre")
-    bridged = (small_graph.nodes(seed=["movie.0"]).hop(user="has_interact", reverse=True)
+    bridged = (small_graph.nodes(seed=["movie.0"]).hop(user="~has_interact")
                .hop(rec="has_interact"))
     both = concat(direct, bridged)
     assert set(both.columns) >= {"seed", "genre", "user", "rec"}
@@ -838,7 +839,7 @@ def test_diffused_mf_scores_against_a_seed_set(small_graph):
 
 
 def test_diffused_mf_scores_each_row_against_its_own_seed(small_graph):
-    frame = (small_graph.nodes(seed=["genre.0"]).hop(rec="has_genre", reverse=True)
+    frame = (small_graph.nodes(seed=["genre.0"]).hop(rec="~has_genre")
              .with_columns(d=DiffusedMatrixFactorization(factors=2, iterations=3)
                            .on("rec", "seed")))
     assert len(frame) == 2
