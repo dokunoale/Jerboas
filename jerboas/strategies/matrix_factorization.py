@@ -9,14 +9,29 @@ from ..core import Strategy
 
 
 class MatrixFactorization(Strategy):
-    """Implicit-feedback matrix factorization scored per row. The full user-item
-    matrix is factorized once in fit() (cached per graph); each row is scored by
-    its user's affinity for its item. edge_weight guides a Greedy engine."""
+    """Implicit-feedback matrix factorization, scored per row.
 
-    supports_guidance = True
+    The full user-item matrix is factorized once in fit() (cached per graph);
+    each row is scored by its user's affinity for its item.
+
+        .with_columns(mf=MatrixFactorization().on("rec", "user"))
+        .with_columns(mf=MatrixFactorization(user=who).on("rec"))
+
+    Whose taste is being applied is *named*, either as a second column holding
+    the user of each row or as one user for the whole frame. It is not inferred:
+    this used to fall back to the first user node the search happened to walk
+    through, which is an arbitrary person's ranking wearing the shape of an
+    answer.
+
+    `weighted=True` reads the interaction's stored score instead of its mere
+    existence, which turns the same solver into explicit feedback: the target is
+    the rating rather than a 1. Implicit stays the default because "she watched
+    it" and "she rated it 2" are different claims, and only the caller knows
+    which one their edges carry."""
 
     def __init__(self, factors=8, iterations=20, regularization=0.05, seed=42,
-                 item_type="movie", user_type="user", relation="has_interact"):
+                 item_type="movie", user_type="user", relation="has_interact",
+                 weighted=False, user=None):
         self.factors = factors
         self.iterations = iterations
         self.regularization = regularization
@@ -24,6 +39,8 @@ class MatrixFactorization(Strategy):
         self.item_type = item_type
         self.user_type = user_type
         self.relation = relation
+        self.weighted = weighted
+        self.user = user                 # one user for the whole frame, if named
 
     def fit(self, graph):
         self._graph = graph
@@ -36,50 +53,39 @@ class MatrixFactorization(Strategy):
         used to be a hand-built CSR with its own index arrays."""
         users = graph.block(self.user_type)
         items = graph.block(self.item_type)
-        matrix = graph.relation_matrix(self.relation)[users[0]:users[1], items[0]:items[1]]
+        weights = "raw" if self.weighted else None
+        matrix = graph.relation_matrix(self.relation, weights)[users[0]:users[1],
+                                                               items[0]:items[1]]
         matrix = matrix.tocsr()
-        matrix.data.fill(1.0)      # CSR sums duplicate entries; feedback stays binary
+        if not self.weighted:
+            matrix.data.fill(1.0)  # CSR sums duplicate entries; feedback stays binary
         matrix.sort_indices()
         user_factors, item_factors = self._factorize(matrix)
         return users, items, user_factors, item_factors
 
-    def edge_weight(self, source, relation, target):
-        users, items, user_factors, item_factors = self._last_fit
-        # node 0 is a real node, so these are None-checks, not truth tests
-        user = _within(source, users)
-        user = _within(target, users) if user is None else user
-        item = _within(source, items)
-        item = _within(target, items) if item is None else item
-        if user is None or item is None:
-            return 0.0
-        return float(user_factors[user - users[0]] @ item_factors[item - items[0]])
+    def scores(self, graph, columns):
+        """on("item") with `user=` given, or on("item", "user") per row."""
+        users, items, user_factors, item_factors = self.fit(graph)
+        item = np.asarray(columns[0], dtype=np.int64)
+        rows = _local(item, items)
 
-    def score(self, query, rows):
-        users, items, user_factors, item_factors = self.fit(query.graph)
-        user_col = query.node_columns.get(self.user_type)
-        item_col = query.node_columns.get(self.item_type, query.primary_column)
+        if len(columns) > 1:
+            people = _local(np.asarray(columns[1], dtype=np.int64), users)
+        elif self.user is not None:
+            named = graph.ids_of([self.user] if _one(self.user) else self.user)
+            people = np.full(len(item), _local(named[:1], users)[0] if len(named) else -1)
+        else:
+            raise ValueError(
+                f"{type(self).__name__} needs to know whose taste to apply: name "
+                f"the user column, on(\"rec\", \"user\"), or one user, "
+                f"{type(self).__name__}(user=key).")
 
-        anchor = None
-        if user_col is None:
-            index = self._anchor_user(query, users)
-            anchor = user_factors[index - users[0]] if index is not None else None
-
-        scores = []
-        for row in rows:
-            item = _within(row[item_col], items)
-            if user_col is None:
-                vector = anchor
-            else:
-                user = _within(row[user_col], users)
-                vector = user_factors[user - users[0]] if user is not None else None
-            scores.append(float(vector @ item_factors[item - items[0]])
-                          if vector is not None and item is not None else 0.0)
-        return scores
-
-    def _anchor_user(self, query, users):
-        # fallback when the query has no user column: the first user node the
-        # search walked through
-        return next((n for n in query.visited_nodes if users[0] <= n < users[1]), None)
+        known = (rows >= 0) & (people >= 0)
+        out = np.zeros(len(item))
+        if known.any():
+            out[known] = np.einsum("ij,ij->i", user_factors[people[known]],
+                                   item_factors[rows[known]])
+        return out
 
     def _factorize(self, matrix):
         rng = np.random.default_rng(self.seed)
@@ -92,29 +98,30 @@ class MatrixFactorization(Strategy):
         # straight off the sparse layout once: CSR stores row i's column indices
         # contiguously in indices[indptr[i]:indptr[i+1]], and CSC does the same
         # per column. That is the alternative to re-scanning a boolean mask (and
-        # a strided column of it) on every pass.
+        # a strided column of it) on every pass. The values travel with them, so
+        # implicit and explicit feedback run the same loop.
         csr, csc = matrix.tocsr(), matrix.tocsc()
-        by_user = [csr.indices[csr.indptr[i]:csr.indptr[i + 1]] for i in range(n_users)]
-        by_item = [csc.indices[csc.indptr[j]:csc.indptr[j + 1]] for j in range(n_items)]
+        by_user = [_slice(csr, i) for i in range(n_users)]
+        by_item = [_slice(csc, j) for j in range(n_items)]
 
         for _ in range(self.iterations):
-            for i, observed in enumerate(by_user):
+            for i, (observed, target) in enumerate(by_user):
                 if observed.size:
                     A = item_factors[observed]
-                    # feedback is binary, so the right-hand side A.T @ ones is
-                    # just the column sum -- one matmul less per row
-                    user_factors[i] = np.linalg.solve(A.T @ A + reg, A.sum(axis=0))
-            for j, observed in enumerate(by_item):
+                    # the right-hand side is A.T @ target; with binary feedback
+                    # every target is 1 and it degenerates to the column sum
+                    user_factors[i] = np.linalg.solve(A.T @ A + reg, target @ A)
+            for j, (observed, target) in enumerate(by_item):
                 if observed.size:
                     A = user_factors[observed]
-                    item_factors[j] = np.linalg.solve(A.T @ A + reg, A.sum(axis=0))
+                    item_factors[j] = np.linalg.solve(A.T @ A + reg, target @ A)
 
         # The matrix spans the whole type block, so it includes items nobody
         # interacted with. Their solve is skipped, which would leave them holding
         # the random initialization -- an affinity invented out of nothing. No
         # evidence means no affinity, so they are zeroed.
-        user_factors[[i for i, o in enumerate(by_user) if not o.size]] = 0.0
-        item_factors[[j for j, o in enumerate(by_item) if not o.size]] = 0.0
+        user_factors[[i for i, (o, _) in enumerate(by_user) if not o.size]] = 0.0
+        item_factors[[j for j, (o, _) in enumerate(by_item) if not o.size]] = 0.0
         return user_factors, item_factors
 
 
@@ -122,7 +129,7 @@ class DiffusedMatrixFactorization(MatrixFactorization):
     """MatrixFactorization whose latent space bleeds from interaction edges onto
     the rest of the graph: each attribute node gets an embedding = mean of its
     neighbour items' factors, so every edge has a weight. Scores against an
-    explicit seed set (to=), a per-row path seed, or the base user model.
+    explicit seed set (to=), a per-row seed column, or the base user model.
 
     The embedding table is one (n_nodes, factors) array. Nodes being integers is
     what allows that -- and with it, scoring a whole result set is one matrix
@@ -148,7 +155,11 @@ class DiffusedMatrixFactorization(MatrixFactorization):
         # interacted with has no representation, so letting it into the
         # denominator would shrink its neighbours' embeddings toward zero for no
         # reason. That count is itself a matrix-vector product.
-        incidence = graph.adjacency()[:, items[0]:items[1]]
+        #
+        # Weighted, the mean becomes a weighted mean -- normalized, because a
+        # negative weight would pull an embedding to the far side of the space
+        # rather than count for less.
+        incidence = graph.adjacency("norm" if self.weighted else None)[:, items[0]:items[1]]
         represented = (item_factors != 0).any(axis=1)
         counts = incidence @ represented.astype(np.float64)
         embeddings = np.zeros((graph.n_nodes, self.factors))
@@ -162,37 +173,37 @@ class DiffusedMatrixFactorization(MatrixFactorization):
         known[users[0]:users[1]] = True
         return embeddings, known
 
-    def edge_weight(self, source, relation, target):
-        embeddings = getattr(self, "_embeddings", None)
-        if embeddings is None or not (self._known[source] and self._known[target]):
-            return 0.0
-        return float(embeddings[source] @ embeddings[target])
+    def scores(self, graph, columns):
+        """on("rec") against the `to=` seeds, or on("rec", "seed") per row."""
+        embeddings = self.embeddings(graph)
+        recommended = np.asarray(columns[0], dtype=np.int64)
+        if not len(recommended):
+            return np.zeros(0)
 
-    def score(self, query, rows):
-        if not rows:
-            return []
-        embeddings = self.embeddings(query.graph)
-        recommended = np.fromiter((row[query.primary_column] for row in rows),
-                                  dtype=np.int64, count=len(rows))
-
-        if self.to:                             # mode 1: explicit seed set, no path needed
-            seeds = self._seed_indices(query.graph)
+        if len(columns) > 1:                    # each row against its own seed
+            seeds = np.asarray(columns[1], dtype=np.int64)
+            return np.einsum("ij,ij->i", embeddings[recommended], embeddings[seeds])
+        if self.to:                             # the best against one seed set
+            seeds = graph.ids_of(self.to)
             if not len(seeds):
-                return [0.0] * len(rows)
-            return (embeddings[recommended] @ embeddings[seeds].T).max(axis=1).tolist()
+                return np.zeros(len(recommended))
+            return (embeddings[recommended] @ embeddings[seeds].T).max(axis=1)
+        return super().scores(graph, columns)   # fall back to the user model
 
-        path_col = query.path_column
-        if path_col is None:                    # mode 3: fall back to user-based MF
-            return super().score(query, rows)
-        seeds = np.fromiter((row[path_col][-1] for row in rows),   # mode 2: each row's own seed
-                            dtype=np.int64, count=len(rows))
-        return np.einsum("ij,ij->i", embeddings[recommended], embeddings[seeds]).tolist()
-
-    def _seed_indices(self, graph):
-        return np.fromiter((i for i in (graph.lookup(s) for s in self.to) if i is not None),
-                           dtype=np.int64)
+def _local(nodes, block):
+    """Node ids as positions inside a type block, and -1 for the ones outside it
+    -- a node the factorization has no row for scores zero rather than someone
+    else's affinity."""
+    low, high = block
+    return np.where((nodes >= low) & (nodes < high), nodes - low, -1)
 
 
-def _within(index, block):
-    """The index itself when it falls inside a type's block, else None."""
-    return index if block[0] <= index < block[1] else None
+def _one(value):
+    """Is this one node, or a collection of them?"""
+    return isinstance(value, (str, tuple)) or hasattr(value, "__index__")
+
+
+def _slice(matrix, i):
+    """One row (CSR) or column (CSC): its observed indices and their values."""
+    start, stop = matrix.indptr[i], matrix.indptr[i + 1]
+    return matrix.indices[start:stop], matrix.data[start:stop]

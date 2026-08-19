@@ -1,68 +1,203 @@
 """Graph: the data, and the entry point to the pipeline.
 
-A node key in the source files is `<type>.<id>` -- so a node is really a (type,
-id) pair, not an opaque string. The loader gives every type a contiguous block
-of integers and stores a node as `start[type] + local`. Three things follow, and
-they are the whole reason for the representation:
+A node key in the source files is `<type>.<id>`, and **an id is a position**:
+ids are dense integers `0..n-1` within a type, so `song.42` is stored at
+`start["song"] + 42`. The layout is read off the data rather than discovered
+from the order the files happen to mention things in, which is why there is no
+permutation to build, no first-seen ordering to preserve, and no table
+translating a name into an index -- `lookup` is arithmetic. A file that says
+otherwise is refused at load, because the alternative is a graph whose contents
+depend on how it was written. An identifier that belongs to the world rather
+than to the graph -- an IMDb code, a Spotify uri -- is an ordinary attribute
+column beside the position. Three things follow, and they are the whole reason
+for the representation:
 
   * the universe is `range(N)`, so every per-node fact is a plain array indexed
     directly -- no dict, no hashing, no interning;
   * `keys_by_type` is a slice, not a stored partition;
-  * a node constraint compiles to one boolean mask (see query._Compiler), which
-    is what lets the engines drop their per-candidate predicate loop.
+  * a hop is a gather over CSR slices (see traverse.py), so expanding a set of
+    nodes never builds a join table.
 
 Relations are directed and stored once, as a single edge-labeled CSR plus its
 transpose. Walking backwards reads the transpose instead of a separate `_r`
-relation, so there is no `rv` flag, no duplicated edges, and `Edge()` traverses
-both directions because both are always present.
+relation, so there is no `rv` flag, no duplicated edges, and a wildcard hop
+traverses both directions because both are always present.
+
+Every edge carries a weight, a float defaulting to 1.0 -- there is no such thing
+as an unweighted edge, only one whose weight nobody wrote down. That is why the
+loader has no notion of an "interaction": a rating is the weight of a
+`has_interact` edge, a similarity is the weight of a `similar_to` edge, and both
+load through the same path. Filtering on it belongs to the query, not here: a
+graph that silently held only part of its file is a graph whose contents depend
+on a constructor argument.
+
+Loading is columnar for the same reason everything else here is: what runs once
+per edge has to be C. A file is read a chunk at a time and cut into columns by
+one `replace` and one `split`, so the only Python loop left in the edge path
+runs once per distinct node rather than once per edge.
 
 Attributes are columnar and typed at load, so `year >= 1990` compares int64
-against int64 instead of coercing a string once per candidate node. One of them
-is virtual: `label` resolves per type to whichever column holds the readable
-name, so a query can filter on it without knowing that movies call it `title`
-and people call it `name`.
+against int64 instead of coercing a string once per candidate node. Reading one
+into a frame is therefore a gather -- `column.values[id - start]` -- and never a
+join.
+
+`readable` is the one thing the graph is told rather than reads: which column a
+person reads for each type. Nothing guesses it, because a guess is wrong exactly
+when it matters, and it is a fact about the dataset rather than about any one
+query -- so it is declared once, here.
 """
 
 import os
-from array import array
+from itertools import chain
 
 import numpy as np
+import polars as pl
 import scipy.sparse as sp
 
-from .columns import build as build_column
+from .columns import Column, build as build_column
+from .frame import Frame, RELATION
 from .keys import Key
-from .query import Query
 
-# a type's label column, in preference order; falling back to the first text
-# column would pick `imdb` over `name` for a person, which is never what a
-# caller printing a result wants
-LABEL_PREFERENCE = ("name", "title", "label")
-
-# the virtual attribute that resolves to whichever column above a type actually
-# has. `movie.label` reads `title` and `person.label` reads `name`, so a caller
-# can filter by the human-readable name without knowing the physical column --
-# the same thing Key.label already gives them on the way out.
+# Every type has these two columns and they are generated, not read: `id` is the
+# node's position, and `label` is what identifies it to anything outside the
+# graph. Without `renumber` they are the same array under two names -- the
+# position is the identity -- and with it, `label` holds the id the source used.
+# Neither is virtual: `graph.column(type, name)` is a dict lookup, and a query
+# that wants `label` to mean a readable column says so with `Node.alias`.
+ID = "id"
 LABEL = "label"
 
-INTERACT = "has_interact"
+# the weight of an edge whose file gives it no score
+DEFAULT_WEIGHT = 1.0
+
+# how much of an edge file becomes columns at a time. Splitting the whole file
+# at once would hold one Python string per *field* until the load finished --
+# millions of them, costing more than the graph they describe. Between 1 KB and
+# 32 MB the time is flat and only the memory moves, so the size is chosen for
+# the memory.
+CHUNK = 1 << 16
 
 
 def _split(key):
-    """'movie.123' -> ('movie', '123'). The id may be any token; only the first
-    dot separates, so ids containing dots survive."""
+    """'movie.123' -> ('movie', '123'). Only the first dot separates, so a type
+    name holding one would still split where it should."""
     type_, _, raw = key.partition(".")
     return type_, raw
 
 
+# --- reading a file by column rather than by line ---------------------------
+
+def _chunks(handle, first):
+    """The file as whole-line chunks, `first` being the line already read off it
+    to learn the shape."""
+    remainder = first
+    while True:
+        block = handle.read(CHUNK)
+        if not block:
+            break
+        block = remainder + block
+        cut = block.rfind("\n")
+        if cut < 0:                      # a line longer than the chunk: keep reading
+            remainder = block
+            continue
+        remainder, block = block[cut + 1:], block[:cut + 1]
+        yield block
+    if remainder:
+        yield remainder if remainder.endswith("\n") else remainder + "\n"
+
+
+def _table(path, header, minimum):
+    """An edge file as parallel columns of strings, a chunk at a time.
+
+    The shape is read off the first data line, not the header: what the file
+    holds is decided by what is in it. A chunk whose lines are not all that wide
+    falls back to `_ragged` -- the fast path needs a rectangle, and a file is
+    allowed not to be one.
+
+    `minimum` is how many columns make a row worth reading: three for a triple,
+    two for an edge whose relation the filename already gave.
+    """
+    with open(path, "r") as handle:
+        first = handle.readline()
+        if header:
+            first = handle.readline()
+        if not first:
+            return
+        width = first.count("\t") + 1
+        if width < minimum:
+            return
+        for block in _chunks(handle, first):
+            yield _rectangle(block, width) or _ragged(block, width, minimum)
+
+
+def _rectangle(block, width):
+    """Columns from a chunk of equal-width lines, or None when it is not one.
+
+    Two separators and one pass: making the newline a tab as well leaves a flat
+    field list that strides into columns, where the obvious reading makes two
+    Python calls per line."""
+    fields = block.replace("\n", "\t").split("\t")
+    del fields[-1]                       # the chunk ends on a newline
+    if not fields or len(fields) % width:
+        return None
+    return [fields[index::width] for index in range(width)]
+
+
+def _ragged(block, width, minimum):
+    """Columns from a chunk whose lines vary: a line too short to be an edge is
+    dropped, and a missing trailing cell reads as absent."""
+    columns = [[] for _ in range(width)]
+    for line in block.split("\n"):
+        parts = line.split("\t")
+        if len(parts) < minimum or parts[0] == "":
+            continue
+        for index, column in enumerate(columns):
+            column.append(parts[index] if index < len(parts) else "")
+    return columns
+
+
+def _position(key, raw):
+    """An id as the position it names, or a refusal.
+
+    Loading a file that does not follow the format is a bug in whatever wrote
+    it, so it raises here rather than being accommodated. `lookup` answers the
+    different question -- "is there such a node?" -- and answers it with None."""
+    if not raw.isdigit():
+        raise ValueError(f"{key!r}: a node id is a position, so it must be a "
+                         f"non-negative integer")
+    return int(raw)
+
+
+def _sortable(raw):
+    """A source id as something to sort by: numbers as numbers and before text,
+    so a renumbering keeps `1 … 1682` in the order anyone would expect."""
+    return (0, int(raw), "") if raw.isdigit() else (1, 0, raw)
+
+
+def _drain(parts):
+    """The staged chunks as one array, letting go of the chunks themselves."""
+    joined = np.concatenate(parts) if parts else np.zeros(0, dtype=np.int32)
+    parts.clear()
+    return joined
+
+
+def _weights(column):
+    """A score column as floats. An empty cell is an edge nobody scored, which
+    is not the same as an edge scored zero."""
+    try:
+        return np.array(column, dtype=np.float64)
+    except ValueError:
+        return np.array([value or DEFAULT_WEIGHT for value in column], dtype=np.float64)
+
+
 class Graph:
-    def __init__(self, kg=None, ui=None, attrs=None, sf=None, labels=None):
+    def __init__(self, kg=None, edges=None, attrs=None, renumber=False, readable=None):
         self.kg = kg
-        self.ui = ui
-        # score filter on ui interactions: (min, max) inclusive; keeps
-        # interactions whose rating falls in range, e.g. (3, inf) keeps >= 3
-        self.sf = sf
+        self.edge_files = edges or []
         self.attr_files = attrs or []
-        self.labels = labels or {}       # type -> label column, overriding the heuristic
+        self.renumber = renumber         # ids are not positions: assign them here
+        # {type: column a person reads}. Declared, never inferred -- see labels()
+        self.readable = dict(readable or {})
 
         self._cache = {}                 # name -> memoized value; safe for the graph's lifetime
 
@@ -75,10 +210,12 @@ class Graph:
         self.relations = []              # relation name by code
         self._relation_code = {}
 
-        # edges as three parallel int arrays, in provisional ids
-        self._e_src = array("i")
-        self._e_rel = array("i")
-        self._e_tgt = array("i")
+        # edges as four parallel columns, in provisional ids: one array per
+        # chunk read, concatenated once in _finalize
+        self._e_src = []
+        self._e_rel = []
+        self._e_tgt = []
+        self._e_weight = []
 
         self._attr_rows = {}             # type -> (column names, {provisional id: values})
 
@@ -102,36 +239,69 @@ class Graph:
             self.relations.append(name)
         return code
 
-    def _add_edge(self, source, relation, target):
-        self._e_src.append(self._intern(source))
-        self._e_rel.append(self._relation(relation))
-        self._e_tgt.append(self._intern(target))
+    def _register(self, sources, targets):
+        """Intern every node key these edges mention.
+
+        Order is irrelevant -- a node's place comes from its id, not from when
+        it was first seen -- so this is only about touching each distinct key
+        once. `dict.fromkeys` does the deduplication in C, leaving the loop to
+        run once per distinct node rather than once per endpoint."""
+        table, known = self._id, self._keys
+        for key in dict.fromkeys(chain(sources, targets)):
+            if key not in table:
+                table[key] = len(known)
+                known.append(key)
+
+    def _ids_of(self, keys):
+        """A column of source keys as the ids _register just handed out -- the
+        lookup itself runs in C, one dict access per endpoint and no more."""
+        return np.fromiter(map(self._id.__getitem__, keys), dtype=np.int32, count=len(keys))
+
+    def _codes_of(self, names):
+        """The same, for a column of relation names."""
+        for name in dict.fromkeys(names):
+            self._relation(name)
+        return np.fromiter(map(self._relation_code.__getitem__, names),
+                           dtype=np.int32, count=len(names))
+
+    def _stage(self, sources, codes, targets, weights):
+        self._register(sources, targets)
+        self._e_src.append(self._ids_of(sources))
+        self._e_rel.append(codes)
+        self._e_tgt.append(self._ids_of(targets))
+        self._e_weight.append(np.ones(len(sources)) if weights is None else weights)
 
     def _load(self):
         if self.kg:
-            with open(self.kg, "r") as f:
-                for line in f:
-                    parts = line.rstrip("\n").split("\t")
-                    if len(parts) < 3:
-                        continue
-                    self._add_edge(parts[0], parts[1], parts[2])
+            self._load_kg(self.kg)
 
-        if self.ui:
-            with open(self.ui, "r") as f:
-                for line in f:
-                    parts = line.rstrip("\n").split("\t")
-                    if len(parts) < 2:
-                        continue
-                    if self.sf is not None:              # rating filter (interaction stays binary)
-                        if len(parts) < 3:
-                            continue
-                        rating = float(parts[2])
-                        if not (self.sf[0] <= rating <= self.sf[1]):
-                            continue
-                    self._add_edge(parts[0], INTERACT, parts[1])
+        for path in self.edge_files:
+            self._load_edges(path)
 
         for path in self.attr_files:
             self._load_attrs(path)
+
+    def _load_kg(self, path):
+        """head <TAB> relation <TAB> tail, and optionally a score: the file that
+        holds several relations at once, so the relation is a column."""
+        for columns in _table(path, header=False, minimum=3):
+            self._stage(columns[0], self._codes_of(columns[1]), columns[2],
+                        _weights(columns[3]) if len(columns) > 3 else None)
+
+    def _load_edges(self, path):
+        """One relation per file, named by the filename suffix: '.../ml.has_interact'
+        -> 'has_interact', the same rule _load_attrs reads a type by.
+
+        A header row names the columns (source, target, score) so the file says
+        what it holds; the score is the third column and may be left out
+        entirely, in which case every edge weighs DEFAULT_WEIGHT."""
+        relation = os.path.basename(path).split(".")[-1]
+        for columns in _table(path, header=True, minimum=2):
+            # named here rather than above, so an empty file leaves behind no
+            # relation the graph has never seen an edge of
+            code = np.full(len(columns[0]), self._relation(relation), dtype=np.int32)
+            self._stage(columns[0], code, columns[1],
+                        _weights(columns[2]) if len(columns) > 2 else None)
 
     def _load_attrs(self, path):
         # type inferred from the filename suffix: '.../ml.movie' -> 'movie';
@@ -156,14 +326,18 @@ class Graph:
     # --- freezing: ids become contiguous, edges become CSR -------------------
 
     def _finalize(self):
-        """Permute the provisional ids into per-type blocks, then freeze.
+        """Put every node where its id says it goes, then freeze.
 
-        Sorting by (type, first-seen) is what makes a type a contiguous range,
-        and therefore `keys_by_type` a slice and every per-node fact an array."""
-        self.n_nodes = len(self._keys)
+        A type's block is as long as its largest id, and a node sits at
+        `start[type] + id`. There is no permutation and no ordering to preserve:
+        two files listing the same graph in any two orders load to the same
+        integers, which is what makes an id something a checkpoint, a URL or
+        another dataset can refer to."""
+        count = len(self._keys)
         self.types, self._type_pos = [], {}
-        tags = np.empty(self.n_nodes, dtype=np.int32)
-        raws = []
+        tags = np.empty(count, dtype=np.int32)
+        places = np.empty(count, dtype=np.int64)
+        raws = [] if self.renumber else None
         for index, key in enumerate(self._keys):         # once per node, not per edge
             type_, raw = _split(key)
             tag = self._type_pos.get(type_)
@@ -171,68 +345,130 @@ class Graph:
                 tag = self._type_pos[type_] = len(self.types)
                 self.types.append(type_)
             tags[index] = tag
-            raws.append(raw)
+            if raws is None:
+                places[index] = _position(key, raw)
+            else:
+                raws.append(raw)
 
-        order = np.lexsort((np.arange(self.n_nodes), tags))   # by type, then first-seen
-        self._new_of_old = np.empty(self.n_nodes, dtype=np.int64)
-        self._new_of_old[order] = np.arange(self.n_nodes)
+        sources = None if raws is None else self._renumber(tags, raws, places)
 
+        sizes = np.zeros(len(self.types), dtype=np.int64)
+        np.maximum.at(sizes, tags, places + 1)
         self.start = np.zeros(len(self.types) + 1, dtype=np.int64)
-        self.start[1:] = np.cumsum(np.bincount(tags, minlength=len(self.types)))
-        self._type_tag_of = tags[order]
+        np.cumsum(sizes, out=self.start[1:])
+        self.n_nodes = int(self.start[-1])
+        self._type_tag_of = np.repeat(np.arange(len(self.types), dtype=np.int32), sizes)
 
-        # per-type raw ids and the reverse lookup, in the new block order
-        self._raw = [[] for _ in self.types]
-        self._local = [{} for _ in self.types]
-        for old in order.tolist():
-            table = self._local[tags[old]]
-            block = self._raw[tags[old]]
-            table[raws[old]] = len(block)
-            block.append(raws[old])
+        # int32, and so every endpoint column downstream: a node id indexes an
+        # array, and an array of two billion is not what runs out first
+        self._new_of_old = (self.start[tags] + places).astype(np.int32)
+        self._check_positions(count)
 
         self._build_adjacency()
-        self._build_columns()
+        self._build_columns(sizes, sources)
 
         # only the by-name lookup tables outlive the load
-        self._e_src = self._e_rel = self._e_tgt = None
+        self._e_src = self._e_rel = self._e_tgt = self._e_weight = None
         self._attr_rows = self._id = self._keys = self._new_of_old = None
+
+    def _renumber(self, tags, raws, places):
+        """Positions for a dataset whose ids are not positions, and the ids it
+        used, per type, in the new order.
+
+        Sorting each type's tokens is what makes the numbering a function of the
+        node *set*: which file mentioned a node first, and how much of a file was
+        read at a time, stop being able to move it. Numeric tokens sort as
+        numbers and before text, so `movie.1 … movie.1682` keeps its order.
+
+        The token itself becomes the `label` column, because it is the only
+        thing a renumbered graph holds that anything outside it can name -- and
+        a checkpoint fitted here must key on it (`alias="label"`), since the
+        positions move whenever the node set does."""
+        sources = [[] for _ in self.types]
+        for tag in range(len(self.types)):
+            rows = np.flatnonzero(tags == tag).tolist()
+            rows.sort(key=lambda index: _sortable(raws[index]))
+            for position, index in enumerate(rows):
+                places[index] = position
+                sources[tag].append(raws[index])
+        return sources
+
+    def _check_positions(self, count):
+        """Every place in every block belongs to exactly one node.
+
+        A skipped id leaves a node with no edges, no attributes and no way to
+        tell it from one whose data went missing; a repeated one ('movie.7' and
+        'movie.007') puts two nodes in one place and loses whichever loaded
+        first. Both are bugs in whatever wrote the file, and neither is
+        discoverable once the graph is built -- so they are refused here."""
+        seen = np.zeros(self.n_nodes, dtype=bool)
+        seen[self._new_of_old] = True
+        if not seen.all():
+            self._refuse(int(np.flatnonzero(~seen)[0]), "is never mentioned")
+        if count != self.n_nodes:
+            twice = np.flatnonzero(np.bincount(self._new_of_old,
+                                               minlength=self.n_nodes) > 1)
+            self._refuse(int(twice[0]), "is named twice")
+
+    def _refuse(self, index, complaint):
+        tag = int(np.searchsorted(self.start, index, "right")) - 1
+        raise ValueError(f"{self.types[tag]}.{index - int(self.start[tag])} {complaint}: "
+                         f"a node id is its position, so a type's ids are 0..n-1")
 
     def _build_adjacency(self):
         """One edge-labeled CSR plus its transpose.
 
         Sorting each node's slice by relation is what makes both access patterns
-        cheap from a single store: a wildcard `Edge()` is the whole slice, and a
+        cheap from a single store: a wildcard hop is the whole slice, and a
         named relation is a searchsorted sub-range of it. Two arrays per
-        direction, versus a dict of dicts of lists holding 2x the edges."""
-        if len(self._e_rel) == 0:
-            empty_i = np.zeros(0, dtype=np.int64)
+        direction, versus a dict of dicts of lists holding 2x the edges.
+
+        The weight rides along as a third array per direction, permuted by the
+        same order: `out_weights[p]` is the weight of the edge ending at
+        `out_indices[p]`, so a weight predicate is a slice like everything else
+        here."""
+        if not any(len(part) for part in self._e_rel):
+            empty_i = np.zeros(0, dtype=np.int32)
+            empty_w = np.zeros(0, dtype=np.float64)
             empty_p = np.zeros(self.n_nodes + 1, dtype=np.int64)
-            self.out_indptr, self.out_indices, self.out_rels = empty_p, empty_i, empty_i
-            self.in_indptr, self.in_indices, self.in_rels = empty_p.copy(), empty_i, empty_i
+            self.out_indptr, self.out_indices = empty_p, empty_i
+            self.out_rels, self.out_weights = empty_i, empty_w
+            self.in_indptr, self.in_indices = empty_p.copy(), empty_i
+            self.in_rels, self.in_weights = empty_i, empty_w.copy()
             return
 
-        # one fancy-index each turns every provisional edge id into its block id
-        src = self._new_of_old[np.frombuffer(self._e_src, dtype=np.int32)]
-        tgt = self._new_of_old[np.frombuffer(self._e_tgt, dtype=np.int32)]
-        rel = np.frombuffer(self._e_rel, dtype=np.int32).astype(np.int64)
+        # one fancy-index each turns every provisional edge id into its block
+        # id. Draining as it goes because the two CSR passes below allocate
+        # twice what these columns hold, and holding both at once is the peak
+        src = self._new_of_old[_drain(self._e_src)]
+        tgt = self._new_of_old[_drain(self._e_tgt)]
+        rel = _drain(self._e_rel)
+        weight = _drain(self._e_weight)
 
-        self.out_indptr, self.out_indices, self.out_rels = self._csr(src, tgt, rel)
-        self.in_indptr, self.in_indices, self.in_rels = self._csr(tgt, src, rel)
+        self.out_indptr, self.out_indices, self.out_rels, self.out_weights = \
+            self._csr(src, tgt, rel, weight)
+        self.in_indptr, self.in_indices, self.in_rels, self.in_weights = \
+            self._csr(tgt, src, rel, weight)
 
-    def _csr(self, key, value, rel):
+    def _csr(self, key, value, rel, weight):
         order = np.lexsort((rel, key))               # by source, then by relation
         indptr = np.zeros(self.n_nodes + 1, dtype=np.int64)
         np.cumsum(np.bincount(key, minlength=self.n_nodes), out=indptr[1:])
-        return indptr, value[order], rel[order]
+        return indptr, value[order], rel[order], weight[order]
 
-    def _build_columns(self):
-        """Per type, {attribute: Column} indexed by local id -- plus `id`, which
-        is a real column now instead of a split() on every read."""
+    def _build_columns(self, sizes, sources):
+        """Per type, {attribute: Column} indexed by local id -- plus `id` and
+        `label`, which are generated rather than read.
+
+        Without `renumber` the two are the same Column object under two names,
+        because the position *is* the identity and a second copy of it would
+        only be a second thing to keep in step."""
         self.columns = {}
-        self.label = {}
         for tag, type_ in enumerate(self.types):
-            size = len(self._raw[tag])
-            table = {"id": build_column(self._raw[tag])}
+            size = int(sizes[tag])
+            identity = Column(np.arange(size, dtype=np.int64))
+            table = {ID: identity,
+                     LABEL: identity if sources is None else build_column(sources[tag])}
             names, rows = self._attr_rows.get(type_, ([], {}))
             # a row is keyed by provisional id; resolve it to a local one once,
             # not once per column
@@ -245,15 +481,6 @@ class Graph:
                         values[local] = row[position]
                 table[name] = build_column(values)
             self.columns[type_] = table
-            self.label[type_] = self._label_column(type_, table)
-
-    def _label_column(self, type_, table):
-        if type_ in self.labels:
-            return self.labels[type_]
-        for name in LABEL_PREFERENCE:
-            if name in table:
-                return name
-        return None
 
     # --- node identity -------------------------------------------------------
 
@@ -271,114 +498,87 @@ class Graph:
         return int(index) - int(self.start[self._type_tag_of[index]])
 
     def raw_id(self, index):
-        return self.columns[self.type_of(index)]["id"].get(self.local(index))
+        return self.local(index)          # an id is a position; they are the same number
 
     def label_of(self, index):
-        value = self.value(index, LABEL)
-        if value is not None:
-            return value
-        return f"{self.type_of(index)}.{self.raw_id(index)}"
+        """What identifies this node outside the graph: the id the source gave
+        it under `renumber`, and its position otherwise."""
+        return self.value(index, LABEL)
 
     def attrs_of(self, index):
         local = self.local(index)
         return {name: column.get(local)
                 for name, column in self.columns[self.type_of(index)].items()}
 
-    def resolve(self, type_, name):
-        """An attribute name as this type stores it. Only `label` is virtual; it
-        is resolved here, in the one place both querying and rendering pass
-        through, so the two can never disagree about what a label is."""
-        return self.label.get(type_) if name == LABEL else name
-
     def value(self, index, name):
         """One attribute of one node, for rendering a single result cell."""
-        type_ = self.type_of(index)
-        column = self.columns[type_].get(self.resolve(type_, name))
+        column = self.columns[self.type_of(index)].get(name)
         return None if column is None else column.get(self.local(index))
 
     def column(self, type_, name):
         """A whole typed attribute column, for building a mask in one go.
 
-        None when the type has no such column -- including a type with no label
-        at all (nothing in LABEL_PREFERENCE), which then simply matches nothing
+        None when the type has no such column, which then simply matches nothing
         rather than falling back to some synthetic string."""
         table = self.columns.get(type_)
-        return None if table is None else table.get(self.resolve(type_, name))
+        return None if table is None else table.get(name)
 
     def key(self, index):
         return Key(self, int(index))
 
+    # --- the container protocol: a graph holds nodes -------------------------
+
+    def __repr__(self):
+        edges = len(self.out_indices)
+        return (f"<Graph: {self.n_nodes} nodes in {len(self.types)} types "
+                f"({', '.join(self.types)}), {edges} edges in "
+                f"{len(self.relations)} relations ({', '.join(self.relations)})>")
+
+    def __len__(self):
+        return self.n_nodes
+
+    def __iter__(self):
+        return (Key(self, index) for index in range(self.n_nodes))
+
+    def __contains__(self, spec):
+        return self.lookup(spec) is not None
+
+    def __getitem__(self, spec):
+        """`g["movie.12"]` -- lookup by name, raising like any other mapping.
+
+        `lookup` answers None for a node that is not there, which is what a
+        caller sweeping a list of guesses wants; this is for the caller who
+        believes the node exists and should hear about it if not."""
+        index = self.lookup(spec)
+        if index is None:
+            raise KeyError(spec)
+        return Key(self, index)
+
     def lookup(self, spec):
         """A node index from a source key ('movie.123') or a (type, id) pair --
-        the way a caller names a node the query did not hand them."""
+        the way a caller names a node the query did not hand them.
+
+        Arithmetic, because an id is a position: nothing to build before a name
+        can be resolved, and nothing that can go stale. Asking for a node that
+        is not there is a question, not an error, so it answers None -- unlike
+        `_position`, which refuses a malformed *file*."""
         if isinstance(spec, Key):
             return int(spec)
         type_, raw = spec if isinstance(spec, tuple) else _split(spec)
         tag = self._type_pos.get(type_)
         if tag is None:
             return None
-        local = self._local[tag].get(str(raw))
-        return None if local is None else int(self.start[tag]) + local
+        try:
+            position = int(raw)
+        except (TypeError, ValueError):
+            return None
+        start, stop = int(self.start[tag]), int(self.start[tag + 1])
+        return start + position if 0 <= position < stop - start else None
 
     # --- traversal -----------------------------------------------------------
 
     def relation_code(self, name):
         return self._relation_code.get(name)
-
-    def expand(self, index, relation=None, reverse=None):
-        """Out-neighbours as [(target, code)], where a negative code means the
-        edge was walked backwards.
-
-        `reverse=None` with no named relation is the wildcard: both directions,
-        because a directed store plus its transpose is exactly what the old `_r`
-        duplication was faking."""
-        out = []
-        if reverse is not True:
-            self._segment(out, self.out_indptr, self.out_indices, self.out_rels,
-                          index, relation, False)
-        if reverse is not False:
-            self._segment(out, self.in_indptr, self.in_indices, self.in_rels,
-                          index, relation, True)
-        return out
-
-    def _segment(self, out, indptr, indices, rels, index, relation, reverse):
-        lo, hi = int(indptr[index]), int(indptr[index + 1])
-        if lo == hi:
-            return
-        if relation is not None:
-            # the slice is sorted by relation, so the named one is a sub-range;
-            # both bounds are searched against the same original segment
-            segment = rels[lo:hi]
-            left = int(np.searchsorted(segment, relation, "left"))
-            right = int(np.searchsorted(segment, relation, "right"))
-            lo, hi = lo + left, lo + right
-            if lo >= hi:
-                return
-        code = ~relation if (reverse and relation is not None) else relation
-        targets = indices[lo:hi].tolist()
-        if relation is not None:
-            out.extend((t, code) for t in targets)
-        else:
-            codes = rels[lo:hi].tolist()
-            out.extend(zip(targets, (~c for c in codes) if reverse else codes))
-
-    def has_edge(self, source, target, relation=None, reverse=False):
-        """Does this edge exist? The anti-join test -- a membership check against
-        an array slice, so no neighbour list is materialized to answer it."""
-        directions = ((self.out_indptr, self.out_indices, self.out_rels),) if reverse is False \
-            else ((self.in_indptr, self.in_indices, self.in_rels),) if reverse is True \
-            else ((self.out_indptr, self.out_indices, self.out_rels),
-                  (self.in_indptr, self.in_indices, self.in_rels))
-        for indptr, indices, rels in directions:
-            lo, hi = int(indptr[source]), int(indptr[source + 1])
-            if relation is not None:
-                segment = rels[lo:hi]
-                left = int(np.searchsorted(segment, relation, "left"))
-                right = int(np.searchsorted(segment, relation, "right"))
-                lo, hi = lo + left, lo + right
-            if lo < hi and target in indices[lo:hi]:
-                return True
-        return False
 
     def neighbours(self, index):
         """Every neighbour, both directions, deduplicated -- the undirected
@@ -393,6 +593,21 @@ class Graph:
         graph never saw has arity zero everywhere."""
         return self.cached(("degree", relation, reverse), lambda: self._degree(relation, reverse))
 
+    def sources(self, reverse=False):
+        """The source node of every stored edge, expanded from the CSR row
+        offsets: `indptr` says where each node's block starts, this says which
+        node each position belongs to.
+
+        int32 because it holds node ids, and memoized because a relation's hop
+        bounds are counted from it -- on the full Spotify graph this array is
+        283 MB, and rebuilding it per relation is what that would otherwise
+        cost."""
+        return self.cached(("sources", reverse), lambda: self._expand_sources(reverse))
+
+    def _expand_sources(self, reverse):
+        indptr = self.in_indptr if reverse else self.out_indptr
+        return np.repeat(np.arange(self.n_nodes, dtype=np.int32), np.diff(indptr))
+
     def _degree(self, relation, reverse):
         indptr = self.in_indptr if reverse else self.out_indptr
         if relation is None:
@@ -401,46 +616,189 @@ class Graph:
         if code is None:
             return np.zeros(self.n_nodes, dtype=np.int64)
         rels = self.in_rels if reverse else self.out_rels
-        sources = np.repeat(np.arange(self.n_nodes), np.diff(indptr))
-        return np.bincount(sources[rels == code], minlength=self.n_nodes)
+        return np.bincount(self.sources(reverse)[rels == code], minlength=self.n_nodes)
+
+    # --- edge weights --------------------------------------------------------
+
+    def weight_bounds(self):
+        """The lowest and highest stored weight of each relation, as two arrays
+        indexed by relation code -- what puts a traversed weight on its own
+        [0, 1] scale without comparing it to another relation's."""
+        return self.cached("weight_bounds", self._weight_bounds)
+
+    def _weight_bounds(self):
+        count = max(len(self.relations), 1)
+        low, high = np.full(count, np.inf), np.full(count, -np.inf)
+        # one masked pass per relation rather than `np.minimum.at`, which is
+        # numpy's unbuffered fallback: 3x on 2.78M edges and three relations.
+        # Relations stay few, so a handful of extra passes is the cheap side
+        for code in range(len(self.relations)):
+            weights = self.out_weights[self.out_rels == code]
+            if weights.size:
+                low[code], high[code] = weights.min(), weights.max()
+        return low, high
+
+    def weights(self, normalized=False):
+        """The stored weights as an (out, in) pair, aligned with out_indices /
+        in_indices."""
+        if not normalized:
+            return self.out_weights, self.in_weights
+        return self.cached("norm_weights", self._normalize_weights)
+
+    def _normalize_weights(self):
+        """Min-max into [0, 1], per relation.
+
+        Per relation because scales do not compare across them: a 1-5 rating and
+        a cosine similarity are both floats and mean nothing to each other. A
+        relation whose weights are all equal -- every edge that was never given a
+        score -- maps to 1.0 rather than 0.0, so a graph with no weights behaves
+        exactly as one that never had the notion.
+
+        This is what makes an unbounded score usable by the parts that must
+        combine or accumulate one: a walk needing non-negative transitions, a
+        loss weighting its examples."""
+        low, high = self.weight_bounds()
+        span = high - low
+
+        def scale(rels, weights):
+            scaled = np.ones(len(weights))
+            varying = span[rels] > 0
+            codes = rels[varying]
+            scaled[varying] = (weights[varying] - low[codes]) / span[codes]
+            return scaled
+
+        return scale(self.out_rels, self.out_weights), scale(self.in_rels, self.in_weights)
 
     # --- sparse views the strategies rank with -------------------------------
 
-    def adjacency(self):
+    def adjacency(self, weights=None):
         """The undirected adjacency as one N x N CSR, counting multi-edges.
 
         Both directions, so random-walk mass flows symmetrically -- the property
-        `rv=True` used to buy by physically duplicating every edge."""
-        return self.cached("adjacency", self._build_matrix)
+        `rv=True` used to buy by physically duplicating every edge.
 
-    def _build_matrix(self):
-        sources = np.repeat(np.arange(self.n_nodes), np.diff(self.out_indptr))
+        `weights` picks what fills the cells: None counts an edge as 1, "raw"
+        uses its stored score, "norm" the per-relation min-max of it. A random
+        walk wants "norm" and not "raw": a negative score is not a transition."""
+        return self.cached(("adjacency", weights), lambda: self._build_matrix(weights))
+
+    def _build_matrix(self, weights):
+        sources = self.sources()
         both_src = np.concatenate([sources, self.out_indices])
         both_tgt = np.concatenate([self.out_indices, sources])
-        data = np.ones(len(both_src))
-        return sp.csr_matrix((data, (both_src, both_tgt)),
+        data = self._edge_data(weights)
+        return sp.csr_matrix((np.concatenate([data, data]), (both_src, both_tgt)),
                              shape=(self.n_nodes, self.n_nodes))
 
-    def relation_matrix(self, relation):
+    def relation_matrix(self, relation, weights=None):
         """One relation as an N x N CSR, source -> target. Block-slice it to get
-        e.g. the user-item matrix: `m[u0:u1, i0:i1]`."""
-        return self.cached(("relation_matrix", relation),
-                           lambda: self._build_relation_matrix(relation))
+        e.g. the user-item matrix: `m[u0:u1, i0:i1]`. `weights` reads as it does
+        for adjacency()."""
+        return self.cached(("relation_matrix", relation, weights),
+                           lambda: self._build_relation_matrix(relation, weights))
 
-    def _build_relation_matrix(self, relation):
-        code = self._relation_code.get(relation)
-        sources = np.repeat(np.arange(self.n_nodes), np.diff(self.out_indptr))
-        keep = slice(None) if code is None else (self.out_rels == code)
+    def _build_relation_matrix(self, relation, weights):
+        sources = self.sources()
+        if relation is None:                       # every relation
+            keep = slice(None)
+        else:
+            code = self._relation_code.get(relation)
+            # a name the graph never saw matches nothing. Reading it as "all of
+            # them" is how a typo used to become the whole graph
+            keep = (self.out_rels == code) if code is not None \
+                else np.zeros(len(sources), dtype=bool)
         rows, cols = sources[keep], self.out_indices[keep]
-        return sp.csr_matrix((np.ones(len(rows)), (rows, cols)),
+        return sp.csr_matrix((self._edge_data(weights)[keep], (rows, cols)),
                              shape=(self.n_nodes, self.n_nodes))
 
-    # --- pipeline entry point (the only method that starts a query) ----------
+    def _edge_data(self, weights):
+        """What one stored edge contributes to a matrix cell: its existence, its
+        score, or its normalized score."""
+        if weights is None:
+            return np.ones(len(self.out_indices))
+        return self.weights(normalized=(weights == "norm"))[0]
 
-    def select(self, *projections):
-        return Query(self, *projections)
+    # --- the frame: where a query starts -------------------------------------
 
-    query = select   # alias
+    def nodes(self, *positional, **named):
+        """A column of nodes, as a frame.
+
+            g.nodes()                     every node, with its type
+            g.nodes("movie")              every movie, in a column called `movie`
+            g.nodes(rec="movie")          the same, under the name the query uses
+            g.nodes(seed=keys)            the nodes someone named
+
+        One variable per call, on purpose: two would be a cross product, and a
+        cross product is never what was meant. Columns meet each other by
+        hopping between them or by joining, both of which say so."""
+        if len(positional) + len(named) > 1:
+            raise TypeError(
+                "nodes(...) makes one column at a time: two would be a cross "
+                "product. Reach the second with hop(...), or join two frames.")
+        if positional:
+            name = value = positional[0]
+        elif named:
+            (name, value), = named.items()
+        else:
+            return self._all_nodes()
+
+        if isinstance(value, str):
+            if value not in self._type_pos:
+                raise ValueError(f"no type {value!r} in this graph; it has: "
+                                 f"{', '.join(sorted(self.types))}")
+            low, high = self.block(value)
+            ids = np.arange(low, high, dtype=np.int32)
+            return Frame(self, {name: ids}, {name: value})
+
+        ids = self.ids_of(value)
+        types = {self.type_of(index) for index in ids.tolist()}
+        single = types.pop() if len(types) == 1 else None
+        return Frame(self, {name: ids}, {name: single})
+
+    def _all_nodes(self):
+        return Frame(self, {"node": np.arange(self.n_nodes, dtype=np.int32),
+                            "type": [self.types[tag] for tag in self._type_tag_of.tolist()]},
+                     {"node": None})
+
+    def edges(self, relation=None, normalized=False):
+        """Every stored edge, or every edge of one relation, as a frame.
+
+        The CSR is already this table -- source, relation, target, weight -- so
+        this is a view of it rather than a copy of it. It is what a query about
+        the edges themselves asks, and what a training run is handed to say which
+        of them it may learn from.
+
+        The relation rides along as an Enum: dictionary-encoded, so naming it on
+        seventy million rows costs a byte each rather than a string each."""
+        sources = self.sources()
+        keep = slice(None)
+        if relation is not None:
+            code = self._relation_code.get(relation)
+            keep = (np.zeros(len(sources), dtype=bool) if code is None
+                    else self.out_rels == code)
+        names = pl.Enum(self.relations) if self.relations else pl.String
+        data = pl.DataFrame({
+            "source": sources[keep],
+            RELATION: pl.Series([self.relations[code]
+                                 for code in self.out_rels[keep].tolist()], dtype=names),
+            "target": self.out_indices[keep],
+            "score": self.weights(normalized)[0][keep],
+        })
+        return Frame(self, data, {"source": None, "target": None})
+
+    def ids_of(self, values):
+        """A set of nodes as an int32 array, however it was named: Keys, source
+        strings, (type, id) pairs, integers, or a frame's node column."""
+        if hasattr(values, "ids"):                       # a Frame
+            return values.ids()
+        if isinstance(values, np.ndarray):
+            return values.astype(np.int32, copy=False)
+        out = []
+        for value in values:
+            index = self.lookup(value) if not isinstance(value, (int, np.integer)) else int(value)
+            if index is not None:
+                out.append(index)
+        return np.asarray(out, dtype=np.int32)
 
     # --- derived, memoized graph facts ---------------------------------------
 
@@ -450,8 +808,8 @@ class Graph:
         return self._cache[key]
 
     def schema(self):
-        """{type: {"columns": set, "relations": set}} -- the schema the Query
-        consults to resolve column-vs-relation and label columns."""
+        """{type: {"columns": set, "relations": set}} -- what this graph holds,
+        for a caller who wants to look before asking."""
         return self.cached("schema", self._build_schema)
 
     def _build_schema(self):
@@ -463,8 +821,5 @@ class Graph:
                                  (self.in_indptr, self.in_rels)):
                 span = rels[int(indptr[lo]):int(indptr[hi])]
                 relations.update(self.relations[c] for c in np.unique(span).tolist())
-            columns = set(self.columns[type_])
-            if self.label.get(type_) is not None:
-                columns.add(LABEL)          # queryable, so the schema advertises it
-            schema[type_] = {"columns": columns, "relations": relations}
+            schema[type_] = {"columns": set(self.columns[type_]), "relations": relations}
         return schema

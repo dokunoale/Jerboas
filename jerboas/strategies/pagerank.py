@@ -16,31 +16,31 @@ class PageRank(Strategy):
     walk rather than a two-hop count.
 
     The walk runs on the graph's undirected adjacency, so mass flows both ways
-    along every stored edge. supports_guidance is on: edge_weight returns the
-    target's rank, so a Greedy engine prefers important nodes.
+    along every stored edge.
+
+    `weighted=True` makes a step's probability proportional to the edge's stored
+    score rather than uniform among the neighbours -- a 5-star rating carries
+    more of the walker than a 1-star one. It reads the normalized weights and
+    not the raw ones: a transition probability cannot be negative, and two
+    relations' scales have to be reconciled before mass can flow between them.
     """
 
-    supports_guidance = True
-
-    def __init__(self, to=None, damping=0.85, iterations=100, tol=1e-6):
+    def __init__(self, to=None, damping=0.85, iterations=100, tol=1e-6, weighted=False):
         self.to = to                    # optional seed set -> personalized (RWR)
         self.damping = damping
         self.iterations = iterations
         self.tol = tol
+        self.weighted = weighted
 
     def fit(self, graph):
-        seeds = tuple(sorted(i for i in (graph.lookup(s) for s in (self.to or ()))
-                             if i is not None))
-        self._ranks = self.cached(graph, ("pagerank", seeds, self.damping, self.iterations),
-                                  lambda: self._power_iteration(graph, seeds))
+        seeds = tuple(sorted(graph.ids_of(self.to or ()).tolist()))
+        self._ranks = self.cached(
+            graph, ("pagerank", seeds, self.damping, self.iterations, self.weighted),
+            lambda: self._power_iteration(graph, seeds))
         return self._ranks
 
-    def edge_weight(self, source, relation, target):
-        return float(self._ranks[target])
-
-    def score(self, query, rows):
-        ranks, col = self._ranks, query.primary_column
-        return [float(ranks[row[col]]) for row in rows]
+    def scores(self, graph, columns):
+        return self._ranks[columns[0]]
 
     def _power_iteration(self, graph, seeds):
         """Power iteration as repeated sparse matrix-vector products.
@@ -54,7 +54,7 @@ class PageRank(Strategy):
         if n == 0:
             return np.zeros(0)
 
-        adjacency = graph.adjacency()
+        adjacency = graph.adjacency("norm" if self.weighted else None)
         outdeg = np.asarray(adjacency.sum(axis=1)).ravel()
         dangling = np.flatnonzero(outdeg == 0)
 

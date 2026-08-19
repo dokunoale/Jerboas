@@ -11,6 +11,11 @@ person where a genre belongs -- and the model learns to tell types apart instead
 of learning the relation. Drawing from the *type block of the true tail* keeps the
 corruption type-correct, so the only way to score it lower is to have learned
 something about the relation itself.
+
+Which edges a run learns from is a `where=` of its own. The graph holds every
+edge it was given; a training job is entitled to a narrower view of it -- and
+that is the honest place for a threshold on a score, because it is a claim about
+this fit, not about what the data contains.
 """
 
 import time
@@ -18,11 +23,52 @@ import time
 import numpy as np
 import torch
 
+from ..frame import RELATION
 
-def triples(graph):
-    """(head, relation, tail) as three parallel arrays, read off the CSR."""
-    heads = np.repeat(np.arange(graph.n_nodes), np.diff(graph.out_indptr))
-    return heads, np.asarray(graph.out_rels), np.asarray(graph.out_indices)
+
+
+def examples(graph, where=None):
+    """The triples a run may learn from, as four parallel arrays.
+
+    With no filter, every stored edge, read straight off the out-CSR -- the CSR
+    *is* the triple store, which is why this library has no dataloader.
+
+    A filter is a frame of edges, because that is what a frame of edges is for:
+
+        train(model, g, where=g.edges("has_interact").filter(v.score >= 3))
+
+    Below a rating of 3 the edge is noise and the model should not see it. Saying
+    it here rather than at load time answers the question for this run only, and
+    leaves the graph still able to say who rated a film at all -- and because the
+    filter is an ordinary frame, "which edges" is a question with a visible
+    answer rather than a marker object.
+    """
+    weights = graph.weights(normalized=True)[0]
+    if where is None:
+        heads = graph.sources()
+        return (heads.astype(np.int64), np.asarray(graph.out_rels),
+                np.asarray(graph.out_indices), weights)
+
+    frame = where.pl if hasattr(where, "pl") else where
+    heads = frame["source"].to_numpy().astype(np.int64)
+    tails = frame["target"].to_numpy().astype(np.int64)
+    codes = {name: code for code, name in enumerate(graph.relations)}
+    rels = np.asarray([codes[name] for name in frame[RELATION].to_list()], dtype=np.int64)
+    scores = frame["score"].to_numpy()
+    low, high = graph.weight_bounds()
+    span = high[rels] - low[rels]
+    scaled = np.where(span > 0, (scores - low[rels]) / np.where(span > 0, span, 1.0), 1.0)
+    return heads, np.asarray(rels), tails, scaled
+
+
+def _describe(where):
+    """The filter as one line of provenance: six months on, a checkpoint should
+    still say which edges it was allowed to see."""
+    if where is None:
+        return ""
+    frame = where.pl if hasattr(where, "pl") else where
+    relations = sorted(set(frame[RELATION].to_list()))
+    return f"{len(frame)} edges of {', '.join(relations)}"
 
 
 def type_bounds(graph):
@@ -37,27 +83,46 @@ def type_bounds(graph):
 
 
 def train(model, graph, epochs=50, batch_size=4096, lr=0.01, device="cpu",
-          seed=42, report=print):
+          seed=42, weighted=True, where=None, report=print):
     """Fit `model` to `graph` in place, and return it.
 
     A batch job, not a pipeline verb: far too slow to sit inside a query's
     fit(), and run once ahead of them all.
+
+    Two ways to tell the run what an edge is worth, and they compose:
+
+        where=g.edges("has_interact").filter(v.score >= 3)   # don't learn from these
+        weighted=True                                    # learn less from weak ones
+
+    `where` is the hard reading, and it is the one that used to live in the
+    loader: below a rating of 3, say, the edge is noise and the model should not
+    see it. `weighted` is the soft one -- each example scaled by its edge's
+    normalized score, which on a graph carrying none is 1.0 everywhere and
+    changes nothing.
     """
     if not model.built:
         model.build(graph)
-    model.meta.update(epochs=epochs, batch_size=batch_size, lr=lr,
-                      device=str(device), sampler="type-aware")
+    model.arrays = None          # the fitted weights, not the ones read out before
     device = torch.device(device)
     model.to(device)
 
-    head, relation, tail = triples(graph)
+    head, relation, tail, weights = examples(graph, where)
     if len(head) == 0:
-        raise ValueError("graph has no edges to train on")
+        raise ValueError("nothing to train on: the graph has no edges"
+                         if where is None else
+                         "nothing to train on: the filter frame is empty")
     low, high = type_bounds(graph)
+
+    model.meta.update(epochs=epochs, batch_size=batch_size, lr=lr,
+                      device=str(device), sampler="type-aware", weighted=weighted,
+                      trained_on=_describe(where) or "every edge",
+                      trained_edges=len(head))
 
     head_t = torch.as_tensor(head, device=device)
     relation_t = torch.as_tensor(relation.astype(np.int64), device=device)
     tail_t = torch.as_tensor(tail.astype(np.int64), device=device)
+    weight_t = (torch.as_tensor(weights, device=device, dtype=torch.float32)
+                if weighted else None)
 
     rng = np.random.default_rng(seed)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -78,6 +143,7 @@ def train(model, graph, epochs=50, batch_size=4096, lr=0.01, device="cpu",
                 head_t[index], relation_t[index], tail_t[index],
                 torch.as_tensor(corrupt_head, device=device),
                 torch.as_tensor(corrupt_tail, device=device),
+                None if weight_t is None else weight_t[index],
             )
             optimizer.zero_grad()
             loss.backward()

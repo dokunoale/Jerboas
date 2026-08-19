@@ -1,17 +1,25 @@
-"""Ranking strategies: the soft, non-deterministic-first scoring layer.
+"""Ranking strategies: the scores a column cannot hold on its own.
 
-Every ranker is a Strategy (core.py): fit() once, score() per run, optional
-edge_weight for guided engines. Where a Condition hard-keeps or drops a row, a
-Strategy orders rows by a learned or computed affinity, and several combine
-(each min-max normalized, then averaged) so a soft signal rewards rather than
-excludes.
+A strategy is what is left when everything a dataframe already does is taken
+away. Sorting by a stored value is `sort`, ranking by a matched edge's weight is
+a column, counting the matches is `group_by(...).agg(...)` -- none of those is a
+strategy any more, and none of them needs to be. What remains is the family of
+scores that have to be computed *from the graph*: a random walk, a
+factorization, a two-hop reachability count, an embedding.
 
-One module per family, because this is the family users extend most:
+    frame.with_columns(pr=PageRank(to=seeds).on("rec").norm(),
+                       kg=TransD.load(path, g, to=seeds).on("rec").norm())
+         .with_columns(score=0.7 * v.pr + 0.3 * v.kg)
 
-    basic                  Score, ExprStrategy, Alphabetical
+Each one names the columns it reads (see core.Strategy.on) instead of guessing
+them from the shape of the query, which is the difference between a strategy
+that knows whose taste it is modelling and one that picks a user out of whatever
+the search happened to walk through.
+
+    connectivity           Connectivity     two-hop reachability from a seed set
+    pagerank               PageRank         random-walk importance, global or personalized
     matrix_factorization   MatrixFactorization, DiffusedMatrixFactorization
-    connectivity           Connectivity
-    pagerank               PageRank
+    weight                 Weight           the weight the data already put on a node
 
 Nodes are integers throughout, which is what makes an embedding table a single
 (N, factors) array a strategy can index directly.
@@ -19,16 +27,13 @@ Nodes are integers throughout, which is what makes an embedding table a single
 fit() means "prepare to score", and is expected to cost milliseconds. A model
 whose training is orders of magnitude slower than that lives in jerboas.models,
 where it is a Strategy too -- fitted by an explicit batch job, then loaded from a
-checkpoint and passed to rank(...) like any other.
+checkpoint and used in a column like any other.
 """
 
-from .basic import Score, ExprStrategy, Alphabetical
 from .connectivity import Connectivity
 from .matrix_factorization import MatrixFactorization, DiffusedMatrixFactorization
 from .pagerank import PageRank
+from .weight import Weight
 
-__all__ = [
-    "Score", "ExprStrategy", "Alphabetical",
-    "MatrixFactorization", "DiffusedMatrixFactorization",
-    "Connectivity", "PageRank",
-]
+__all__ = ["Connectivity", "MatrixFactorization", "DiffusedMatrixFactorization",
+           "PageRank", "Weight"]

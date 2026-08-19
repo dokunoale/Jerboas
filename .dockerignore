@@ -5,7 +5,6 @@
 tests
 benchmark
 checkpoints
-data/movielens/imdb
-data/movielens/ml.ui_train
+data/
 *.md
 !README.md

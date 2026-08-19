@@ -4,9 +4,9 @@ This is the only part of the library that needs torch, and it is optional:
 
     pip install jerboas[torch]
 
-Serving does not need it. Training writes a checkpoint of plain arrays, and
-strategies.Embedding reads it with numpy alone -- so the machine that fits a
-model and the machine that answers queries need not have the same install.
+Serving does not need it. Training writes a checkpoint of plain arrays that a
+loaded model reads with numpy alone -- so the machine that fits a model and the
+machine that answers queries need not have the same install.
 
 Training is not a pipeline verb. It costs orders of magnitude more than a query
 can absorb -- seconds on MovieLens, minutes or more as the graph grows -- so it
@@ -17,10 +17,11 @@ is an explicit batch job, run once, outside any query:
     model = train(TransD(factors=64), graph, epochs=50, device="mps")
     model.save("checkpoints/ml.transd.npz")
 
-and it comes back as a ranking strategy, needing no wrapper:
+and it comes back as a ranking strategy, needing no wrapper -- a column like
+any other:
 
-    g.select(rec, Score()).rank(
-        TransD.load("checkpoints/ml.transd.npz", g, to=seeds)
+    frame.with_columns(
+        score=TransD.load("checkpoints/ml.transd.npz", g, to=seeds).on("rec")
     ).top(10)
 
 `train` is a free function rather than a method because `nn.Module.train()`
@@ -35,7 +36,7 @@ except ModuleNotFoundError as exc:      # pragma: no cover - depends on the inst
         "jerboas.models needs torch, which is an optional dependency.\n"
         "Install it with:  pip install 'jerboas[torch]'\n"
         "Serving a model someone else trained does not need torch -- "
-        "strategies.Embedding reads a checkpoint with numpy."
+        "a loaded checkpoint is read with numpy."
     ) from exc
 
 del _torch
