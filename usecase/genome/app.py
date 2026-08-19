@@ -26,12 +26,11 @@ filter and an aggregate.
 
 from contextlib import asynccontextmanager
 
-import polars as pl
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 import jerboas as jb
-from jerboas import SCORE, reverse, shadow, v
+from jerboas import reverse, v
 
 DATA_DIR = "./data/genome"
 
@@ -109,9 +108,8 @@ def suggest(graph, watchlist, k, strength):
                    # Deduplicated, unlike the score: a tag shared with two of
                    # your films is twice the evidence, and the same word twice
                    # in a list of reasons is a bug.
-                   shared=v.tag.expr.sort_by(pl.col(shadow(SCORE, "rec")),
-                                              descending=True)
-                                    .unique(maintain_order=True).head(5))
+                   shared=v.tag.sort_by(v.rec.score, descending=True)
+                              .unique(maintain_order=True).head(5))
               .top(k)
               .attrs(rec=["title", "year"]))
 

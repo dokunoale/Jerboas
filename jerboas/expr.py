@@ -170,6 +170,14 @@ class _Methods:
     def _call(self, method, *args, **kwargs):
         return _Method(self, method, args, kwargs)
 
+    def __getattr__(self, name):
+        """The rest of the named questions, without a line each. Only the ones
+        in `_NAMED`: an expression is not a polars expression, and pretending
+        otherwise would hand polars a jerboas object to choke on."""
+        if name.startswith("_") or name not in _NAMED:
+            raise AttributeError(name)
+        return lambda *args, **kwargs: _Method(self, name, args, kwargs)
+
     def sum(self):
         return self._call("sum")
 
@@ -391,7 +399,11 @@ class _Method(Expr, _Methods):
                     f"no {self.method}(): ask how many with .count(), or whether any "
                     f"with .is_in(...).")
             return ctx.degree(target)
-        return getattr(target, self.method)(*self.args, **self.kwargs)
+        # the arguments are resolved too, so `v.tag.sort_by(v.rec.score)` needs
+        # no one to know how a confidence is stored
+        args = [_side(one, ctx) for one in self.args]
+        kwargs = {name: _side(one, ctx) for name, one in self.kwargs.items()}
+        return getattr(target, self.method)(*args, **kwargs)
 
     __hash__ = Expr.__hash__
 
@@ -483,7 +495,10 @@ class _Norm(Expr, _Methods):
 
 # the methods a name may be called as, beyond the three with their own nodes
 _NAMED = ("sum", "count", "n_unique", "mean", "min", "max", "std", "first", "last",
-          "abs", "alias", "is_null", "is_not_null", "is_between")
+          "abs", "alias", "is_null", "is_not_null", "is_between",
+          # the ones an aggregate reaches for, so a group can keep its evidence
+          # in the order the evidence deserves
+          "sort_by", "unique", "head", "tail", "cast", "fill_null", "round")
 
 
 def _reads(thing):

@@ -318,6 +318,23 @@ def test_raw_polars_still_passes_through(small_graph):
     assert len(frame.filter(v.movie.year.expr >= 1999)) == 1
 
 
+def test_a_methods_arguments_are_resolved_too(small_graph):
+    """`v.tag.sort_by(v.rec.score)` needs no one to know how a confidence is
+    stored -- which is the difference between an abstraction and a convention."""
+    ranked = (small_graph.nodes(user="user").hop(rec="has_interact")
+              .group_by(v.user)
+              .agg(best=v.rec.sort_by(v.rec.score, descending=True).first()))
+    seen = dict(zip(names(ranked, "user"),
+                    [str(small_graph.key(one)) for one in ranked.pl["best"]]))
+    assert seen["user.0"] == "movie.0"        # rated 5, against movie.1's 1
+    assert seen["user.1"] == "movie.1"        # rated 4, against movie.2's 2
+
+
+def test_only_the_named_methods_pass_through(small_graph):
+    with pytest.raises(AttributeError):
+        v.rec.score.some_polars_method_we_do_not_wrap()
+
+
 def test_signals_still_combine_by_arithmetic(small_graph):
     frame = (small_graph.nodes("movie")
              .with_columns(pr=PageRank().on("movie").norm())
