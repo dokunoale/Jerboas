@@ -12,9 +12,9 @@ import pytest
 
 import jerboas as jb
 
-from jerboas import (Connectivity, DiffusedMatrixFactorization, Graph, Key,
-                     MatrixFactorization, PageRank, Weight, col, concat, reverse,
-                     v)
+from jerboas import (Connectivity, DiffusedMatrixFactorization, Fuzzy, Graph,
+                     Key, MatrixFactorization, PageRank, Semantic, Weight, Words,
+                     col, concat, reverse, v)
 
 
 def names(frame, column=None):
@@ -693,7 +693,7 @@ def test_like_survives_a_typo(small_graph):
 
 
 def test_like_admits_k_matches_per_needle(small_graph):
-    found = small_graph.nodes("person").filter(v.person.label.like("Director", k=2))
+    found = small_graph.nodes("person").filter(v.person.label.like("Director", rule=Fuzzy(k=2)))
     assert len(found) == 2
 
 
@@ -737,7 +737,7 @@ def test_a_column_nothing_searched_answers_nothing(small_graph):
 def test_the_needle_groups_the_candidates(small_graph):
     """Which is what a set of names needs: several matches each, told apart."""
     found = (small_graph.nodes("movie").labels("movie")
-             .filter(v.movie.label.like(["Alpha", "Gamma"], k=2))
+             .filter(v.movie.label.like(["Alpha", "Gamma"], rule=Fuzzy(k=2)))
              .with_columns(asked=v.movie.label.needle))
     counted = dict(found.group_by(v.asked).agg(n=v.movie.count()).pl.rows())
     assert counted == {"Alpha": 1, "Gamma": 1}
@@ -748,7 +748,7 @@ def test_a_row_two_needles_judge_alike_goes_to_the_first(small_graph):
     alternative, admitting the row twice, would make a set of names return more
     rows than it has answers."""
     found = (small_graph.nodes("person").labels("person")
-             .filter(v.person.label.like(["Director", "Xavier"], k=2))
+             .filter(v.person.label.like(["Director", "Xavier"], rule=Fuzzy(k=2)))
              .with_columns(asked=v.person.label.needle))
     assert len(found) == 2                                 # not three
     assert set(found.pl["asked"].to_list()) == {"Director"}
@@ -1373,7 +1373,7 @@ def test_a_list_column_is_a_vector_and_not_an_attribute(vector_graph):
 
 def test_near_admits_the_k_nearest(vector_graph):
     found = vector_graph.nodes(chunk="chunk").filter(
-        v.chunk.embedding.near([1.0, 0.0], k=2))
+        v.chunk.embedding.like([1.0, 0.0], rule=Semantic(k=2)))
     assert sorted(names(found)) == ["chunk.0", "chunk.1"]
 
 
@@ -1381,46 +1381,50 @@ def test_near_keeps_the_cosine_as_the_columns_confidence(vector_graph):
     """The same shape as `like` over text, and for the same reason: admission
     and weight are one measure."""
     found = (vector_graph.nodes(chunk="chunk")
-             .filter(v.chunk.embedding.near([1.0, 0.0], k=2))
+             .filter(v.chunk.embedding.like([1.0, 0.0], rule=Semantic(k=2)))
              .with_columns(sim=v.chunk.embedding.score)
              .sort("sim", descending=True))
     assert found.pl["sim"].to_list() == [pytest.approx(1.0), pytest.approx(0.994, abs=1e-3)]
 
 
 def test_the_opposite_direction_is_no_confidence_rather_than_negative(vector_graph):
-    """Cosine below zero is not a weaker answer, it is the other way."""
+    """Cosine below zero is not a weaker answer, it is the other way -- so a row
+    facing away is not admitted at all rather than admitted at nothing."""
     found = (vector_graph.nodes(chunk="chunk")
-             .filter(v.chunk.embedding.near([1.0, 0.0], cutoff=0.0))
+             .filter(v.chunk.embedding.like([1.0, 0.0], rule=Semantic(cutoff=0.0)))
              .with_columns(sim=v.chunk.embedding.score))
-    assert min(found.pl["sim"].to_list()) == 0.0
-    assert "chunk.3" in names(found)                  # admitted at zero, not below
+    assert min(found.pl["sim"].to_list()) > 0.0
+    assert "chunk.3" not in names(found)              # it points the other way
 
 
 def test_a_cutoff_narrows_without_a_k(vector_graph):
     found = vector_graph.nodes(chunk="chunk").filter(
-        v.chunk.embedding.near([1.0, 0.0], cutoff=0.5))
+        v.chunk.embedding.like([1.0, 0.0], rule=Semantic(cutoff=0.5)))
     assert sorted(names(found)) == ["chunk.0", "chunk.1"]
 
 
 def test_several_query_vectors_are_several_questions(vector_graph):
-    """A row answers whichever it answers best."""
+    """A row answers whichever it answers best, and says which."""
     found = (vector_graph.nodes(chunk="chunk")
-             .filter(v.chunk.embedding.near([[1.0, 0.0], [0.0, 1.0]], k=3))
-             .with_columns(sim=v.chunk.embedding.score))
+             .filter(v.chunk.embedding.like([[1.0, 0.0], [0.0, 1.0]], rule=Semantic(k=3)))
+             .with_columns(sim=v.chunk.embedding.score,
+                           asked=v.chunk.embedding.needle))
     assert set(names(found)) == {"chunk.0", "chunk.1", "chunk.2"}
     assert max(found.pl["sim"].to_list()) == pytest.approx(1.0)
+    answers = dict(zip(names(found), found.pl["asked"].to_list()))
+    assert answers["chunk.2"] == 1                    # the second question
 
 
-def test_near_needs_a_vector_column(vector_graph):
-    with pytest.raises(ValueError, match="no vector column 'text'"):
-        vector_graph.nodes(chunk="chunk").filter(v.chunk.text.near([1.0, 0.0]))
+def test_a_vector_rule_needs_a_vector_column(vector_graph):
+    with pytest.raises(ValueError, match="not a vector column"):
+        vector_graph.nodes(chunk="chunk").filter(v.chunk.text.like([1.0, 0.0], rule=Semantic()))
 
 
-def test_near_pushes_into_a_hop(vector_graph):
+def test_a_vector_rule_pushes_into_a_hop(vector_graph):
     """Being a condition about the node just reached, it is applied before the
     rows are built, like any other."""
     walked = (vector_graph.nodes(chunk="chunk").head(1)
-              .hop(rec="follows").filter(v.rec.embedding.near([0.9, 0.1], k=1)))
+              .hop(rec="follows").filter(v.rec.embedding.like([0.9, 0.1], rule=Semantic(k=1))))
     assert names(walked, "rec") == ["chunk.1"]
 
 
@@ -1587,7 +1591,7 @@ def covers():
 
 def _candidates(graph, titles):
     return (graph.nodes(seed="song")
-            .filter(v.seed.name.like(titles, k=4))
+            .filter(v.seed.name.like(titles, rule=Fuzzy(k=4)))
             .with_columns(asked=v.seed.name.needle))
 
 
@@ -1610,7 +1614,7 @@ def test_with_nothing_connected_the_frames_order_decides(covers):
     replacement for it."""
     candidates = _candidates(covers, ["A", "B"])
     # `written_by` does not exist here, so nothing meets anything
-    lonely = covers.nodes(seed="song").filter(v.seed.name.like(["A"], k=4)) \
+    lonely = covers.nodes(seed="song").filter(v.seed.name.like(["A"], rule=Fuzzy(k=4))) \
         .with_columns(asked=v.seed.name.needle)
     assert len(lonely.coherent(by=v.asked, through=reverse("holds"))) == 1
     reversed_order = candidates.sort("seed", descending=True)
@@ -1632,3 +1636,97 @@ def test_the_connection_can_be_counted_instead_of_met(covers):
         assert len(chosen) == 2, way
     with pytest.raises(ValueError, match="unknown connection"):
         candidates.coherent(by=v.asked, through=reverse("holds"), connection="x")
+
+
+# --- the rule is what a search measures with ---------------------------------
+
+def test_words_tells_a_word_from_a_substring(tmp_path):
+    """`Toxicity` holds the characters of `Toxic` and none of its words, which
+    is the distinction a search over titles needs."""
+    attrs = tmp_path / "w.song"
+    attrs.write_text("id\tname\n0\tToxic\n1\tToxicity\n2\tToxic Love\n")
+    edges = tmp_path / "w.by"
+    edges.write_text("source\ttarget\nsong.0\tartist.0\nsong.1\tartist.0\nsong.2\tartist.0\n")
+    graph = Graph(edges=[str(edges)], attrs=[str(attrs)])
+    songs = graph.nodes(song="song")
+
+    by_words = songs.filter(v.song.name.like("Toxic", rule=Words(k=3)))
+    assert sorted(names(by_words)) == ["song.0", "song.2"]      # not Toxicity
+    by_characters = songs.filter(v.song.name.like("Toxic", rule=Fuzzy(k=3)))
+    assert sorted(names(by_characters)) == ["song.0", "song.1", "song.2"]
+
+
+def test_words_scores_how_much_of_the_needle_is_held(small_graph):
+    found = (small_graph.nodes("person").labels("person")
+             .filter(v.person.label.like("Xavier Director", rule=Words(k=2)))
+             .with_columns(share=v.person.label.score))
+    held = dict(zip(names(found), found.pl["share"].to_list()))
+    assert held["person.0"] == 1.0                    # both words
+    assert held["person.1"] == 0.5                    # only `Director`
+
+
+def test_words_falls_back_when_no_row_holds_the_word(small_graph):
+    """A misspelling holds no word of anything, and characters are all that is
+    left -- which is what keeps a typo working."""
+    found = (small_graph.nodes("person").labels("person")
+             .filter(v.person.label.like("Xavir Diretor", rule=Words(k=1))))
+    assert names(found) == ["person.0"]
+
+
+def test_words_falls_back_when_the_column_was_not_indexed(small_graph):
+    """A computed column has no index behind it, and the rule says so by
+    answering anyway rather than answering less well in silence."""
+    found = (small_graph.nodes("movie").attrs(movie="title")
+             .with_columns(shouted=pl.col("movie.title").str.to_uppercase())
+             .filter(col("shouted").like("ALPHA", rule=Words(k=1))))
+    assert names(found) == ["movie.0"]
+
+
+def test_near_is_like_without_the_thing_itself(small_graph):
+    """The k closest that are not the question. A remaster of a song is that
+    song, so a perfect score is what `near` drops."""
+    people = small_graph.nodes("person").labels("person")
+    like = people.filter(v.person.label.like("Xavier Director", rule=Words(k=2)))
+    near = people.filter(v.person.label.near("Xavier Director", rule=Words(k=2)))
+    assert names(like) == ["person.0", "person.1"]
+    assert names(near) == ["person.1"]                # the other Director
+
+
+def test_near_counts_its_k_after_dropping_the_identical(tmp_path):
+    """`near` asks for k answers, not for k minus however many were the
+    question."""
+    attrs = tmp_path / "n.song"
+    attrs.write_text("id\tname\n0\tToxic\n1\tToxic Love\n2\tToxic Rain\n")
+    edges = tmp_path / "n.by"
+    edges.write_text("source\ttarget\nsong.0\tartist.0\nsong.1\tartist.0\n"
+                     "song.2\tartist.0\n")
+    graph = Graph(edges=[str(edges)], attrs=[str(attrs)])
+    songs = graph.nodes(song="song")
+    assert names(songs.filter(v.song.name.like("Toxic", rule=Words(k=1)))) == ["song.0"]
+    near = songs.filter(v.song.name.near("Toxic", rule=Words(k=1)))
+    assert len(near) == 1 and names(near) != ["song.0"]
+
+
+def test_near_over_vectors_drops_the_query_itself(vector_graph):
+    rows = vector_graph.nodes(chunk="chunk")
+    like = rows.filter(v.chunk.embedding.like([1.0, 0.0], rule=Semantic(k=2)))
+    near = rows.filter(v.chunk.embedding.near([1.0, 0.0], rule=Semantic(k=2)))
+    assert "chunk.0" in names(like)                   # the vector itself
+    assert "chunk.0" not in names(near)
+
+
+def test_a_rule_is_the_extension_point(small_graph):
+    """One verb, whatever measure: what a rule answers is which rows, how close,
+    and to which needle, and the query does not change with the measure."""
+    from jerboas import Rule
+
+    class First(Rule):
+        def matches(self, search, needles, exclusive=False):
+            return {0: (0.5, needles[0])}
+
+    found = (small_graph.nodes("movie").labels("movie")
+             .filter(v.movie.label.like("whatever", rule=First()))
+             .with_columns(score=v.movie.label.score, asked=v.movie.label.needle))
+    assert names(found) == ["movie.0"]
+    assert found.pl["score"].to_list() == [0.5]
+    assert found.pl["asked"].to_list() == ["whatever"]

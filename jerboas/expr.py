@@ -453,62 +453,37 @@ class _In(Expr, _Methods):
 
 
 class _Like(Expr, _Methods):
-    """Graded membership over a text column: the search box, as a condition.
+    """Graded membership over a column: the search box, as a condition.
 
-    Admits the `k` stored values closest to each needle rather than a region
-    around them, so a fragment finds the whole, a typo still lands, and the
-    empty needle admits nothing. The measure that decided admission is not
-    thrown away -- it becomes the column's confidence, so `v.person.label.score`
-    is how close each surviving row was, and the two can never disagree because
-    they are one computation."""
+    What counts as close is the `rule` (see rules.py) -- characters, whole
+    words, vectors -- and every rule answers the same three things: which rows,
+    how close, and to which needle. So the measure changes and the query does
+    not.
 
-    __slots__ = ("target", "needles", "k", "cutoff")
+    Admission and weight are one computation, which is what keeps them from
+    disagreeing: the closeness becomes the column's confidence, and which needle
+    each row answers becomes its `needle`.
 
-    def __init__(self, target, needles, k=1, cutoff=0.6):
+    `exclusive` is `near`: the closest that are not the thing itself. What that
+    means is the rule's to say, and each of them says a perfect score -- a
+    remaster of a song is that song."""
+
+    __slots__ = ("target", "needles", "rule", "exclusive")
+
+    def __init__(self, target, needles, rule=None, exclusive=False):
         self.target = target
-        self.needles = [needles] if isinstance(needles, (str, bytes)) else list(needles)
-        self.k = k
-        self.cutoff = cutoff
+        self.needles = needles
+        self.rule = rule
+        self.exclusive = exclusive
 
     def reads(self):
         return _reads(self.target)
 
     def resolve(self, ctx):
         if not isinstance(self.target, Col):
-            raise TypeError("like(...) reads a column of text: name one, "
-                            "`v.person.label.like(...)`")
-        return ctx.like(self.target, self.needles, self.k, self.cutoff)
-
-    __hash__ = Expr.__hash__
-
-
-class _Near(Expr, _Methods):
-    """Nearness over a vector column: the search box, for embeddings.
-
-    The same shape as `like` over text, and for the same reason -- admission
-    and weight are one measure. It admits the `k` nearest rows to each query
-    vector and keeps the cosine as the column's confidence, so
-    `v.chunk.embedding.score` is how near each surviving row was.
-
-    Cosine below zero is not a weaker answer, it is the opposite direction, so
-    it reads as no confidence at all rather than as a negative one."""
-
-    __slots__ = ("target", "query", "k", "cutoff")
-
-    def __init__(self, target, query, k=None, cutoff=0.0):
-        self.target = target
-        self.query = query
-        self.k = k
-        self.cutoff = cutoff
-
-    def reads(self):
-        return _reads(self.target)
-
-    def resolve(self, ctx):
-        if not isinstance(self.target, Col):
-            raise TypeError("near(...) reads a vector column: name one, "
-                            "`v.chunk.embedding.near(query)`")
-        return ctx.near(self.target, self.query, self.k, self.cutoff)
+            raise TypeError("like(...) reads a column: name one, "
+                            "`v.person.name.like(...)`")
+        return ctx.like(self.target, self.needles, self.rule, self.exclusive)
 
     __hash__ = Expr.__hash__
 
@@ -545,7 +520,7 @@ _NAMED = ("sum", "count", "n_unique", "mean", "min", "max", "std", "first", "las
 _SPECIAL.update(is_in=lambda target, values: _In(target, values),
                 contains=lambda target, text: _Contains(target, text),
                 like=lambda target, *a, **k: _Like(target, *a, **k),
-                near=lambda target, *a, **k: _Near(target, *a, **k),
+                near=lambda target, *a, **k: _Like(target, *a, exclusive=True, **k),
                 norm=lambda target: _Norm(target))
 
 

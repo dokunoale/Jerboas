@@ -11,7 +11,7 @@ can look at.
 
 ```python
 import jerboas as jb
-from jerboas import v, PageRank
+from jerboas import v, PageRank, Words
 
 g = jb.Graph(kg="data/example/example.kg",
              edges=["data/example/example.has_interact"],
@@ -20,7 +20,7 @@ g = jb.Graph(kg="data/example/example.kg",
              readable={"song": "name", "artist": "name",
                        "author": "name", "genre": "name"})
 
-seeds = g.nodes(artist="artist").filter(v.artist.label.like("Golden", k=3))
+seeds = g.nodes(artist="artist").filter(v.artist.label.like("Golden", rule=Words(k=3)))
 
 (g.nodes(seed=seeds).hop(song="~performed_by")
    .with_columns(score=PageRank(to=seeds).on("song"))
@@ -174,55 +174,61 @@ Without that rule a method on the class would win the attribute lookup and
 `v.person.name` would silently mean something else — which is the worst way for
 a query language to be wrong, since it returns an answer.
 
-## Nearness is the same idea, over vectors
-
-A column of lists in an attributes frame is a **vector**, not an attribute — the
-dtype says which — kept as one `(n, d)` float32 block per type. What a query asks
-of one is nearness, which is graded membership again:
-
-```python
-g.nodes(chunk="chunk").filter(v.chunk.embedding.near(query, k=50))
-                      .sort(v.chunk.embedding.score, descending=True)
-```
-
-Same three properties as `like`: it admits the k nearest rather than a region,
-the cosine becomes the column's confidence, and the two cannot disagree because
-they are one computation. Several query vectors are several questions, and a row
-answers whichever it answers best. A cosine below zero is not a weaker answer but
-the opposite direction, so it reads as no confidence rather than a negative one.
-
-The search is exact — a matmul against a few hundred thousand rows is
-milliseconds, and there is nothing to be wrong about. An index belongs behind the
-same expression later, where "approximate" shows up as a lower confidence rather
-than as a different API.
-
-## Membership is graded, and the measure is kept
+## Membership is graded, and the rule is yours
 
 A filter answers *yes* or *no*. `like` answers *how much*, in `[0, 1]`, and that
 single idea is what the library is built around.
 
 ```python
-g.nodes("person").filter(v.person.label.like("tarantino"))
+.filter(v.person.name.like(names, rule=Fuzzy(k=3)))           # characters
+.filter(v.song.name.like(titles, rule=Words(k=8)))            # whole words
+.filter(v.chunk.embedding.like(query, rule=Semantic(k=50)))   # vectors
 ```
 
-A set of strings is a **search box, not a filter**: `like` admits the `k` values
-closest to each needle rather than a region around them. So a fragment finds the
-whole (`"tarantino"` → *Quentin Tarantino*), a typo still lands (`"George Lukas"`
-→ *George Lucas*), and asking for nothing returns nothing.
+One verb, three measures, and the same three answers on the other side:
+`v.x.score` is how close, `v.x.needle` is to which of the things asked for, and
+the rows admitted are exactly the ones a ranking would have put on top. A
+service retrieving over text and one retrieving over embeddings write the same
+query.
 
-It is a condition like any other, so it goes in `filter` — but the measure that
-decided admission is not thrown away. It becomes the **confidence of the column
-it judged**:
+| rule | what is close | |
+|---|---|---|
+| `Fuzzy` | characters — a fragment finds the whole, a typo still lands | reads every value |
+| `Words` | whole words, graded by how many of the needle's a value holds | reads the graph's index |
+| `Semantic` | the cosine, clipped at zero — below it is the other direction, not a weaker answer | one matmul |
+
+`Words` is the one that can tell `Toxic` from `Toxicity` — one holds the other's
+characters and none of its words — while `Wonderwall - Remastered` still holds
+all of `Wonderwall`. It reads an inverted index the graph builds once per column
+and memoizes, so a search costs the rows that match rather than the rows that
+exist: on the Spotify use case, **0.17 s a request against 1.2 s**. Where no
+index applies — a computed column, a variable of no single type, a needle no row
+holds a word of — it falls back to `Fuzzy` rather than answering less well in
+silence.
+
+Writing another is a class with one method, which is why the family is open:
 
 ```python
-(g.nodes("person")
-   .filter(v.person.label.like("tarantino", k=3))
-   .with_columns(closeness=v.person.label.score)
-   .sort(v.person.label.score, descending=True))
+class First(Rule):
+    def matches(self, search, needles, exclusive=False):
+        return {0: (0.5, needles[0])}       # {row: (closeness, needle)}
 ```
 
-Admission and weight are one computation, so they cannot disagree — the rows
-that come back are exactly the ones a ranking would have put on top.
+The division of labour is the one `Strategy` follows for ranking. The **measure**
+uses whatever it must — an index, a matmul, difflib — because a posting list is
+not a frame operation and pretending otherwise would mean scanning. The
+**selection** is the library's own vocabulary.
+
+### `near` is the same verb, exclusively
+
+```python
+.filter(v.song.name.near(title, rule=Words(k=5)))
+```
+
+The k closest that are *not* the thing itself. What "the thing itself" means is
+the rule's to say, and each of these says a perfect score — a remaster of a song
+is that song. The k are counted after it is dropped, since `near` asks for k
+answers rather than for k minus however many were the question.
 
 ## Every column has a confidence
 
@@ -251,7 +257,7 @@ keeps one candidate per name — the combination that keeps the most company:
 
 ```python
 (g.nodes(seed="song")
-   .filter(v.seed.name.like(["Wonderwall", "Come Pick Me Up"], k=8))
+   .filter(v.seed.name.like(["Wonderwall", "Come Pick Me Up"], rule=Words(k=8)))
    .with_columns(asked=v.seed.name.needle, seen=v.seed.contains.count())
    .sort("seen", descending=True)                  # the fallback, when nothing connects
    .coherent(by=v.asked, through=reverse("contains")))
@@ -925,7 +931,8 @@ jerboas/
   expr.py         v / col -- names, resolved by the frame that has the graph
   resolve.py      a hop that has not built its rows, and what resolves a name
   optimize.py     deferring a walk so its cost has a ceiling
-  fuzzy.py        graded membership over a text column
+  rules.py        Fuzzy / Words / Semantic -- what a search measures with
+  fuzzy.py        character similarity, the measure Fuzzy is written in terms of
   columns.py      typed, nullable attribute columns
   keys.py         Key -- a node, outside the frame
   checkpoint.py   storing a trained model, and rebinding it by name

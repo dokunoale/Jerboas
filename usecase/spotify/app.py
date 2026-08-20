@@ -33,7 +33,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 import jerboas as jb
-from jerboas import DiffusedMatrixFactorization, reverse, v
+from jerboas import DiffusedMatrixFactorization, Words, reverse, v
 
 DATA_DIR = os.environ.get("SPOTIFY_DIR", "./data/spotify/graph-100k")
 
@@ -123,7 +123,7 @@ def _by_title(graph, titles):
     `v.seed.name.needle` says which title each candidate answers, so what would
     be a loop over names is a column."""
     return (graph.nodes(seed="song")
-            .filter(v.seed.name.like(titles, k=TIES))
+            .filter(v.seed.name.like(titles, rule=Words(k=TIES)))
             .with_columns(asked=v.seed.name.needle.cast(pl.String),
                           closeness=v.seed.name.score,
                           seen=v.seed.contains.count(),
@@ -147,7 +147,7 @@ def _by_performer(graph, wanted):
     if not pins:
         return _no_candidates(graph)
     people = (graph.nodes(artist="artist")
-              .filter(v.artist.name.like(list(pins), k=PERFORMERS))
+              .filter(v.artist.name.like(list(pins), rule=Words(k=PERFORMERS)))
               .with_columns(who=v.artist.name.needle))
     if not len(people):
         return _no_candidates(graph)

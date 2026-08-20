@@ -26,7 +26,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 import jerboas as jb
-from jerboas import PageRank, TransD, concat, train, v
+from jerboas import PageRank, TransD, Words, concat, train, v
 
 DATA_DIR = "./data/movielens"
 CHECKPOINT = "./checkpoints/ml.transd.npz"
@@ -60,7 +60,7 @@ def seeds(graph, wanted):
         asked = [name.strip() for name in (names or []) if name and name.strip()]
         if asked:
             frames.append(graph.nodes(seed=type_)
-                          .filter(v.seed.label.like(asked))
+                          .filter(v.seed.label.like(asked, rule=Words()))
                           .select("seed"))
     return concat(*frames) if frames else None
 

@@ -1,4 +1,9 @@
-"""Graded membership over a text column: the one filter that is also a score.
+"""Character similarity: the measure `rules.Fuzzy` is written in terms of.
+
+The rule is the interface (see rules.py); this is one implementation of one
+measure, kept apart because difflib's own shape -- indexing the needle once,
+skipping the quadratic work under a cutoff -- is the whole of what makes it
+usable on a column of any size.
 
 A set of strings is a search box, not a filter. `frame.like(v.person.name,
 ["tarantino"])` admits the values closest to the needle rather than the ones
@@ -12,7 +17,17 @@ of quietly becoming a ranking term nobody wrote.
 """
 
 import heapq
+import re
 from difflib import SequenceMatcher
+
+# what separates one word from the next: everything that is not a letter or a
+# digit, so `Wonderwall - Remastered` is two words and `Sgt. Pepper's` is three
+_WORDS = re.compile(r"[^\w]+", re.UNICODE)
+
+
+def words_of(text):
+    """The words of one value, lowercased and in order."""
+    return [word for word in _WORDS.split(str(text).lower()) if word]
 
 
 def scorer(needle, cutoff=0.0):
@@ -41,7 +56,7 @@ def scorer(needle, cutoff=0.0):
     return closeness
 
 
-def closest(needle, texts, k, cutoff):
+def closest(needle, texts, k, cutoff, exclusive=False):
     """The k rows closest to one needle, as [(row, similarity)].
 
     A needle that is literally present is already as close as anything can be, so
@@ -55,15 +70,17 @@ def closest(needle, texts, k, cutoff):
     whatever loaded first, which is a coin toss wearing the shape of a result."""
     text_needle = str(needle).lower()
     contained = sorted((len(text), row) for row, text in texts
-                       if text_needle and text_needle in text)
+                       if text_needle and text_needle in text
+                       and not (exclusive and text == text_needle))
     if len(contained) >= k:
         return [(row, 1.0) for _length, row in contained[:k]]
     close = scorer(text_needle, cutoff)
-    scored = ((close(text), row) for row, text in texts)
+    scored = ((close(text), row) for row, text in texts
+              if not (exclusive and text == text_needle))
     return [(row, score) for score, row in heapq.nlargest(k, scored) if score >= cutoff]
 
 
-def best(needles, texts, k, cutoff):
+def best(needles, texts, k, cutoff, exclusive=False):
     """The k closest rows to each needle, as {row: (closeness, needle)}.
 
     Folded: a row admitted by two needles is admitted once, keeping the higher
@@ -78,7 +95,7 @@ def best(needles, texts, k, cutoff):
     answers."""
     found = {}
     for needle in needles:
-        for row, score in closest(needle, texts, k, cutoff):
+        for row, score in closest(needle, texts, k, cutoff, exclusive):
             if score > found.get(row, (0.0, None))[0]:
                 found[row] = (score, needle)
     return found

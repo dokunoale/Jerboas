@@ -19,9 +19,9 @@ confidence.
 import numpy as np
 import polars as pl
 
-from . import fuzzy
 from .expr import (ATTR, NEEDLE, PROVENANCE, REL, SCORE, TYPE, Relation,
                    path_of, shadow)
+from .rules import Search, default_rule
 
 
 class Pending:
@@ -110,8 +110,8 @@ class Resolver:
             self.extra[name] = pl.Series(name, admissible[ids])
         return pl.col(name)
 
-    def like(self, column, needles, k, cutoff):
-        """The k closest rows to each needle, and what the measure found kept.
+    def like(self, column, needles, rule, exclusive):
+        """What the rule admitted, and what it found kept.
 
         Two things, and they cost one computation: the closeness becomes the
         column's confidence, so admission and weight cannot disagree; and which
@@ -120,69 +120,29 @@ class Resolver:
         the answer is the same for every row, so it is a value rather than a
         column."""
         name = str(column)
-        values = self._values(name)
-        texts = [(row, str(value).lower()) for row, value in enumerate(values)
-                 if value is not None]
-        found = fuzzy.best(needles, texts, k, cutoff)
+        asked = _needles(needles)
+        search = Search(self.frame, name, lambda: self._values(name))
+        found = (rule or default_rule()).matches(search, asked, exclusive)
 
-        closeness = np.zeros(len(values))
-        asked = [None] * len(values)
+        height = self.frame._df.height
+        closeness = np.zeros(height)
+        answered = [None] * height
         for row, (score, needle) in found.items():
             closeness[row] = score
-            asked[row] = needle
+            answered[row] = needle
         self.keep[shadow(SCORE, name)] = pl.Series(shadow(SCORE, name), closeness)
-        if len(needles) == 1:
-            self.constants[(NEEDLE, name)] = needles[0]
-        else:
+        if len(asked) == 1:
+            self.constants[(NEEDLE, name)] = asked[0]
+        elif _nameable(asked):
             self.keep[shadow(NEEDLE, name)] = pl.Series(
-                shadow(NEEDLE, name), asked, dtype=pl.Enum(list(dict.fromkeys(needles))))
+                shadow(NEEDLE, name), answered,
+                dtype=pl.Enum([str(one) for one in dict.fromkeys(asked)]))
+        else:
+            self.keep[shadow(NEEDLE, name)] = pl.Series(shadow(NEEDLE, name), answered)
 
         admitted = f"{name}.__like__"
         self.extra[admitted] = pl.Series(admitted, closeness > 0)
         return pl.col(admitted)
-
-    def near(self, column, query, k, cutoff):
-        """The rows nearest a query vector, and the cosine kept as the column's
-        confidence.
-
-        Scored as one matmul against the type's unit block rather than a
-        distance per row, which is what makes an exact search worth having
-        before an approximate one: a few hundred thousand rows are
-        milliseconds, and there is nothing to be wrong about."""
-        var, _, name = str(column).partition(".")
-        if var not in self.frame.vars:
-            raise ValueError(f"{var!r} is not a column of nodes, so it has no vectors")
-        type_ = self.frame.vars[var]
-        if type_ is None:
-            raise ValueError(
-                f"{var!r} holds nodes of no single type, so which type's {name!r} "
-                f"vectors to read is a question: narrow it with v.{var}.type first.")
-        block = self.frame.graph.unit(type_, name)
-        if block is None:
-            raise ValueError(
-                f"{type_} has no vector column {name!r}; it has: "
-                f"{', '.join(sorted(self.frame.graph.vectors.get(type_, {}))) or 'none'}")
-
-        low = self.frame.graph.block(type_)[0]
-        rows = self.frame._df[var].to_numpy() - low
-        queries = _unit_queries(query)
-        # the best any query vector says of each row: several needles are
-        # several questions, and a row answers whichever it answers best
-        similarity = (block[rows] @ queries.T).max(axis=1)
-        similarity = np.clip(similarity, 0.0, 1.0)
-
-        admitted = similarity >= cutoff
-        if k is not None and admitted.sum() > k:
-            best = np.argpartition(-np.where(admitted, similarity, -1.0), k)[:k]
-            keep = np.zeros(len(similarity), dtype=bool)
-            keep[best] = True
-            admitted &= keep
-        name_of_shadow = shadow(SCORE, str(column))
-        self.keep[name_of_shadow] = pl.Series(name_of_shadow,
-                                              np.where(admitted, similarity, 0.0))
-        flag = f"{column}.__near__"
-        self.extra[flag] = pl.Series(flag, admitted)
-        return pl.col(flag)
 
     def signal(self, signal):
         """A strategy's score, as a literal column the rest of an expression can
@@ -392,3 +352,21 @@ def _run(frame, groups, predicates, budget):
     # one: the answer exists once rather than twice, which on a walk whose
     # result is most of its cost is the difference between finishing and not
     return pl.concat(parts, how="vertical", rechunk=False)
+
+
+def _needles(needles):
+    """One needle or several. A string is one thing and a vector is one thing;
+    neither is a sequence of needles, however sequence-shaped it looks."""
+    if isinstance(needles, (str, bytes)):
+        return [needles]
+    if isinstance(needles, np.ndarray):
+        return [needles] if needles.ndim == 1 else list(needles)
+    items = list(needles)
+    if items and isinstance(items[0], (int, float, np.integer, np.floating)):
+        return [items]                     # one vector, written out
+    return items
+
+
+def _nameable(needles):
+    """Can these be the categories of an Enum? A query vector cannot."""
+    return all(isinstance(one, str) for one in needles)

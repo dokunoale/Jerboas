@@ -30,7 +30,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 import jerboas as jb
-from jerboas import reverse, v
+from jerboas import Words, reverse, v
 
 DATA_DIR = "./data/genome"
 
@@ -40,35 +40,21 @@ DATA_DIR = "./data/genome"
 # because the honest answer depends on how broad an answer you want.
 STRENGTH = 0.9
 
-# leading articles MovieLens files at the end of a title (see filed_as)
-ARTICLES = ("the", "a", "an", "le", "la", "les", "il", "lo", "der", "die", "das")
-
-
-def filed_as(title):
-    """A title the way MovieLens files it: the leading article goes to the end,
-    so *The Matrix* is stored as *Matrix, The*.
-
-    Worth the four lines. `like` treats a title that contains the needle as a
-    perfect match, so "The Matrix" untranslated lands on *The Matrix Revisited*
-    -- a documentary -- while the film itself is left to come back as its own
-    top suggestion."""
-    article, _, rest = title.partition(" ")
-    if rest and article.lower() in ARTICLES:
-        return f"{rest}, {article}"
-    return title
-
-
 def resolve(graph, titles):
     """Watchlist entries as a frame of films, one best match each.
 
     A watchlist is typed by a person, so it is matched the way a search box
     matches: `like` admits the closest stored title rather than a region around
     it, and what it landed on comes back in the response so a wrong guess is
-    visible rather than silent."""
-    wanted = [filed_as(title.strip()) for title in titles if title and title.strip()]
+    visible rather than silent.
+
+    Matched by words, which is what lets a person write `The Matrix` for a
+    catalogue that files it as `Matrix, The`. Four lines of moving the article
+    to the end used to live here, and words do not care where it went."""
+    wanted = [title.strip() for title in titles if title and title.strip()]
     if not wanted:
         return None
-    return graph.nodes(seed="movie").filter(v.seed.title.like(wanted, k=1)).select("seed")
+    return graph.nodes(seed="movie").filter(v.seed.title.like(wanted, rule=Words(k=1))).select("seed")
 
 
 def shared(graph, seeds, strength):

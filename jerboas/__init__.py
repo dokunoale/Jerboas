@@ -61,6 +61,7 @@ from .frame import Frame, concat
 from .graph import Graph
 from .keys import Key
 from .optimize import optimize
+from .rules import Fuzzy, Rule, Search, Semantic, Words
 from .strategies import (
     Connectivity,
     DiffusedMatrixFactorization,
@@ -78,6 +79,8 @@ __all__ = [
     "Key",
     # deferring a walk so its cost has a ceiling
     "optimize",
+    # how a search decides what is close
+    "Rule", "Search", "Fuzzy", "Words", "Semantic",
     # strategies: the scores a column cannot hold on its own
     "Strategy", "Signal",
     "Connectivity", "MatrixFactorization", "DiffusedMatrixFactorization",

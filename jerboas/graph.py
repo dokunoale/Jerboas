@@ -55,6 +55,7 @@ import polars as pl
 import scipy.sparse as sp
 
 from .columns import Column, build as build_column
+from .fuzzy import words_of
 from .frame import Frame, RELATION
 from .keys import Key
 
@@ -179,6 +180,19 @@ def _drain(parts):
     joined = np.concatenate(parts) if parts else np.zeros(0, dtype=np.int32)
     parts.clear()
     return joined
+
+
+def _index(column):
+    """{word: sorted local ids}."""
+    postings = {}
+    for local in range(len(column)):
+        value = column.get(local)
+        if value is None:
+            continue
+        for word in set(words_of(value)):
+            postings.setdefault(word, []).append(local)
+    return {word: np.asarray(rows, dtype=np.int32)
+            for word, rows in postings.items()}
 
 
 def _matrix(series):
@@ -622,6 +636,21 @@ class Graph:
     def vector(self, type_, name):
         """One vector column, or None when the type has no such thing."""
         return self.vectors.get(type_, {}).get(name)
+
+    def words(self, type_, name):
+        """An inverted index over a text column: {word: the local ids holding it}.
+
+        Built once per column and memoized, the way a degree or a normalized
+        weight is. It answers the question a search actually asks -- which rows
+        hold this word -- instead of walking every value to find out, and it
+        answers it by *word*, which is the difference between `Toxic` matching
+        `Toxicity` and not.
+
+        None when the column is not text, since there is nothing to tokenize."""
+        column = self.column(type_, name)
+        if column is None or column.values.dtype != object:
+            return None
+        return self.cached(("words", type_, name), lambda: _index(column))
 
     def unit(self, type_, name):
         """The same block with every row scaled to length one, so nearness is a
