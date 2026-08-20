@@ -14,6 +14,14 @@ cd "$(dirname "$0")"
 IMAGE=jerboas
 DOMAIN=test
 
+# A guest gets 1GB unless told otherwise, which spotify outgrows about ten
+# seconds into loading its graph -- and the kernel killing it leaves no
+# traceback, just a startup that stops mid-sentence. 4GB is roughly three times
+# what the default subgraph peaks at while fitting; the larger ones want more:
+#
+#     MEMORY=12g ./run.sh spotify
+MEMORY="${MEMORY:-4g}"
+
 available() {
     find usecase -mindepth 2 -maxdepth 2 -name app.py -exec dirname {} \; | xargs -n1 basename
 }
@@ -51,6 +59,7 @@ echo
 exec container run --rm \
     --name "$USECASE" \
     --dns-domain "$DOMAIN" \
+    -m "$MEMORY" \
     -e "USECASE=$USECASE" \
     -p 8000:8000 \
     -v "$PWD/data:/app/data" \

@@ -174,16 +174,20 @@ which is what the separator below is for.
 rather than becoming part of the score. Until it is, widening a pool to reach a
 long title also fills it with near-misses.
 
-## 6. Smaller things, each already known
+## 6. Smaller things
 
 | | |
 |---|---|
-| **`.pl` exposes shadows** | Dropping to polars shows `__jb_score__rec`. Documented, but a convention that leaks. A `.pl` that hides them by default, with `.raw` for the whole thing, would cost nothing. |
-| **`unique()` and confidence** | Deduplicating keeps an arbitrary row's confidence. `group_by` has a rule now; `unique` should say what its rule is. |
-| **`frame.py` is 1 071 lines** | The largest file after the loader. The resolver and the pending hop are each a coherent piece and could be their own module. |
-| **Batching is manual** | `BLOCK = 128` in the benchmark is the caller doing what a planner would. A `chunked(n)` helper is the honest interim step. |
+| **A model has no checkpoint** | An embedding is fitted by a batch job and loaded from a file; a factorization is fitted at startup and refitted at every restart -- 23 s on the Spotify cut, and minutes on the whole of it. The arrays are the same shape as an embedding's, so `checkpoint.py` already knows how to store them. |
+| **`like` scans every value** | Most of a request on Spotify: 680 000 titles gathered and measured for every search. Containment could be answered by an index over the words rather than by walking the column. |
 | **`.to_pandas()` needs pyarrow** | An extra (`jerboas[pandas]`), which is fine, but the error when it is missing is polars' and mentions neither jerboas nor the extra. |
 | **No 0.1 compatibility** | Deliberate, and the migration table in the README is the whole of it. If anyone is on 0.1, a `jerboas.legacy` shim is a week of work and probably not worth it. |
+| **The whole Spotify graph is untried** | 70.8 M edges, and everything here was measured on the 100 000-playlist cut. |
+
+Done since this list was written: `.pl` hides the shadow columns and `.raw` does
+not; `unique` says whose confidence survives; `frame.py` gave up the resolver
+and the pending hop to `resolve.py`; and `chunked(n)` is the interim the
+benchmark was doing by hand.
 
 ---
 

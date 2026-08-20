@@ -16,6 +16,17 @@ WORKDIR /app
 # whole of it when the image is being built to run the tests (see test.sh).
 ARG EXTRAS=api,torch
 
+# Torch, from the CPU index rather than PyPI. The default wheel for aarch64 is a
+# CUDA build -- 2.9GB of nvidia-* and triton that nothing here can reach, there
+# being no GPU passthrough: torch.cuda.is_available() is False in this image and
+# device() picks "cpu" anyway. Seeded before the install below, which then finds
+# torch>=2.5 already satisfied and leaves it alone, so pyproject stays the only
+# place a version is bound. Guarded, because EXTRAS need not ask for torch.
+RUN case ",${EXTRAS}," in *,torch,*) \
+        pip install --no-cache-dir \
+            --index-url https://download.pytorch.org/whl/cpu torch ;; \
+    esac
+
 COPY pyproject.toml /tmp/deps/
 RUN cd /tmp/deps \
     && touch README.md LICENSE NOTICE \
