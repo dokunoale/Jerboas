@@ -954,7 +954,11 @@ def concat(*frames, how="diagonal"):
     variables = {}
     for frame in frames:
         variables.update(frame.vars)
-    return Frame(frames[0].graph, pl.concat(_aligned(frames), how=how), variables)
+    constants = {}
+    for frame in frames:
+        constants.update(frame.constants)
+    return Frame(frames[0].graph, pl.concat(_aligned(frames), how=how), variables,
+                 constants=constants)
 
 
 def _aligned(frames):
@@ -964,16 +968,22 @@ def _aligned(frames):
     empty column of unknown type is polars' Null -- which refuses to stack onto
     a String. So a column that is Null in one frame takes the type another frame
     gives it."""
-    known = {}
+    known, mixed = {}, set()
     for frame in frames:
-        for name, dtype in frame.pl.schema.items():
-            if dtype != pl.Null and name not in known:
-                known[name] = dtype
+        for name, dtype in frame._df.schema.items():
+            if dtype == pl.Null:
+                continue
+            if name in known and known[name] != dtype:
+                # an Enum and a String hold the same words in two encodings, and
+                # only one of them stacks onto the other
+                mixed.add(name)
+            known.setdefault(name, dtype)
     out = []
     for frame in frames:
-        recast = [pl.col(name).cast(known[name]) for name, dtype in frame.pl.schema.items()
-                  if dtype == pl.Null and name in known]
-        out.append(frame.pl.with_columns(recast) if recast else frame.pl)
+        recast = [pl.col(name).cast(pl.String if name in mixed else known[name])
+                  for name, dtype in frame._df.schema.items()
+                  if name in known and (dtype == pl.Null or name in mixed)]
+        out.append(frame._df.with_columns(recast) if recast else frame._df)
     return out
 
 

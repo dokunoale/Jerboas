@@ -50,6 +50,12 @@ SUPPORT = 20
 # how many equally-titled songs to weigh against each other before picking one
 TIES = 8
 
+# how many performers a name written after a tab may mean
+PERFORMERS = 4
+
+# whether a performer put a candidate in the pool, rather than a title alone
+PINNED = "pinned"
+
 FACTORS = 32
 ITERATIONS = 8
 
@@ -71,75 +77,62 @@ def asked_for(names):
 
 
 def resolve(graph, names):
-    """The songs you named, one best match each.
+    """The songs you named, one each.
 
     A name typed by a person is a search box, not a key: `like` admits the
     closest stored titles rather than the equal one, and what it landed on comes
     back in the answer so a wrong guess is visible rather than silent.
 
-    All the names in one query, because `v.seed.name.needle` says which of them
-    each row is an answer to: the grouping the tie-break needs is a column
-    rather than a loop.
+    Every name is resolved in the same frame, which is what makes the choice a
+    good one. Candidates arrive by two routes -- `_by_performer` for the names
+    that named one, `_by_title` for every name -- and both land in one pool
+    tagged with the name they answer (`v.seed.name.needle`) and with whether a
+    performer put them there. Then:
 
-    Three things decide, in this order. A **performer** given after a tab is a
-    constraint and settles it outright. Failing that, **closeness**, and then
-    **how many playlists hold it** -- which is a claim about this dataset rather
-    than about the name, and the crude version of the right answer.
+      * **an explicit performer wins** where it found anything: a name whose
+        pool holds pinned candidates keeps only those. Where it found nothing,
+        the name falls back to its titles -- which is not a special case but the
+        absence of one. Both routes are always in the pool, and one filter says
+        which survives, per name, in the data rather than in a list.
 
-    The right answer is `Frame.coherent`, which picks the combination of
-    candidates most connected to each other, and this does not use it yet.
-    Measured against real playlists it loses to popularity and loses by more as
-    the playlist grows -- 66.7% against 75.0% at three songs, 57.5% against
-    97.5% at eight. The cause is upstream of the choice: `like` scores any
-    containment 1.0, so `Toxicity` ties with `Toxic` and the pool fills with
-    near-misses that a popularity-free measure is happy to prefer. What is
-    missing is a closeness that ranks a containing title by how tightly it
-    contains -- which `fuzzy.closest` computes, taking the shortest match first,
-    and throws away."""
+      * **the rest resolve each other.** `coherent` keeps one candidate per name
+        -- the combination that keeps the most company -- and the pinned ones
+        are in that reckoning as anchors: a name with a single candidate cannot
+        move, but everything else is chosen partly by how well it sits beside
+        it. Told that one song is Oasis, the others lean towards Oasis.
+
+    The sort is the fallback rather than the decision: with one name, or names
+    with nothing in common, nothing is connected and the order stands.
+    """
     wanted = list(asked_for(names))
     if not wanted:
         return None
-    pinned = [(title, performer) for title, performer in wanted if performer]
-    loose = [title for title, performer in wanted if not performer]
-
-    found = [_by_performer(graph, title, performer) for title, performer in pinned]
-    found = [one for one in found if one is not None]
-    loose += [title for (title, _p), one in zip(pinned, found + [None] * len(pinned))
-              if one is None]
-    if loose:
-        found.append(_by_title(graph, loose))
-    return jb.concat(*found) if found else None
-
-
-def _by_title(graph, titles):
-    """The best match for each title, all of them in one query.
-
-    `v.seed.name.needle` says which title each candidate answers, so the choice
-    is a grouping rather than a loop over names -- and the choice itself is
-    `coherent`: the combination of candidates that keep the most company with
-    each other, two songs keeping company when a playlist holds both.
-
-    Measured by handing back the titles of real playlists and counting how many
-    resolve to the songs those playlists actually held, it beats taking the most
-    played candidate by a distance -- 100% against 66.7% at three titles, 98.4%
-    against 81.2% at sixteen -- because a set of names says something no name
-    says alone.
-
-    The sort before it is the fallback rather than the decision: with one name,
-    or names with nothing in common, nothing is connected and the order stands.
-    """
-    return (graph.nodes(seed="song")
-            .filter(v.seed.name.like(titles, k=TIES))
-            .with_columns(asked=v.seed.name.needle,
-                          closeness=v.seed.name.score,
-                          seen=v.seed.contains.count())
+    pool = jb.concat(_by_performer(graph, wanted),
+                     _by_title(graph, [title for title, _performer in wanted]))
+    return (pool
+            # a performer that found something settles its own name and no other
+            .filter(pl.col(PINNED) | ~pl.col(PINNED).any().over("asked"))
             .sort(["closeness", "seen"], descending=True)
             .coherent(by=v.asked, through=reverse("contains"))
             .select("seed"))
 
 
-def _by_performer(graph, title, performer):
-    """A title among one performer's songs.
+def _by_title(graph, titles):
+    """Every title's closest candidates, all of them in one query.
+
+    `v.seed.name.needle` says which title each candidate answers, so what would
+    be a loop over names is a column."""
+    return (graph.nodes(seed="song")
+            .filter(v.seed.name.like(titles, k=TIES))
+            .with_columns(asked=v.seed.name.needle.cast(pl.String),
+                          closeness=v.seed.name.score,
+                          seen=v.seed.contains.count(),
+                          **{PINNED: pl.lit(False)})
+            .select("seed", "asked", "closeness", "seen", PINNED))
+
+
+def _by_performer(graph, wanted):
+    """The candidates a performer allows, for the names that named one.
 
     The performer is not a filter over the titles that matched -- it narrows
     what is searched. Which matters: the exact-titled `Wonderwall`s are eight
@@ -147,20 +140,37 @@ def _by_performer(graph, title, performer):
     among them at any pool size worth using. Asked of Oasis' songs instead, it
     is the only answer there is.
 
-    None when the performer or the title finds nothing, so the caller can fall
-    back to the title alone rather than be answered with silence."""
-    people = graph.nodes(artist="artist").filter(v.artist.name.like(performer, k=4))
+    One query for every pinned name: the performers are searched together and
+    `v.artist.name.needle` says which one each is, so the title that goes with
+    it is a join rather than an iteration."""
+    pins = {performer: title for title, performer in wanted if performer}
+    if not pins:
+        return _no_candidates(graph)
+    people = (graph.nodes(artist="artist")
+              .filter(v.artist.name.like(list(pins), k=PERFORMERS))
+              .with_columns(who=v.artist.name.needle))
     if not len(people):
-        return None
-    songs = (graph.nodes(seed=people).hop(seed_song=reverse("performed_by"))
-             .select("seed_song").rename({"seed_song": "seed"}))
-    if not len(songs):
-        return None
-    matched = (songs.filter(v.seed.name.like(title, k=TIES))
-               .with_columns(closeness=v.seed.name.score,
-                             seen=v.seed.contains.count())
-               .sort(["closeness", "seen"], descending=True).head(1).select("seed"))
-    return matched if len(matched) else None
+        return _no_candidates(graph)
+    songs = (people.hop(seed=reverse("performed_by"))
+             .attrs(seed="name")
+             .with_columns(asked=pl.col("who").cast(pl.String)
+                           .replace_strict(pins, default=None)))
+    return (songs
+            .filter(pl.col("seed.name").str.to_lowercase()
+                    .str.contains(pl.col("asked").str.to_lowercase(), literal=True))
+            .with_columns(closeness=pl.lit(1.0), seen=v.seed.contains.count(),
+                          **{PINNED: pl.lit(True)})
+            .select("seed", "asked", "closeness", "seen", PINNED))
+
+
+def _no_candidates(graph):
+    """An empty pool shaped like the others, so a concat of it is a concat and
+    not a special case."""
+    return (graph.nodes(seed="song").head(0)
+            .with_columns(asked=pl.lit(None, dtype=pl.String),
+                          closeness=pl.lit(0.0), seen=pl.lit(0, dtype=pl.Int64),
+                          **{PINNED: pl.lit(False)})
+            .select("seed", "asked", "closeness", "seen", PINNED))
 
 
 def candidates(graph, seeds):

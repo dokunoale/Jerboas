@@ -219,7 +219,9 @@ _NAMED = ("sum", "count", "n_unique", "mean", "min", "max", "std", "first", "las
           # the arithmetic a score is shaped with: a count is not a weight until
           # something has flattened it
           "log", "log1p", "exp", "sqrt", "pow", "clip", "floor", "ceil",
-          "rank", "over", "is_finite", "is_nan")
+          "rank", "over", "is_finite", "is_nan",
+          # the ones a per-group decision reaches for
+          "any", "all", "not_")
 
 
 def _dispatchable(name):
@@ -535,7 +537,9 @@ _NAMED = ("sum", "count", "n_unique", "mean", "min", "max", "std", "first", "las
           # the arithmetic a score is shaped with: a count is not a weight until
           # something has flattened it
           "log", "log1p", "exp", "sqrt", "pow", "clip", "floor", "ceil",
-          "rank", "over", "is_finite", "is_nan")
+          "rank", "over", "is_finite", "is_nan",
+          # the ones a per-group decision reaches for
+          "any", "all", "not_")
 
 
 _SPECIAL.update(is_in=lambda target, values: _In(target, values),
