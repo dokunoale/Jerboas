@@ -9,8 +9,8 @@ if it makes retrieval and ranking one operation, or if it removes a reason
 someone cannot use the library at all. Breadth for its own sake does not.
 
 Ordered by what unblocks the most, not by what is most interesting to build.
-Items 1, 2, 4 and most of 5 are **done** (see below); 3 is done as far as a
-peephole goes and not as a planner.
+Everything except item 3 is **done** (see below); 3 is done as far as a peephole
+goes and not as a planner.
 
 ---
 
@@ -160,26 +160,67 @@ asked is neither. And the connection is one hop to where they *meet* plus a
 self-join, not a walk out and back -- the way back visits everything else the
 meeting place holds and then throws all of it away.
 
-What is left is cost: the pool for each name comes from `like`, which scans
-every stored value, and that is most of a request. A name whose right answer is
-not in the pool at all -- Oasis' `Wonderwall` is filed as `Wonderwall -
-Remastered` and the exact-titled ones are eight covers -- is still out of reach,
-which is what the separator below is for.
+Cost and reach were both what was left, and both are handled below: the pool now
+comes from an index rather than a scan, and a name whose right answer is not in
+the pool at all -- Oasis' `Wonderwall` is filed as `Wonderwall - Remastered`,
+and the exact-titled ones are eight covers -- is reachable by writing the
+performer after a tab, which narrows what is searched rather than filtering what
+matched.
 
-## 5b. A closeness that ranks how tightly a title contains
+## 5b. What a search measures with is a rule -- done
 
-`like` scores any containment 1.0, so `Toxicity` ties with `Toxic` and
-`Wonderwall - Remastered` ties with `Wonderwall`. The information exists --
-`fuzzy.closest` takes the shortest containing match first -- and is thrown away
-rather than becoming part of the score. Until it is, widening a pool to reach a
-long title also fills it with near-misses.
+`like` used to be difflib, and the use case that wanted whole words had to work
+around it. It is now `.filter(v.x.name.like(needles, rule=...))`, where a `Rule`
+(rules.py) answers three things -- which rows, how close, to which needle -- and
+the query does not change when the measure does: `Fuzzy` (characters), `Words`
+(an inverted index over whole words), `Semantic` (cosine). `near` is the same
+verb exclusively: the k closest that are not the thing itself, which every rule
+here reads as a perfect score.
+
+That settles the closeness this section was asking for, though not the way it
+proposed. `Toxicity` is one word and holds none of `Toxic`, so it scores 0
+rather than tying; `Wonderwall - Remastered` holds all of `Wonderwall` and does
+tie with the bare title, which is right -- a remaster is that song, and which of
+them is meant is what `coherent` and the `\t` separator decide.
+
+The index is where the cost went: a Spotify request is **0.17 s against 1.2 s**,
+and the evaluation above **1 s a query against 14 s**. The rule reads posting
+lists, so what it costs is the rows holding any of the words rather than the
+rows that exist, and it falls back to `Fuzzy` where no index applies rather than
+answering worse without saying so.
+
+A rule uses whatever it must -- an index, a matmul, difflib -- but selects with
+the library's own vocabulary, so a rule cannot be written that the library could
+not have expressed.
+
+## 5c. Reading a playlist as one thing or several -- done
+
+Two additions the recommender wanted, both of them general.
+
+`Concentration(space, relation=)` asks whether what a node touches points one
+way or every way: the resultant length of its neighbours' vectors, in `[0, 1]`.
+It tells a song in five hundred playlists about the same thing from a song in
+five hundred playlists about anything -- film scores and classical around 0.49,
+trap around 0.98 -- which a degree cannot, and which dividing by the degree gets
+wrong in the other direction. Two sparse products over the whole graph,
+memoized.
+
+`top(..., temperature=)` makes the ranking a sample rather than a maximum, by
+Gumbel's trick, measured in the scores' own spread so it means the same thing
+whatever the column holds.
+
+On top of them the service takes a `concentration`: at 0 the playlist is one
+field and the answers come from wherever in it they score best, at 1 every song
+is its own and the answers cover all of them, in between k-means over the latent
+space with `top(over="part")` answering each. Asked
+`Smells Like Teen Spirit / Come As You Are / Lithium / Poker Face / Bad Romance
+/ Toxic`, 0.0 answers all grunge, 0.5 grunge plus Britney, 1.0 both halves.
 
 ## 6. Smaller things
 
 | | |
 |---|---|
 | **A model has no checkpoint** | An embedding is fitted by a batch job and loaded from a file; a factorization is fitted at startup and refitted at every restart -- 23 s on the Spotify cut, and minutes on the whole of it. The arrays are the same shape as an embedding's, so `checkpoint.py` already knows how to store them. |
-| **`like` scans every value** | Most of a request on Spotify: 680 000 titles gathered and measured for every search. Containment could be answered by an index over the words rather than by walking the column. |
 | **`.to_pandas()` needs pyarrow** | An extra (`jerboas[pandas]`), which is fine, but the error when it is missing is polars' and mentions neither jerboas nor the extra. |
 | **No 0.1 compatibility** | Deliberate, and the migration table in the README is the whole of it. If anyone is on 0.1, a `jerboas.legacy` shim is a week of work and probably not worth it. |
 | **The whole Spotify graph is untried** | 70.8 M edges, and everything here was measured on the 100 000-playlist cut. |

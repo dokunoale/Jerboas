@@ -32,19 +32,16 @@ import polars as pl
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from scipy.cluster.vq import kmeans2
+
 import jerboas as jb
-from jerboas import DiffusedMatrixFactorization, Words, reverse, v
+from jerboas import Concentration, DiffusedMatrixFactorization, Words, reverse, v
 
 DATA_DIR = os.environ.get("SPOTIFY_DIR", "./data/spotify/graph-100k")
 
-# What a factorization may learn from. A song in one playlist is not evidence of
-# anything a latent space can hold: with 680 000 songs whose median support is a
-# single playlist, factorizing everything is factorizing mostly noise, and the
-# result ranks soundtrack themes above pop. Restricted to the songs the crowd has
-# actually placed more than once, the same model becomes a usable re-ranker.
-#
-# It is a claim about the data rather than a tuning knob, which is why it is
-# written here and not hidden in the strategy.
+# how many playlists a song must appear in before the factorization may learn
+# from it (see `supported`) -- a claim about the data rather than a tuning knob,
+# which is why it is here and not hidden in the strategy
 SUPPORT = 20
 
 # how many equally-titled songs to weigh against each other before picking one
@@ -89,17 +86,14 @@ def resolve(graph, names):
     tagged with the name they answer (`v.seed.name.needle`) and with whether a
     performer put them there. Then:
 
-      * **an explicit performer wins** where it found anything: a name whose
-        pool holds pinned candidates keeps only those. Where it found nothing,
-        the name falls back to its titles -- which is not a special case but the
-        absence of one. Both routes are always in the pool, and one filter says
-        which survives, per name, in the data rather than in a list.
+      * **an explicit performer wins** where it found anything, and where it
+        found nothing the name falls back to its titles. That is one filter over
+        the pool rather than a special case, so both routes are always present
+        and the data says which survives, per name.
 
-      * **the rest resolve each other.** `coherent` keeps one candidate per name
-        -- the combination that keeps the most company -- and the pinned ones
-        are in that reckoning as anchors: a name with a single candidate cannot
-        move, but everything else is chosen partly by how well it sits beside
-        it. Told that one song is Oasis, the others lean towards Oasis.
+      * **the rest resolve each other.** `coherent` keeps the combination that
+        keeps the most company, with the pinned ones in that reckoning as
+        anchors: told that one song is Oasis, the others lean towards Oasis.
 
     The sort is the fallback rather than the decision: with one name, or names
     with nothing in common, nothing is connected and the order stands.
@@ -173,39 +167,63 @@ def _no_candidates(graph):
             .select("seed", "asked", "closeness", "seen", PINNED))
 
 
-def candidates(graph, seeds):
-    """Every song the playlists holding your songs also hold, and how often.
+def clustered(graph, model, seeds, concentration):
+    """The seeds, each labelled with the part of the playlist it belongs to.
 
-    Two steps out and one back: seed song -> the playlists containing it -> what
-    else they contain. The playlists are named because the count is over them;
-    nothing else about them is wanted."""
-    return (graph.nodes(seed=seeds)
+    A playlist is one thing when it is about one thing and several when it is
+    not, and only whoever asked knows which. `concentration` says how finely to
+    split it: at 0 the whole playlist is one field and the answers come from
+    wherever in it they score best, at 1 every song is its own and the answers
+    cover all of them. In between, k-means over the latent space.
+
+    Splitting is what stops a broad playlist from being answered entirely out of
+    its largest corner."""
+    ids = seeds.ids("seed")
+    parts = 1 + round(concentration * (len(ids) - 1))
+    if parts <= 1:
+        return seeds.with_columns(part=pl.lit(0, dtype=pl.Int32))
+    space = model.embeddings(graph)[ids]
+    labels, _ = kmeans2(space, min(parts, len(ids)), minit="++", seed=0)[::-1]
+    return seeds.with_columns(part=pl.Series("part", labels, dtype=pl.Int32))
+
+
+def candidates(graph, seeds):
+    """Every song the playlists holding your songs also hold, and how many of
+    them do -- counted within the part of the playlist the seed belongs to.
+
+    Two steps out and one back: seed -> the playlists containing it -> what else
+    they contain. The playlists are named because the count is over them."""
+    return (seeds
             .hop(playlist=reverse("contains"))
             .hop(rec="contains")
             .filter(~v.rec.is_in(seeds))
-            .group_by(v.rec).agg(shared=pl.len().cast(pl.Float64)))
+            .group_by(v.rec, v.part).agg(shared=pl.len().cast(pl.Float64)))
 
 
-def rank(counted, seeds, model, k):
-    """The crowd's evidence, shaped by the model's taste.
+def rank(counted, seeds, model, k, parts, temperature):
+    """Three signals, and the query says how much each counts.
 
-    `log1p` on the count is the whole of the shaping: a song in six hundred of
-    those playlists is a better answer than one in sixty, but not ten times
-    better, and multiplying by a raw count buries the model entirely. Both
-    signals stay their own column, so an answer can say which one carried it."""
-    return (counted
-            .with_columns(taste=model.seeded(seeds).on("rec"))
-            .with_columns(score=v.taste * v.shared.log1p())
-            .top(k))
+    `shared` is the crowd's evidence, damped: six hundred of those playlists is
+    a better answer than sixty, not ten times better, and a raw count buries the
+    other two. `taste` is the model's. `gathered` is whether the song belongs
+    anywhere at all -- a film score sits in five hundred playlists with nothing
+    in common, and answering with it is answering with the average of
+    everything.
 
-
-def supported(graph):
-    """The interactions a factorization may learn from, and the songs it will
-    then know anything about."""
-    songs = (graph.nodes(song="song")
-             .with_columns(seen=v.song.contains.count())
-             .filter(v.seen >= SUPPORT).select("song"))
-    return graph.edges("contains").filter(v.target.is_in(songs)), songs
+    Then the best of each part, so a playlist about two things is answered about
+    both, topped up from the best of anywhere when the parts cannot fill k."""
+    scored = (counted
+              .with_columns(taste=model.seeded(seeds).on("rec"),
+                            gathered=Concentration(model, relation="contains").on("rec"))
+              .with_columns(score=v.taste * v.shared.log1p() * v.gathered))
+    each = -(-k // max(parts, 1))
+    covered = (scored.top(each, by=v.score, over="part", temperature=temperature)
+               .unique("rec"))
+    if len(covered) < k:
+        rest = (scored.filter(~v.rec.is_in(covered))
+                .top(k - len(covered), by=v.score, temperature=temperature))
+        covered = jb.concat(covered, rest).unique("rec")
+    return covered.sort("score", descending=True).head(k)
 
 
 def describe(frame, column):
@@ -216,26 +234,24 @@ def describe(frame, column):
             if len(frame) else frame.attrs(**{column: "name"}))
 
 
-def extend(graph, model, known, songs, k):
+def extend(graph, model, known, songs, k, concentration=0.0, temperature=0.0):
     seeds = resolve(graph, songs)
     if seeds is None or not len(seeds):
         return [], []
-    # what the match landed on, performer included: "Bohemian Rhapsody" is Queen
-    # and also Panic! At The Disco covering Queen, and which one the crowd means
-    # is a fact about this dataset rather than about the name
     found = describe(seeds, "seed")
     named = [f"{row['seed.name']} -- {row['artist.name']}"
              for row in found.rows(named=True)]
-    titles = found.pl["seed.name"].to_list()
 
-    counted = (candidates(graph, seeds).filter(v.rec.is_in(known))
+    parts = clustered(graph, model, seeds, concentration)
+    counted = (candidates(graph, parts).filter(v.rec.is_in(known))
                .attrs(rec="name")
                # another master of a song you gave me is not a suggestion
-               .filter(~v.rec.name.is_in(titles)))
+               .filter(~v.rec.name.is_in(found.pl["seed.name"].to_list())))
     if not len(counted):
         return named, []
 
-    ranked = describe(rank(counted, seeds, model, k), "rec")
+    ranked = describe(rank(counted, seeds, model, k,
+                           parts.pl["part"].n_unique(), temperature), "rec")
     return named, [
         {
             "song": row["rec.name"],
@@ -245,6 +261,19 @@ def extend(graph, model, known, songs, k):
         }
         for row in ranked.rows(named=True)
     ]
+
+
+def supported(graph):
+    """The interactions a factorization may learn from, and the songs it will
+    then know anything about.
+
+    A song in one playlist is not evidence a latent space can hold: with 680 000
+    songs whose median support is a single playlist, factorizing everything is
+    factorizing noise, and the result ranks soundtrack themes above pop."""
+    songs = (graph.nodes(song="song")
+             .with_columns(seen=v.song.contains.count())
+             .filter(v.seen >= SUPPORT).select("song"))
+    return graph.edges("contains").filter(v.target.is_in(songs)), songs
 
 
 # --- startup -----------------------------------------------------------------
@@ -292,6 +321,12 @@ app = FastAPI(title="Jerboas playlist continuation", lifespan=lifespan)
 class ExtendRequest(BaseModel):
     songs: list[str]
     k: int = Field(default=5, ge=1, le=50)
+    # how finely to read the playlist: 0 treats it as one field and answers from
+    # wherever in it the scores are best, 1 answers about every song in it
+    concentration: float = Field(default=0.0, ge=0.0, le=1.0)
+    # 0 answers the same thing every time; 1 lets the noise be as large as the
+    # spread of the scores it is disturbing
+    temperature: float = Field(default=0.0, ge=0.0, le=5.0)
 
 
 class Suggestion(BaseModel):
@@ -314,7 +349,8 @@ def post_extend(body: ExtendRequest):
     if not body.songs:
         raise HTTPException(status_code=422, detail="name at least one song")
     named, suggestions = extend(app.state.graph, app.state.model, app.state.known,
-                                body.songs, body.k)
+                                body.songs, body.k, body.concentration,
+                                body.temperature)
     if not named:
         raise HTTPException(status_code=404, detail="no song matched")
     return ExtendResponse(songs=named, suggestions=suggestions)
@@ -323,7 +359,6 @@ def post_extend(body: ExtendRequest):
 @app.get("/health")
 def get_health():
     graph = app.state.graph
-    return {"status": "ok",
-            "playlists": graph.block("playlist")[1] - graph.block("playlist")[0],
-            "songs": graph.block("song")[1] - graph.block("song")[0],
+    sized = lambda kind: graph.block(kind)[1] - graph.block(kind)[0]
+    return {"status": "ok", "playlists": sized("playlist"), "songs": sized("song"),
             "known": len(app.state.known)}

@@ -187,31 +187,21 @@ class Frame:
             .hop((), rec="has_genre")          # any relation, then has_genre
             .hop(step=("has_genre", "~directed_by"))   # either, at this step
 
-        A **keyword** names the column the step's arrivals are kept in. A
-        **positional** step is walked and not kept -- which is what lets it be
-        folded: two routes that meet at an unnamed intermediate carry identical
-        rows onward, and only one of them is worth continuing. That fold is the
-        old engine's memoized sub-path search, and here it is a consequence of
-        not having given something a name rather than a parameter.
+        A keyword names the column the step's arrivals are kept in; a positional
+        step is walked and not kept, which is what lets it be folded -- two
+        routes through something nobody named are one answer. The last step must
+        be named, because where the walk ends is what the frame holds.
 
-        The last step must be named, because where the walk ends is what the
-        frame holds. Python already requires the positional ones to come first,
-        so the rule costs nothing to obey.
+        A step is a relation, `~name` for it read backwards, or a collection for
+        any of several. The empty collection is any relation at all, either way,
+        which is what closes a bridge without the store holding every edge twice.
 
-        A step is a relation name, `~name` for the same relation read backwards
-        -- the spelling `v.x.via` prints -- or a collection of them for "any of
-        these". The empty collection is "any relation at all", in either
-        direction, which is what closes a bridge without the store holding every
-        edge twice.
-
-        Walking leaves from the rightmost column of nodes. To leave from another,
-        `select` it and `join` the result back: that is what working on a
-        dataframe is for.
+        Walking leaves from the rightmost column of nodes; to leave from
+        another, `select` it and `join` the result back.
 
         Only the named columns are added. What the step measured is each one's
         confidence (`v.genre.score`) and which relation it walked is
-        `v.genre.via` -- attributes of a column rather than columns, costing
-        nothing when they say the same thing about every row.
+        `v.genre.via`.
         """
         steps = [(spec, None) for spec in through]
         steps += [(spec, name) for name, spec in named.items()]
@@ -527,47 +517,25 @@ class Frame:
     def coherent(self, column=None, *, by, through, connection="meet", passes=3):
         """One row per group, choosing the combination most connected to itself.
 
-        A name resolved on its own has only its own popularity to go on. A *set*
-        of names has more: the things somebody names together tend to sit near
-        each other, so the assignment to prefer is the one whose choices are
-        most connected. `Wonderwall` beside `Champagne Supernova` is Oasis;
-        `Wonderwall` beside `Come Pick Me Up` is Ryan Adams -- neither is the
-        more popular in the abstract, and what decides is the company.
-
             candidates.coherent(by=v.asked, through=reverse("contains"))
 
-        `by` groups the candidates -- `v.x.needle` is what a search leaves for
-        exactly this -- and `through` is one step to where two of them *meet*:
-        two songs are connected by the playlists holding both. So the connection
-        is one hop and a self-join rather than a walk out and back, which is the
-        difference between a second and a minute -- the way back multiplies by
-        everything else the meeting place holds, and then throws all of it away.
+        A name resolved alone has only its own popularity to go on; a *set* of
+        names has the company they keep. `by` groups the candidates -- what
+        `v.x.needle` leaves -- and `through` is one step to where two of them
+        meet.
 
-        `connection` is what that meeting is worth, and the default is that they
-        met at all. Counting the meetings instead, or dividing that count by how
-        far each candidate reaches, are both worse -- measured, on real
-        playlists, by giving back the titles of songs the playlist held and
-        seeing how many resolve to the songs it actually held:
+        `connection` is what a meeting is worth. That they met at all beats
+        counting the meetings (which favours the popular) and beats dividing
+        that count by how far each reaches (which overshoots to the obscure):
+        resolving real playlists back to their songs, 98.4% against 89.1% and
+        77.5%.
 
-            titles      most played     meet      count    count/reach
-                 3            66.7%    100.0%     91.7%          75.0%
-                16            81.2%     98.4%     89.1%          77.5%
-
-        Counting favours the popular, since a song in seventeen hundred
-        playlists meets more of everything; dividing the count overshoots the
-        other way, handing the choice to whichever obscure candidate shares a
-        large fraction of its few neighbours. Whether two candidates keep
-        company at all is neither, and it is the thing being asked.
-
-        The choice itself is `k**n` combinations, so it is not enumerated:
-        starting from the frame's own order, each group takes the candidate best
-        connected to what the others currently hold, repeatedly. Two or three
-        passes settle it, and the result is a local maximum rather than the
-        maximum -- which is the usual trade and worth saying out loud.
-
-        **When the graph says nothing the frame's order decides**, so sorting by
-        whatever you would have used alone -- popularity, closeness -- makes
-        this an improvement on that rather than a replacement for it.
+        The choice is `k**n` combinations and is not enumerated. Starting from
+        the frame's own order, each group takes the candidate best connected to
+        what the others hold, repeatedly -- a local maximum, in two or three
+        passes. When nothing is connected the order stands, so sorting by
+        whatever you would have used alone makes this an improvement on it
+        rather than a replacement.
         """
         node = self._var(column)
         groups = self._df[name_of(by)].to_list()
@@ -698,7 +666,7 @@ class Frame:
         return _GroupBy(self, [name_of(one) for one in _flat(by)], maintain_order,
                         confidence)
 
-    def top(self, n, by=None, descending=True, over=None):
+    def top(self, n, by=None, descending=True, over=None, temperature=0.0, seed=None):
         """The n best rows. `by` defaults to a `score` column when there is one,
         because that is what the frame was building up to.
 
@@ -710,7 +678,13 @@ class Frame:
             .hop(mid=()).top(5, by=v.pr, over="seed").hop(rec=())
 
         That second line is a beam search: keep the k most promising partial
-        walks at each step and expand only those. It was an engine once."""
+        walks at each step and expand only those.
+
+        `temperature` makes the choice a sample rather than a maximum: at zero
+        the n best, above it the n drawn in proportion to `exp(score / t)`. The
+        trick is Gumbel's -- perturb each score by `-log(-log(u))` and take the
+        top n -- which is exactly sampling without replacement from that
+        distribution, at the cost of one array of noise."""
         if by is None:
             by = "score" if "score" in self._df.columns else None
         if by is None:
@@ -719,6 +693,8 @@ class Frame:
         ordering = _resolved(by, resolver)
         if isinstance(ordering, str):          # polars reads a bare name as a column
             ordering = pl.col(ordering)
+        if temperature:
+            ordering = _perturbed(ordering, temperature, resolver, self._df.height, seed)
         data = resolver.attach(self._df)
         if over is None:
             data = data.sort(ordering, descending=descending).head(n)
@@ -988,6 +964,7 @@ def _aligned(frames):
 
 
 _ROW, _MEET = "__coherent_row", "__coherent_meet"
+_JITTER = "__top_jitter"
 
 
 def _assign(groups, weights, passes):
@@ -1017,6 +994,27 @@ def _assign(groups, weights, passes):
         if not moved:
             break
     return set(chosen.values())
+
+
+def _perturbed(ordering, temperature, resolver, height, seed):
+    """A score with Gumbel noise: the top n of it is a sample of n, drawn in
+    proportion to `exp(score / temperature)`.
+
+    Measured in the scores' own spread rather than their units, so a temperature
+    means the same thing whether the column holds a PageRank around 0.01 or a
+    count around 600: at 1 the noise is as large as the spread it disturbs, at
+    0.1 it only shuffles what was nearly tied.
+
+    The noise is a column rather than a literal, because `over` evaluates a
+    group at a time and a literal of the frame's height means nothing there."""
+    rng = np.random.default_rng(seed)
+    uniform = rng.random(height)
+    resolver.extra[_JITTER] = pl.Series(
+        _JITTER, -np.log(-np.log(np.clip(uniform, 1e-12, 1.0 - 1e-12))))
+    spread = ordering.std().fill_null(0.0)
+    return pl.when(spread > 0) \
+             .then(ordering / (spread * temperature) + pl.col(_JITTER)) \
+             .otherwise(pl.col(_JITTER))
 
 
 def _walk(graph, nodes, spec):

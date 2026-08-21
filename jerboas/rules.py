@@ -1,28 +1,19 @@
 """How a search decides what is close: the extension point for admission.
 
-`Strategy` is where ranking is plugged in -- a thing that computes with whatever
-it needs and hands back a column. This is the same for the other half. A `Rule`
-answers one question, over a column and a set of needles: which rows are close
-enough, how close, and to which needle.
-
     .filter(v.person.name.like(names, rule=Fuzzy(k=3)))
     .filter(v.song.name.like(titles, rule=Words(k=8)))
     .filter(v.chunk.embedding.like(query, rule=Semantic(k=50)))
 
-One verb, three measures, and the same three answers on the other side --
-`v.x.score` is how close, `v.x.needle` is to what. A service doing retrieval
-over text and a service doing it over embeddings write the same query.
+`Strategy` is where ranking is plugged in; a `Rule` is the same for admission.
+It answers one question over a column and a set of needles -- which rows, how
+close, and to which needle -- so the measure changes and the query does not.
 
-`near` is the exclusive reading of the same verb: the k closest that are *not*
-the thing itself. What "the thing itself" means is the rule's to say, and every
-rule here says the same: a perfect score. A remaster of a song is that song.
+`near` is the exclusive reading of the same verb: the k closest that are not the
+thing itself, where every rule here reads "itself" as a perfect score.
 
-The division of labour is the one `Strategy` already follows. The **measure**
-uses whatever it must -- an inverted index, a matmul, difflib -- because a
-posting list is not a frame operation and pretending otherwise would mean
-scanning, which is what an index exists to avoid. The **selection** is the
-library's own vocabulary, so a rule cannot be written that the library could not
-have expressed.
+The measure uses whatever it must -- an index, a matmul, difflib -- because a
+posting list is not a frame operation. The selection is the library's own
+vocabulary.
 """
 
 from abc import ABC, abstractmethod
@@ -137,16 +128,14 @@ class Words(Rule):
     `Wonderwall - Remastered` holds all of `Wonderwall` and is as close as the
     bare title.
 
-    Graded rather than all-or-nothing for a reason beyond taste: `near` asks for
-    what is close and not identical, and under an all-or-nothing reading of
-    closeness there is nothing between the two.
+    Graded rather than all-or-nothing because `near` asks for what is close and
+    not identical, and all-or-nothing leaves nothing between the two.
 
     It reads the index rather than the column -- posting lists, unioned and
-    counted -- so what it costs is the number of rows that hold any of the words
-    rather than the number that exist. Where the index cannot help, because the
-    column is computed or the variable holds no single type, it falls back to
-    `Fuzzy` rather than answering less well without saying so; and so does a
-    needle no row holds a word of, which is what keeps a typo working."""
+    counted -- so it costs the number of rows holding any of the words rather
+    than the number that exist. Where the index cannot help (a computed column,
+    a variable of no single type) it falls back to `Fuzzy`, and so does a needle
+    no row holds a word of, which is what keeps a typo working."""
 
     def __init__(self, k=1, cutoff=0.0):
         self.k = k

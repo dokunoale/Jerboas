@@ -1,19 +1,16 @@
 """The one interface left: Strategy, and the signal it produces.
 
-A graph is a data structure and a query is a dataframe, so most of what used to
-be an interface here is now a column: a predicate is a polars expression, a
-traversal is a verb, an aggregate is a group_by. What cannot be a column is a
-score that has to be computed from the graph -- a walk, a factorization, an
-embedding -- and that is what a Strategy is.
+A predicate is a polars expression, a traversal is a verb, an aggregate is a
+group_by. What none of those can be is a score computed *from the graph* -- a
+walk, a factorization, an embedding -- and that is what a Strategy is.
 
     class PageRank(Strategy):
         def fit(self, graph): ...                  # once, before scoring
         def scores(self, graph, columns): ...      # id arrays in, floats out
 
 `columns` is the tuple of node-id arrays named in `on(...)`, in that order: the
-first is what is being scored, and anything after it is context (the user whose
-taste it is, the seed it was reached from). Naming them is the point -- it is
-what a strategy used to have to guess from the shape of the search.
+first is what is scored, the rest are context (whose taste it is, which seed it
+was reached from).
 
     frame.with_columns(pr=PageRank(to=seeds).on("rec").norm())
 

@@ -514,6 +514,43 @@ and averaged inside `rank(...)`; now `.norm()` is written where it happens, the
 weights are numbers you chose, and every intermediate signal is a column you can
 print and sort by on its own.
 
+### Whether a node belongs anywhere
+
+A degree says how many neighbours; `Concentration` says how alike they are. It
+adds their vectors and compares the length of the sum with the sum of the
+lengths — pointing together the two are equal, scattered the sum cancels itself
+out:
+
+```python
+(frame
+   .with_columns(gathered=Concentration(model, relation="contains").on("rec"))
+   .filter(v.gathered >= 0.4))
+```
+
+That is the difference between a song in five hundred playlists *about the same
+thing* and a song in five hundred playlists about anything — which a count
+cannot make, and which dividing by the count gets wrong in the other direction.
+On the Spotify graph film scores and classical sit around 0.49 and trap around
+0.98. `space` is anything with `embeddings(graph)`, or an `(n, d)` array; two
+sparse products over the whole graph, memoized, so it costs the same for one
+node as for all of them.
+
+### The best n, or n drawn from them
+
+```python
+.top(5, by=v.score)                       # the five best
+.top(5, by=v.score, temperature=0.5)      # five, sampled
+.top(5, by=v.score, over="part")          # the five best per group
+```
+
+`temperature` makes the choice a sample rather than a maximum: at zero the n
+best, above it n drawn in proportion to `exp(score / t)`. It is Gumbel's trick —
+perturb each score by `-log(-log(u))` and take the top n — which is exactly
+sampling without replacement from that distribution, at the cost of one array of
+noise. The temperature is measured in the scores' own spread rather than their
+units, so it means the same thing whether the column holds a PageRank around
+0.01 or a count around 600.
+
 ## Results carry their meaning
 
 A frame holds integer node ids, because that is what indexes an array. When you

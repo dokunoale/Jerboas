@@ -1,31 +1,22 @@
 """Storing a trained embedding, and binding it back to a graph.
 
-Mostly this module is about *identity*, not bytes. A node's position in the graph
-is an artifact of how that graph was loaded: blocks are laid out in order of
-first appearance, so adding one movie, or listing the attribute files
-differently, shifts every id after it. A checkpoint keyed by position would still
-load against the changed graph -- the shapes match -- and would score the wrong
-entities without raising. So every weight row records whose it is, and binding
-resolves that against whatever ids the caller's graph is using now. The same goes
-for relations, by name.
+Mostly this is about *identity*, not bytes. A checkpoint keyed by position would
+load against a graph built from a different slice of the source -- the shapes
+match -- and score the wrong entities without raising. So every weight row
+records whose it is, and binding resolves that against the ids the caller's
+graph is using now; relations likewise, by name.
 
-*Whose it is* is a column the checkpoint names, not a fixed field. By default it
-is the node's own id, which is what a graph whose ids mean something wants. When
-they do not -- a dataset that numbers its nodes densely and keeps the durable
-identifier in an attribute, the way `spotify.song` keeps `uri` -- the checkpoint
-records that attribute instead:
+*Whose it is* is a column the checkpoint names. By default the node's own id;
+when ids are not durable and the identifier lives in an attribute -- the way
+`spotify.song` keeps `uri` -- the checkpoint records that instead, falling back
+to the id for a type that has no such column:
 
     model.save("checkpoints/spotify.transd.npz", alias="uri")
     TransD.load("checkpoints/spotify.transd.npz", graph)     # reads the alias back
 
-so the same weights rebind correctly onto a graph built from a different slice of
-the source, where node 1337 is a different song. A type with no such column falls
-back to its id, so one alias serves a graph whose types do not all have one.
-
 The file is a compressed .npz, and it is *inert*: every array is a native numpy
-dtype, strings included, so it loads with `allow_pickle=False`. A pickled .npz is
-executable code wearing a data extension; opening one from an untrusted source
-would run it. Nothing here can.
+dtype, strings included, so it loads with `allow_pickle=False`. A pickled .npz
+is executable code wearing a data extension. Nothing here is.
 
     format        int      this layout's version
     model         str      which model wrote it: "transd", "transe", ...

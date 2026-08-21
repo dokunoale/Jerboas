@@ -1,31 +1,22 @@
 """Names that stay names until a frame resolves them.
 
-A pattern variable is a column, so `v.rec` is the column `rec` and `v.rec.year`
-the column `rec.year`. That much was always true. What is new here is *when* the
-name is decided: nothing is turned into a polars expression at the point it is
-written. `v.movie.has_genre >= 2` is a little tree of names, and the Frame --
-which is the only thing that knows the graph -- resolves it.
-
-Late resolution buys three things that eager construction cannot:
+A pattern variable is a column: `v.rec` is the column `rec`, `v.rec.year` the
+column `rec.year`. What matters is *when* the name is decided -- nothing becomes
+a polars expression where it is written, so the Frame, which is the only thing
+holding the graph, resolves it:
 
     .filter(v.movie.year >= 1990)              # the attribute is read on demand
     .filter(v.movie.has_genre.count() >= 2)    # a relation's arity, not a column
     .filter(v.movie.directed_by.is_in(people)) # the edge exists, unexpanded
 
-and, because the predicate reaches the Frame before it reaches polars, the Frame
-can decide *where* to apply it -- to the rows a hop has not built yet rather than
-to the rows it has. That is the old compiler's admission mask, obtained by
-writing an ordinary filter.
+And because the predicate reaches the Frame before polars, the Frame can decide
+*where* to apply it -- to the rows a hop has not built yet rather than the ones
+it has.
 
-A name resolves in this order, and the order is the whole rule:
-
-    1. a column the frame already has
-    2. an attribute of that variable's type   -> read from the graph, on demand
-    3. a relation of the graph                -> arity with .count(), existence
-                                                 with .is_in(...)
-
-`v.movie.attr.x` and `v.movie.rel.x` say which namespace to use when a type has
-an attribute named like a relation. `.expr` drops out to raw polars, unresolved.
+A name resolves in this order, which is the whole rule: a column the frame has,
+an attribute of that variable's type, a relation of the graph.
+`v.movie.attr.x` / `v.movie.rel.x` say which when a type has an attribute named
+like a relation, and `.expr` drops out to raw polars.
 """
 
 import numpy as np
@@ -86,14 +77,12 @@ def reverse(relation):
     """A relation read the other way: `reverse("directed_by")` is the films a
     person directed rather than the people who directed a film.
 
-    The same thing as writing `"~directed_by"`, and there for two reasons: the
-    prefix is spelling rather than syntax, so code that says `reverse(...)`
-    keeps meaning it if the character changes; and `~` already means `not` in a
-    predicate, so a query that would rather not write it twice for two different
-    reasons need not.
+    The same thing as `"~directed_by"`, for two reasons: the prefix is spelling
+    rather than syntax, so `reverse(...)` keeps meaning it if the character
+    changes, and `~` already means `not` in a predicate.
 
     Applied twice it gives back what it was given, and it maps over a collection
-    of relations rather than making you write it out."""
+    of relations."""
     if not isinstance(relation, str):
         return tuple(reverse(one) for one in relation)
     return relation[len(REVERSED):] if relation.startswith(REVERSED) \

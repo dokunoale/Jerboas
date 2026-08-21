@@ -66,8 +66,8 @@ def closest(needle, texts, k, cutoff, exclusive=False):
 
     Shortest first among the containing ones: "alien" is inside Alien, Aliens,
     Alien 3 and Alien: Resurrection, and the one that adds least is the one that
-    was meant. Taking them in column order instead let an exact match lose to
-    whatever loaded first, which is a coin toss wearing the shape of a result."""
+    was meant. Column order instead let an exact match lose to whatever loaded
+    first."""
     text_needle = str(needle).lower()
     contained = sorted((len(text), row) for row, text in texts
                        if text_needle and text_needle in text
@@ -88,11 +88,9 @@ def best(needles, texts, k, cutoff, exclusive=False):
     question a set of names asks that one name does not -- so it is answered
     rather than counted and thrown away.
 
-    Two needles that judge a row *equally* well are a tie the measure cannot
-    break, and it is not broken here either: the first one asked keeps it. That
-    is arbitrary but it is at least stable, and the alternative -- admitting the
-    row twice -- would make a set of names return more rows than it has
-    answers."""
+    A row two needles judge equally well goes to the first one asked: arbitrary,
+    but stable, and admitting it twice would make a set of names return more
+    rows than it has answers."""
     found = {}
     for needle in needles:
         for row, score in closest(needle, texts, k, cutoff, exclusive):

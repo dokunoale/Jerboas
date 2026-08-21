@@ -12,9 +12,9 @@ import pytest
 
 import jerboas as jb
 
-from jerboas import (Connectivity, DiffusedMatrixFactorization, Fuzzy, Graph,
-                     Key, MatrixFactorization, PageRank, Semantic, Weight, Words,
-                     col, concat, reverse, v)
+from jerboas import (Concentration, Connectivity, DiffusedMatrixFactorization,
+                     Fuzzy, Graph, Key, MatrixFactorization, PageRank, Semantic,
+                     Weight, Words, col, concat, reverse, v)
 
 
 def names(frame, column=None):
@@ -1730,3 +1730,81 @@ def test_a_rule_is_the_extension_point(small_graph):
     assert names(found) == ["movie.0"]
     assert found.pl["score"].to_list() == [0.5]
     assert found.pl["asked"].to_list() == ["whatever"]
+
+
+# --- temperature: the best, or a sample of the best --------------------------
+
+def test_temperature_zero_is_the_maximum(small_graph):
+    frame = small_graph.nodes("movie").with_columns(score=PageRank().on("movie"))
+    assert names(frame.top(2)) == names(frame.top(2, temperature=0.0))
+
+
+def test_temperature_samples_instead_of_maximising(small_graph):
+    """A recommender that answers the same thing every time is worse than its
+    scores suggest."""
+    frame = small_graph.nodes("movie").with_columns(score=PageRank().on("movie"))
+    answers = {tuple(names(frame.top(1, temperature=2.0, seed=one))) for one in range(20)}
+    assert len(answers) > 1
+
+
+def test_temperature_is_measured_in_the_scores_own_spread(small_graph):
+    """So it means the same thing whether the column holds a rank near 0.01 or a
+    count near 600."""
+    frame = small_graph.nodes("movie").with_columns(score=PageRank().on("movie"))
+    wide = frame.with_columns(score=v.score * 1000.0)
+    at = lambda one, t: {tuple(names(one.top(1, temperature=t, seed=s)))
+                         for s in range(20)}
+    assert len(at(frame, 0.05)) == len(at(wide, 0.05))
+
+
+def test_temperature_works_inside_a_window(small_graph):
+    """`over` evaluates a group at a time, so the noise has to be a column."""
+    frame = (small_graph.nodes(user="user").hop(rec="has_interact")
+             .top(1, by=v.rec.score, over="user", temperature=1.0, seed=3))
+    assert len(frame) == 3
+
+
+def test_a_seed_makes_the_sample_repeatable(small_graph):
+    frame = small_graph.nodes("movie").with_columns(score=PageRank().on("movie"))
+    assert names(frame.top(2, temperature=1.0, seed=7)) \
+        == names(frame.top(2, temperature=1.0, seed=7))
+
+
+# --- concentration: how gathered a neighbourhood is --------------------------
+
+@pytest.fixture
+def gathered_graph():
+    """Two nodes of equal degree, one whose neighbours agree and one whose do
+    not: `a` sits with three vectors pointing the same way, `b` with three
+    pointing three ways."""
+    rows = np.array([[1.0, 0.0], [0.9, 0.4], [1.0, 0.1],      # one direction
+                     [1.0, 0.0], [-1.0, 0.0], [0.0, 1.0]],    # three
+                    dtype=np.float32)
+    context = pl.DataFrame({"id": list(range(6)),
+                            "embedding": [list(map(float, row)) for row in rows]})
+    edges = pl.DataFrame({"node": ["a", "a", "a", "b", "b", "b"],
+                          "ctx": [0, 1, 2, 3, 4, 5]})
+    return Graph.from_frames({"holds": edges}, attrs={"ctx": context},
+                             source=("node", "node"), target=("ctx", "ctx"),
+                             renumber=True)
+
+
+def test_concentration_tells_gathered_from_scattered(gathered_graph):
+    space = gathered_graph.vector("ctx", "embedding")
+    whole = np.zeros((gathered_graph.n_nodes, space.shape[1]), dtype=np.float32)
+    low, high = gathered_graph.block("ctx")
+    whole[low:high] = space
+    frame = (gathered_graph.nodes(node="node")
+             .with_columns(gathered=Concentration(whole, relation="holds").on("node"))
+             .labels("node"))
+    held = dict(zip(frame.pl["node.label"].to_list(), frame.pl["gathered"].to_list()))
+    assert held["a"] > 0.9                      # its neighbours agree
+    assert held["b"] < 0.4                      # they cancel each other out
+    assert gathered_graph.degree("holds", False)[gathered_graph["node.0"]] \
+        == gathered_graph.degree("holds", False)[gathered_graph["node.1"]]
+
+
+def test_concentration_refuses_a_space_of_the_wrong_size(gathered_graph):
+    with pytest.raises(ValueError, match="rows and the graph has"):
+        gathered_graph.nodes(node="node").with_columns(
+            g=Concentration(np.zeros((3, 2))).on("node"))

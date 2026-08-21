@@ -1,33 +1,24 @@
 """Deferring a walk, so its cost has a ceiling.
 
-A hop expands a frame by the degree of what it walks, and the expansion happens
-before any filter can reduce it. On a small frame that is nothing; on a large one
-it is the whole problem -- a two-hop wildcard over a big graph builds hundreds of
-millions of rows on the way to a few thousand.
-
-Inside `optimize`, a hop describes itself instead of taking place. The filters
-written after it join the description, and the whole of it runs when something
-reads the frame -- in slices, each walked, filtered and reduced before the next
-one starts. The answer is the same; the peak is a slice instead of the lot.
-
     with jb.optimize(rows=5_000_000):
         frame = seeds.hop(rec=()).filter(v.rec.type == "movie")
 
-`rows` is a budget on *what a step produces*, not on what it is given, and it is
-not an estimate: the graph knows every node's degree, so the exact size of an
-expansion is `degree[nodes].sum()` before a step is taken. The slices are cut
-where that running total crosses the budget, which is why a walk out of a hub
-takes a smaller slice than one out of a leaf, and why a walk that fits is not
-deferred at all.
+A hop expands a frame by the degree of what it walks, and the expansion happens
+before any filter can reduce it. Inside `optimize` a hop describes itself
+instead, the filters written after it join the description, and the whole runs
+when something reads the frame -- in slices. Same answer, and the peak is a
+slice instead of the lot.
 
-The budget is applied again at every step, so `hop(a=..., b=...)` and
-`hop(a=...).hop(b=...)` cost the same -- the second hop of either is cut against
-the middle it actually landed on.
+`rows` budgets what a step *produces*, and it is exact rather than estimated:
+the graph knows every degree, so an expansion's size is `degree[nodes].sum()`
+before a step is taken. Slices are cut where that running total crosses the
+budget, so a walk out of a hub takes a shorter slice than one out of a leaf, a
+walk that fits is not deferred, and the budget applies again at every step --
+which is why `hop(a=..., b=...)` and `hop(a=...).hop(b=...)` cost the same.
 
-Two things still follow from working in slices: a predicate that aggregates
-(`>= v.rec.score.mean()`) sees its slice rather than the whole result, and the
-surviving rows are accumulated rather than streamed, so a query whose *answer*
-does not fit is not helped.
+Two things follow from working in slices: a predicate that aggregates sees its
+slice, and the answer is accumulated rather than streamed, so a query whose
+result does not fit is not helped.
 """
 
 from contextlib import contextmanager

@@ -6,42 +6,26 @@ Two objects, and the second is a dataframe:
     print(g)                # <Graph: 15369 nodes in 5 types, 127k edges ...>
     print(g.nodes("movie")) # shape: (1682, 1) -- a table, with a graph behind it
 
-`Graph` is the data structure: a typed, positional node store plus an
-edge-labeled CSR. `Frame` is what you ask it -- a polars DataFrame that knows
-which of its columns hold nodes, and adds the four verbs a table cannot get from
-being a table:
+`Graph` is the data: a typed, positional node store plus an edge-labeled CSR.
+`Frame` is what you ask it -- a polars DataFrame that knows which of its columns
+hold nodes -- with three verbs of its own (`hop`, `attrs`, `labels`) and the
+rest of polars forwarded. A pattern variable is a column name, so two of them
+are the same variable when spelled the same.
 
-    hop      one traversal, one result row per edge
-    like     graded membership over a text column -- the search box
-    attrs    a stored attribute as a column
-    labels   the column a person reads, per the graph's `readable` map
-
-Everything else is polars: `filter`, `with_columns`, `group_by`, `sort`, `join`,
-and `.pl` for whatever is not forwarded. A pattern variable is a column name --
-`v.rec` is the column `rec`, `v.rec.year` the column `rec.year` -- so two of them
-are the same variable when they are spelled the same, and the frame prints what
-it is holding.
-
-    seeds = g.nodes("artist").labels("artist").like(v.artist.label, "Golden", k=3)
-
-    (g.nodes(seed=seeds).hop(to="song", type="song")
+    seeds = g.nodes(artist="artist").filter(v.artist.label.like("Golden",
+                                                               rule=Words(k=3)))
+    (g.nodes(seed=seeds).hop(song="~performed_by")
        .with_columns(score=PageRank(to=seeds).on("song"))
-       .top(5).attrs(song="name"))
+       .top(5).labels("song"))
 
-A `Strategy` is the one thing a column cannot be: a score computed from the
-graph -- a walk, a factorization, an embedding. `on(...)` names the columns it
-reads, and the frame turns it into a column, which is then ordinary arithmetic:
+Everything a graph can be asked besides walking it is a condition, and every
+condition goes in `filter`. What a search measures with is a `Rule` (rules.py);
+what a ranking is computed with is a `Strategy`, and a strategy is a column, so
+combining several is arithmetic that is written down.
 
-    .with_columns(pr=PageRank(to=seeds).on("rec").norm(),
-                  kg=TransD.load(path, g, to=seeds).on("rec").norm())
-    .with_columns(score=0.7 * v.pr + 0.3 * v.kg)
-
-Nothing is combined behind your back, and every intermediate signal stays a
-column you can print.
-
-The embedding models (TransD, TransE) are strategies like the rest, but they are
-imported on demand: fitting one needs torch, which is an optional extra, and the
-base install must stay importable without it.
+The embedding models (TransD, TransE) are strategies like the rest, imported on
+demand: fitting one needs torch, and the base install stays importable without
+it.
 """
 
 _LAZY = {"TransD": "models", "TransE": "models", "Translational": "models",
@@ -63,6 +47,7 @@ from .keys import Key
 from .optimize import optimize
 from .rules import Fuzzy, Rule, Search, Semantic, Words
 from .strategies import (
+    Concentration,
     Connectivity,
     DiffusedMatrixFactorization,
     MatrixFactorization,
@@ -83,7 +68,7 @@ __all__ = [
     "Rule", "Search", "Fuzzy", "Words", "Semantic",
     # strategies: the scores a column cannot hold on its own
     "Strategy", "Signal",
-    "Connectivity", "MatrixFactorization", "DiffusedMatrixFactorization",
+    "Concentration", "Connectivity", "MatrixFactorization", "DiffusedMatrixFactorization",
     "PageRank", "Weight",
     "TransD", "TransE",
 ]

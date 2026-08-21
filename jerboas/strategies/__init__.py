@@ -1,21 +1,19 @@
 """Ranking strategies: the scores a column cannot hold on its own.
 
 A strategy is what is left when everything a dataframe already does is taken
-away. Sorting by a stored value is `sort`, ranking by a matched edge's weight is
-a column, counting the matches is `group_by(...).agg(...)` -- none of those is a
-strategy any more, and none of them needs to be. What remains is the family of
-scores that have to be computed *from the graph*: a random walk, a
-factorization, a two-hop reachability count, an embedding.
+away: sorting by a stored value is `sort`, ranking by an edge's weight is a
+column, counting matches is a `group_by`. What remains has to be computed *from
+the graph* -- a random walk, a factorization, an embedding.
 
     frame.with_columns(pr=PageRank(to=seeds).on("rec").norm(),
                        kg=TransD.load(path, g, to=seeds).on("rec").norm())
          .with_columns(score=0.7 * v.pr + 0.3 * v.kg)
 
-Each one names the columns it reads (see core.Strategy.on) instead of guessing
-them from the shape of the query, which is the difference between a strategy
-that knows whose taste it is modelling and one that picks a user out of whatever
-the search happened to walk through.
+Each names the columns it reads (`on`) rather than guessing them from the shape
+of the query -- the difference between a strategy that knows whose taste it is
+modelling and one that picks a user out of whatever the search walked through.
 
+    concentration          Concentration    whether a neighbourhood points one way
     connectivity           Connectivity     two-hop reachability from a seed set
     pagerank               PageRank         random-walk importance, global or personalized
     matrix_factorization   MatrixFactorization, DiffusedMatrixFactorization
@@ -30,10 +28,11 @@ where it is a Strategy too -- fitted by an explicit batch job, then loaded from 
 checkpoint and used in a column like any other.
 """
 
+from .concentration import Concentration
 from .connectivity import Connectivity
 from .matrix_factorization import MatrixFactorization, DiffusedMatrixFactorization
 from .pagerank import PageRank
 from .weight import Weight
 
-__all__ = ["Connectivity", "MatrixFactorization", "DiffusedMatrixFactorization",
+__all__ = ["Concentration", "Connectivity", "MatrixFactorization", "DiffusedMatrixFactorization",
            "PageRank", "Weight"]

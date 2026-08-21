@@ -1,19 +1,15 @@
 """What a hop defers, and what turns a name into a column.
 
-Two pieces the Frame leans on, neither of which is about being a dataframe.
+`Pending` is a hop that has walked but not built its rows: held one step, a
+filter about the node just reached is applied to the arrays rather than to rows
+that would then be dropped.
 
-`Pending` is a hop that has walked the graph but not built its rows. The walk
-produced four parallel arrays, and turning them into a frame means taking every
-column the old frame had at those positions -- the expensive half of a hop. Held
-one step, a filter about the node just reached can be applied to the arrays
-instead of to rows that would then be dropped.
+`Resolver` is where a name meets the graph. Four answers, in order: a column's
+provenance (its confidence, the relation that revealed it, its type), a column
+the frame has, an attribute of that variable's type, or a relation. What was
+read only to decide is taken off again; what was *measured* stays.
 
-`Resolver` is where a name meets the graph. Four answers, in order: the
-provenance of a column (its confidence, the relation that revealed it, the type
-its ids fall in), a column the frame already has, an attribute of that
-variable's type, or a relation of the graph. Whatever is read only to decide
-something is taken off again; whatever was *measured* stays, as the column's
-confidence.
+`Plan` is a walk described but not taken -- see optimize.py.
 """
 
 import numpy as np

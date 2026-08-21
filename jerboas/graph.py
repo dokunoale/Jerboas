@@ -1,50 +1,28 @@
-"""Graph: the data, and the entry point to the pipeline.
+"""Graph: the data the frames are a view of.
 
-A node key in the source files is `<type>.<id>`, and **an id is a position**:
-ids are dense integers `0..n-1` within a type, so `song.42` is stored at
-`start["song"] + 42`. The layout is read off the data rather than discovered
-from the order the files happen to mention things in, which is why there is no
-permutation to build, no first-seen ordering to preserve, and no table
-translating a name into an index -- `lookup` is arithmetic. A file that says
-otherwise is refused at load, because the alternative is a graph whose contents
-depend on how it was written. An identifier that belongs to the world rather
-than to the graph -- an IMDb code, a Spotify uri -- is an ordinary attribute
-column beside the position. Three things follow, and they are the whole reason
-for the representation:
+**An id is a position.** Ids are dense integers `0..n-1` within a type, so
+`song.42` is stored at `start["song"] + 42` and `lookup` is arithmetic -- no
+translation table, and no dependence on the order a file happens to list things
+in. A file that says otherwise is refused at load, because the alternative is a
+graph whose contents depend on how it was written. From that: the universe is
+`range(N)`, so every per-node fact is a plain array; a type's block is a slice;
+and a hop is a gather over CSR slices (traverse.py) rather than a join.
 
-  * the universe is `range(N)`, so every per-node fact is a plain array indexed
-    directly -- no dict, no hashing, no interning;
-  * `keys_by_type` is a slice, not a stored partition;
-  * a hop is a gather over CSR slices (see traverse.py), so expanding a set of
-    nodes never builds a join table.
+Relations are stored once, as an edge-labeled CSR plus its transpose, so walking
+backwards reads the transpose rather than a duplicated `_r` relation.
 
-Relations are directed and stored once, as a single edge-labeled CSR plus its
-transpose. Walking backwards reads the transpose instead of a separate `_r`
-relation, so there is no `rv` flag, no duplicated edges, and a wildcard hop
-traverses both directions because both are always present.
+Every edge carries a weight defaulting to 1.0 -- there is no unweighted edge,
+only one whose weight nobody wrote down -- and what counts as good enough is a
+question for the query, never for the loader.
 
-Every edge carries a weight, a float defaulting to 1.0 -- there is no such thing
-as an unweighted edge, only one whose weight nobody wrote down. That is why the
-loader has no notion of an "interaction": a rating is the weight of a
-`has_interact` edge, a similarity is the weight of a `similar_to` edge, and both
-load through the same path. Filtering on it belongs to the query, not here: a
-graph that silently held only part of its file is a graph whose contents depend
-on a constructor argument.
-
-Loading is columnar for the same reason everything else here is: what runs once
-per edge has to be C. A file is read a chunk at a time and cut into columns by
-one `replace` and one `split`, so the only Python loop left in the edge path
-runs once per distinct node rather than once per edge.
-
-Attributes are columnar and typed at load, so `year >= 1990` compares int64
-against int64 instead of coercing a string once per candidate node. Reading one
-into a frame is therefore a gather -- `column.values[id - start]` -- and never a
-join.
+Loading is columnar because what runs once per edge has to be C: a chunk becomes
+columns with one `replace` and one `split`, and the Python that is left runs
+once per distinct node. Attributes are typed at load, so reading one into a
+frame is a gather and comparing it is one array operation.
 
 `readable` is the one thing the graph is told rather than reads: which column a
-person reads for each type. Nothing guesses it, because a guess is wrong exactly
-when it matters, and it is a fact about the dataset rather than about any one
-query -- so it is declared once, here.
+person reads, per type. Nothing guesses it, and it is a fact about the dataset
+rather than about a query.
 """
 
 import os
@@ -355,20 +333,16 @@ class Graph:
                               target=("movie", "movie_id"))
 
         `edges` is one frame carrying a relation column, or a mapping from
-        relation name to a frame that needs none. `attrs` maps a type to a frame
-        whose first column (or `id` column) is the node id and whose rest are
-        attributes.
+        relation to a frame that needs none; `attrs` maps a type to a frame
+        whose first column is the id.
 
-        A column may name nodes two ways. Given a column name, its values are
-        source keys -- `movie.123`, the format the files use. Given a
-        `(type, column)` pair, the values are ids of that type and the key is
-        built from them, which is what data from anywhere else looks like: a
-        `user_id` column and a `movie_id` column, with the type in the schema
-        rather than in the value.
+        A column names nodes either as source keys (`movie.123`, the format the
+        files use) or as a `(type, column)` pair -- a column of ids and the type
+        they belong to, which is what data from anywhere else looks like.
 
-        Everything else is the file loader's: ids are positions unless
-        `renumber=True`, and the graph is complete when it exists -- which is
-        why this takes what it needs in one call rather than being built up.
+        Everything else is the file loader's, ids-are-positions included, and it
+        takes what it needs in one call because a graph is complete when it
+        exists.
         """
         graph = cls.__new__(cls)
         graph._prepare(renumber, readable)
