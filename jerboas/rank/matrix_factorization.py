@@ -17,6 +17,9 @@ from .core import Strategy
 # what a checkpoint holds: one row of factors per node of the two blocks
 TABLES = (("factors", NODE),)
 
+# how many dimensions of a diffused sum exist at once
+_DIMENSIONS = 8
+
 
 class MatrixFactorization(Strategy):
     """Implicit-feedback matrix factorization, scored per row.
@@ -99,8 +102,11 @@ class MatrixFactorization(Strategy):
         model.meta = meta
         model.missing_nodes = stored.missing_nodes
         users, items = graph.block(model.user_type), graph.block(model.item_type)
-        table = stored.tensors["factors"].astype(np.float64)
-        fitted = (users, items, table[users[0]:users[1]], table[items[0]:items[1]])
+        table = stored.tensors["factors"]
+        # copies of the two blocks, so the (N, factors) table can go
+        fitted = (users, items, table[users[0]:users[1]].copy(),
+                  table[items[0]:items[1]].copy())
+        del table, stored
         model.cached(graph, ("factors", None), lambda: fitted)
         return model
 
@@ -129,11 +135,17 @@ class MatrixFactorization(Strategy):
             matrix = graph.relation_matrix(self.relation, weights)[users[0]:users[1],
                                                                    items[0]:items[1]]
         matrix = matrix.tocsr()
+        # the graph keeps a multi-edge as repeated cells; one cell per pair, so
+        # that binary feedback is binary and a rating is not counted twice
+        matrix.sum_duplicates()
         if not self.weighted:
-            matrix.data.fill(1.0)  # CSR sums duplicate entries; feedback stays binary
+            matrix.data.fill(1.0)
         matrix.sort_indices()
         user_factors, item_factors = self._factorize(matrix)
-        return users, items, user_factors, item_factors
+        # solved in float64, kept in float32: a score needs seven digits, and on
+        # a large graph the factors are gigabytes
+        return (users, items, user_factors.astype(np.float32),
+                item_factors.astype(np.float32))
 
     def _from_frame(self, graph, users, items):
         """The interactions a frame of edges holds, as the same sparse matrix.
@@ -266,12 +278,25 @@ class DiffusedMatrixFactorization(MatrixFactorization):
         # Weighted, the mean becomes a weighted mean -- normalized, because a
         # negative weight would pull an embedding to the far side of the space
         # rather than count for less.
-        incidence = graph.adjacency("norm" if self.weighted else None)[:, items[0]:items[1]]
-        represented = (item_factors != 0).any(axis=1)
-        counts = incidence @ represented.astype(np.float64)
-        embeddings = np.zeros((graph.n_nodes, self.factors))
+        #
+        # Neighbours in either direction are two products, one per direction of
+        # the store, over a vector that is zero outside the item block -- rather
+        # than a symmetric adjacency sliced to the items, which on the whole
+        # Spotify graph is two gigabytes held to be multiplied once. The sum is
+        # taken a few dimensions at a time for the same reason.
+        directions = graph.matrices("norm" if self.weighted else None)
+        represented = np.zeros(graph.n_nodes, dtype=np.float32)
+        represented[items[0]:items[1]] = (item_factors != 0).any(axis=1)
+        counts = sum(direction @ represented for direction in directions)
         known = counts > 0
-        embeddings[known] = (incidence @ item_factors)[known] / counts[known, None]
+        embeddings = np.zeros((graph.n_nodes, self.factors), dtype=np.float32)
+        spread = np.zeros((graph.n_nodes, _DIMENSIONS), dtype=np.float32)
+        for low in range(0, self.factors, _DIMENSIONS):
+            high = min(low + _DIMENSIONS, self.factors)
+            spread[:, :high - low] = 0.0
+            spread[items[0]:items[1], :high - low] = item_factors[:, low:high]
+            summed = sum(direction @ spread[:, :high - low] for direction in directions)
+            embeddings[known, low:high] = summed[known] / counts[known, None]
 
         # the factorized blocks are authoritative for themselves
         embeddings[items[0]:items[1]] = item_factors

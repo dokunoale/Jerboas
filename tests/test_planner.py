@@ -296,3 +296,41 @@ def test_a_filter_pushed_into_a_hop_keeps_the_relation_it_walked(small_graph):
     walked = (small_graph.nodes(user="user").hop(rec="has_interact")
               .filter(v.rec.year >= 1994))
     assert set(walked.with_columns(w=v.rec.via).pl["w"].to_list()) == {"has_interact"}
+
+
+# --- matrices over the store ---------------------------------------------------------
+
+def _reference(graph, relation=None):
+    """The matrix the old builder made: every stored edge as a (source, target)
+    cell, summed."""
+    import scipy.sparse as sp
+    keep = (np.ones(len(graph.out_indices), dtype=bool) if relation is None
+            else graph.out_rels == graph.relation_code(relation))
+    sources = graph.sources()[keep]
+    return sp.csr_matrix((np.ones(keep.sum()), (sources, graph.out_indices[keep])),
+                         shape=(graph.n_nodes, graph.n_nodes))
+
+
+@pytest.mark.parametrize("relation", [None, "r", "s", "t"])
+def test_a_relation_matrix_is_the_store_read_as_one(tangle, relation):
+    built = tangle.relation_matrix(relation)
+    assert abs(built - _reference(tangle, relation)).max() == 0
+
+
+def test_the_adjacency_is_both_directions_counting_multi_edges(tangle):
+    reference = _reference(tangle)
+    assert abs(tangle.adjacency() - (reference + reference.T)).max() == 0
+    forwards, backwards = tangle.matrices()
+    assert abs(backwards - forwards.T).max() == 0
+
+
+def test_a_repeated_edge_is_one_interaction_to_a_factorization():
+    once = pl.DataFrame({"source": ["u.0", "u.0", "u.1"], "target": ["i.0", "i.1", "i.1"]})
+    twice = pl.concat([once, once.head(1)])
+    scores = []
+    for edges in (once, twice):
+        graph = Graph.from_frames({"likes": edges})
+        model = jb.MatrixFactorization(factors=2, iterations=3, item_type="i",
+                                       user_type="u", relation="likes", user="u.0")
+        scores.append(graph.nodes(item="i").with_columns(s=model.on("item")).pl["s"])
+    assert scores[0].to_list() == scores[1].to_list()

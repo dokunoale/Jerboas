@@ -79,6 +79,6 @@ class Concentration(Strategy):
         of the relation -- on the whole Spotify graph, the difference between a
         6 GB peak and one a container survives."""
         if self.relation is None:
-            return (graph.adjacency(),)
+            return graph.matrices()
         matrix = graph.relation_matrix(self.relation)
         return (matrix, matrix.T)

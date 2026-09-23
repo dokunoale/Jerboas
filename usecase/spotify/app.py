@@ -283,16 +283,23 @@ def extend(graph, model, known, songs, k, concentration=0.0, temperature=0.0):
 
 
 def supported(graph):
-    """The interactions a factorization may learn from, and the songs it will
-    then know anything about.
+    """The songs a factorization may learn from, and will then know anything
+    about.
 
     A song in one playlist is not evidence a latent space can hold: with 680 000
     songs whose median support is a single playlist, factorizing everything is
     factorizing noise, and the result ranks soundtrack themes above pop."""
-    songs = (graph.nodes(song="song")
-             .with_columns(seen=v.song.contains.count())
-             .filter(v.seen >= SUPPORT).select("song"))
-    return graph.edges("contains").filter(v.target.is_in(songs)), songs
+    return (graph.nodes(song="song")
+            .with_columns(seen=v.song.contains.count())
+            .filter(v.seen >= SUPPORT).select("song"))
+
+
+def interactions(graph, known):
+    """The playlist edges into those songs: what the factorization is fitted on.
+
+    Only a fit needs them, and on the whole graph they are 66 million rows, so
+    a start that loads a stored factorization never builds them."""
+    return graph.edges("contains").filter(v.target.is_in(known))
 
 
 # --- startup -----------------------------------------------------------------
@@ -324,14 +331,15 @@ def fit(graph):
     "This one" means the hyperparameters and the support threshold the
     checkpoint recorded are the ones declared here -- a stored model fitted
     with other settings is refitted and replaced, never served."""
-    kept, known = supported(graph)
+    known = supported(graph)
     wanted = DiffusedMatrixFactorization(
-        factors=FACTORS, iterations=ITERATIONS, where=kept,
+        factors=FACTORS, iterations=ITERATIONS,
         item_type="song", user_type="playlist", relation="contains")
     stored = _stored(graph, {**wanted.config(), "support": SUPPORT})
     if stored is not None:
         log.info("spotify: factorization loaded from %s", CHECKPOINT)
         return stored, known
+    wanted.where = interactions(graph, known)
     wanted.fit(graph)
     os.makedirs(os.path.dirname(CHECKPOINT) or ".", exist_ok=True)
     # by uri: a song's position is the graph's numbering, its uri is Spotify's

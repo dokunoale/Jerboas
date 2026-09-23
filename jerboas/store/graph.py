@@ -35,6 +35,7 @@ import scipy.sparse as sp
 from . import cache as stored
 from .columns import Column, build as build_column
 from ..search.fuzzy import words_of
+from ..query import traverse
 from ..query.frame import Frame, RELATION
 from .keys import Key
 
@@ -912,52 +913,69 @@ class Graph:
 
     # --- sparse views the strategies rank with -------------------------------
 
+    # Matrices are built from the store on every call and not memoized. The CSR
+    # already is one: a node's edges are contiguous and sorted, so a matrix
+    # over it needs no conversion, only a column of cell values. On the whole
+    # Spotify graph one of these is a gigabyte or more, and every strategy that
+    # asks for one fits once and keeps what it computed, not the matrix.
+    # Multi-edges stay as repeated cells; a product sums them, which is what
+    # "counting multi-edges" means.
+
+    def matrices(self, weights=None):
+        """The graph as two N x N CSRs, forwards and backwards: row i holds the
+        edges node i stores, and the edges stored into it.
+
+        The second is the first transposed. Both share the store's index arrays,
+        so asking for them costs a column of cell values per direction, and a
+        product over "either direction" is two products rather than a symmetric
+        matrix twice their size.
+
+        `weights` picks what fills the cells: None counts an edge as 1, "raw"
+        uses its stored score, "norm" the per-relation min-max of it."""
+        forwards, backwards = self._edge_data(weights)
+        shape = (self.n_nodes, self.n_nodes)
+        return (_csr(forwards, self.out_indices, self.out_indptr, shape),
+                _csr(backwards, self.in_indices, self.in_indptr, shape))
+
     def adjacency(self, weights=None):
         """The undirected adjacency as one N x N CSR, counting multi-edges.
 
         Both directions, so random-walk mass flows symmetrically -- the property
-        `rv=True` used to buy by physically duplicating every edge.
-
-        `weights` picks what fills the cells: None counts an edge as 1, "raw"
-        uses its stored score, "norm" the per-relation min-max of it. A random
-        walk wants "norm" and not "raw": a negative score is not a transition."""
-        return self.cached(("adjacency", weights), lambda: self._build_matrix(weights))
-
-    def _build_matrix(self, weights):
-        sources = self.sources()
-        both_src = np.concatenate([sources, self.out_indices])
-        both_tgt = np.concatenate([self.out_indices, sources])
-        data = self._edge_data(weights)
-        return sp.csr_matrix((np.concatenate([data, data]), (both_src, both_tgt)),
-                             shape=(self.n_nodes, self.n_nodes))
+        `rv=True` used to buy by physically duplicating every edge. A walk wants
+        `weights="norm"` rather than "raw": a negative score is not a
+        transition."""
+        forwards, backwards = self.matrices(weights)
+        return (forwards + backwards).tocsr()
 
     def relation_matrix(self, relation, weights=None):
         """One relation as an N x N CSR, source -> target. Block-slice it to get
         e.g. the user-item matrix: `m[u0:u1, i0:i1]`. `weights` reads as it does
-        for adjacency()."""
-        return self.cached(("relation_matrix", relation, weights),
-                           lambda: self._build_relation_matrix(relation, weights))
-
-    def _build_relation_matrix(self, relation, weights):
-        sources = self.sources()
-        if relation is None:                       # every relation
-            keep = slice(None)
-        else:
-            code = self._relation_code.get(relation)
+        for matrices(); `relation=None` is every relation."""
+        if relation is None:
+            return self.matrices(weights)[0]
+        code = self._relation_code.get(relation)
+        shape = (self.n_nodes, self.n_nodes)
+        if code is None:
             # a name the graph never saw matches nothing. Reading it as "all of
             # them" is how a typo used to become the whole graph
-            keep = (self.out_rels == code) if code is not None \
-                else np.zeros(len(sources), dtype=bool)
-        rows, cols = sources[keep], self.out_indices[keep]
-        return sp.csr_matrix((self._edge_data(weights)[keep], (rows, cols)),
-                             shape=(self.n_nodes, self.n_nodes))
+            return sp.csr_matrix(shape, dtype=np.float32)
+        # within a node, a relation's edges are one contiguous run of its slice,
+        # so the rows stay in order and only their lengths change
+        lo, hi = traverse.bounds(self, code, False)
+        indptr = np.zeros(self.n_nodes + 1, dtype=np.int64)
+        np.cumsum(hi - lo, out=indptr[1:])
+        keep = self.out_rels == code
+        return _csr(self._edge_data(weights)[0][keep], self.out_indices[keep], indptr, shape)
 
     def _edge_data(self, weights):
-        """What one stored edge contributes to a matrix cell: its existence, its
-        score, or its normalized score."""
+        """What one stored edge contributes to a matrix cell -- its existence,
+        its score, or its normalized score -- aligned with the out- and the
+        in-store."""
         if weights is None:
-            return np.ones(len(self.out_indices))
-        return self.weights(normalized=(weights == "norm"))[0]
+            ones = np.ones(len(self.out_indices), dtype=np.float32)
+            return ones, ones
+        forwards, backwards = self.weights(normalized=(weights == "norm"))
+        return forwards.astype(np.float32), backwards.astype(np.float32)
 
     # --- the frame: where a query starts -------------------------------------
 
@@ -1064,3 +1082,10 @@ class Graph:
                 relations.update(self.relations[c] for c in np.unique(span).tolist())
             schema[type_] = {"columns": set(self.columns[type_]), "relations": relations}
         return schema
+
+
+def _csr(data, indices, indptr, shape):
+    """A CSR over arrays the store already holds, sorted as the store is."""
+    matrix = sp.csr_matrix((data, indices, indptr), shape=shape, copy=False)
+    matrix.has_sorted_indices = True
+    return matrix
