@@ -1,37 +1,90 @@
 """A walk described but not taken, and how it is run.
 
-Held only inside `optimize` (see optimize.py): the frame a deferred hop returns
-carries a `Plan` instead of rows, the filters written after it join the plan,
-and the whole runs when something reads the frame.
+Inside `optimize` (see optimize.py) a hop returns a frame that carries a `Plan`
+instead of rows. The conditions written after it join the plan, a hop after it
+extends the plan, and the whole runs when something reads the frame.
+
+A plan is a list of stages. Each ends at a named step and carries the
+conditions that can be decided once that step has landed -- the earliest point
+at which everything they read exists, so a condition on the middle of a walk
+prunes the middle before the next step multiplies it. Running a stage decides
+two things per stage, with the numbers the graph already keeps:
+
+*Which end to walk from.* A stage whose conditions say where it must land
+(`v.rec.is_in(wanted)`) can be walked backwards from that set when the set's
+edges are fewer than the frame's -- same rows, same order.
+
+*How big a slice.* The budget, turned into rows at this frame's width, cut
+against what this step out of these nodes will produce.
+
+The slices are a generator (`parts`), which is what `Frame.batches()` hands out
+and what the streamed reductions consume; `build` is the one place they are
+accumulated.
 """
 
 import polars as pl
+
+from ..query.expr import SCORE, shadowed
+from .planner import landing, roots
 
 
 class Plan:
     """A walk described but not taken, and the conditions about where it lands.
 
-    Held only inside `optimize`. Running it takes the same walk and applies the
-    same conditions, in slices cut by what a step produces -- and cut again at
-    every step, so a walk written as one hop and the same walk written as two
-    cost the same. The answer is what it would have been; the peak is a slice.
+    Running it takes the same walk and applies the same conditions, in slices
+    cut by what a step produces -- and cut again at every step, so a walk
+    written as one hop and the same walk written as two cost the same. The
+    answer is what it would have been; the peak is a slice.
     """
 
-    __slots__ = ("frame", "steps", "budget", "predicates")
+    __slots__ = ("frame", "stages", "budget")
 
-    def __init__(self, frame, steps, budget, predicates=()):
+    def __init__(self, frame, stages, budget):
         self.frame = frame              # the frame the walk leaves from
-        self.steps = steps              # [(relation spec, column or None)]
-        self.budget = budget            # rows one step may produce at a time
-        self.predicates = list(predicates)
+        self.stages = stages            # [(steps, predicates)], each ending named
+        self.budget = budget            # optimize.Budget
+
+    @classmethod
+    def of(cls, frame, steps, budget):
+        return cls(frame, [(group, []) for group in _groups(steps)], budget)
+
+    def extended(self, steps):
+        """The same plan, walked further."""
+        return Plan(self.frame, self.stages + [(group, []) for group in _groups(steps)],
+                    self.budget)
 
     def narrowed(self, predicates):
-        """The same plan, with more said about where the walk may land."""
-        return Plan(self.frame, self.steps, self.budget,
-                    self.predicates + list(predicates))
+        """The same plan, with more said about where the walk may land. Each
+        condition joins the earliest stage after which everything it reads
+        exists; one that does not say what it reads waits for the last."""
+        stages = [(steps, list(conditions)) for steps, conditions in self.stages]
+        base = {name.partition(".")[0] for name in self.frame._df.columns}
+        for one in predicates:
+            wanted = roots(one)
+            index = len(stages) - 1
+            if wanted is not None:
+                seen = set(base)
+                for position, (steps, _conditions) in enumerate(stages):
+                    seen |= {name for _spec, name in steps if name is not None}
+                    if wanted <= seen:
+                        index = position
+                        break
+            stages[index][1].append(one)
+        return Plan(self.frame, stages, self.budget)
+
+    def names(self):
+        """The columns the frame will have, as far as a hop needs to know --
+        the ones it may not land on."""
+        return list(self.frame._df.columns) + [
+            name for steps, _conditions in self.stages
+            for _spec, name in steps if name is not None]
+
+    def parts(self):
+        """The answer a slice at a time, as frames."""
+        yield from _parts(self.frame, self.stages, self.budget)
 
     def build(self):
-        return _run(self.frame, _groups(self.steps), self.predicates, self.budget)
+        return stack([part.raw for part in self.parts()])
 
 
 def _groups(steps):
@@ -45,25 +98,89 @@ def _groups(steps):
     return [steps[:first + 1]] + [[one] for one in steps[first + 1:]]
 
 
-def _run(frame, groups, predicates, budget):
-    """One run of steps at a time, each in slices, recursing for the rest."""
-    group, rest = groups[0], groups[1:]
-    parts = []
-    for piece in frame._slices(group[0][0], budget):
-        part = piece._hop_eager(group)
+def _parts(frame, stages, budget):
+    """One stage at a time, each in slices, recursing for the rest."""
+    (steps, conditions), rest = stages[0], stages[1:]
+    toward = direction(frame, steps, conditions)
+    degree = toward.degree() if toward is not None else frame._step_degree(steps[0][0])
+    for piece in frame._slices(degree, budget.rows(frame, steps)):
+        part = piece._hop_eager(steps, toward=toward)
+        if conditions:
+            part = part.filter(*conditions)
         if rest:
-            part = _run(part, rest, predicates, budget)
-            parts.append(part)
-            continue
-        if predicates:
-            part = part.filter(*predicates)
-        parts.append(part.raw)
-    if not parts:
-        empty = frame._wrap(frame._df.clear())._hop_eager(group)
-        return _run(empty, rest, predicates, budget) if rest else empty.raw
-    if len(parts) == 1:
-        return parts[0]
+            yield from _parts(part, rest, budget)
+        else:
+            yield part
+
+
+class Toward:
+    """One step's edges into a set, found from the set's end once and gathered
+    onto every slice (query/traverse.py, `Reach`)."""
+
+    __slots__ = ("reaches",)
+
+    def __init__(self, reaches):
+        self.reaches = reaches          # one per relation the step names
+
+    def degree(self):
+        total = self.reaches[0].degree()
+        for reach in self.reaches[1:]:
+            total = total + reach.degree()
+        return total
+
+
+def direction(frame, steps, conditions):
+    """A `Toward` when this stage is cheaper walked from where it must land,
+    None to walk it forwards.
+
+    Both costs are exact: forwards is the frame's degree along the step,
+    backwards the set's degree along it read the other way, plus sorting the
+    frame's nodes once to match the edges found onto its rows."""
+    if len(steps) != 1:
+        return None
+    spec, name = steps[0]
+    wanted = landing(conditions, name, frame.graph)
+    if wanted is None:
+        return None
+    forwards = frame._produces(spec)
+    backwards = frame._arriving(spec, wanted) + frame._df.height
+    if backwards >= forwards:
+        return None
+    return Toward(frame._reaches(spec, wanted))
+
+
+def stack(frames):
+    """Slices as one frame, without copying them into one buffer.
+
+    The slices of one walk can disagree about their shadows: a confidence
+    column exists only where some weight in the slice was not 1.0, so one slice
+    may carry it and the next not. The union is taken, the missing confidence
+    is the 1.0 it stood for, and the columns come back in the order a single
+    walk would have put them in."""
+    frames = [one for one in frames]
+    if len(frames) == 1:
+        return frames[0]
+    order = _union(frames)
     # rechunk=False keeps the slices' own buffers instead of copying them into
     # one: the answer exists once rather than twice, which on a walk whose
     # result is most of its cost is the difference between finishing and not
-    return pl.concat(parts, how="vertical", rechunk=False)
+    data = pl.concat(frames, how="diagonal_relaxed", rechunk=False)
+    missing = [name for name in order
+               if (shadowed(name) or ("",))[0] == SCORE
+               and any(name not in one.columns for one in frames)]
+    if missing:
+        data = data.with_columns(pl.col(missing).fill_null(1.0))
+    return data.select(order)
+
+
+def _union(frames):
+    """Every column any slice has, each placed after the column it follows in
+    the slice that has it."""
+    order = list(max(frames, key=lambda one: one.width).columns)
+    for one in frames:
+        previous = None
+        for name in one.columns:
+            if name not in order:
+                order.insert(order.index(previous) + 1 if previous else 0, name)
+            previous = name
+    return order

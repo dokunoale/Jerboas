@@ -29,8 +29,9 @@ from . import traverse
 from .expr import (SCORE, VIA, Col, Expr, direction, is_shadow, name_of,
                    reverse, shadow, shadowed)
 from ..store.keys import Key
-from ..plan.optimize import row_budget
+from ..plan.optimize import budget
 from ..plan.plan import Plan
+from ..plan.planner import row_local
 from .resolve import Pending, Resolver, take
 
 RELATION = "relation"
@@ -215,20 +216,31 @@ class Frame:
                 self._claim(name)
             self._known(spec)
 
-        budget = row_budget()
-        if budget is not None and self._produces(steps[0][0]) > budget:
-            # described rather than taken: the walk runs when something reads the
-            # frame, in slices cut by what each step produces (see plan/optimize.py)
-            variables = dict(self.vars)
-            for spec, name in steps:
-                if name is not None:
-                    variables[name] = self._target_type(spec)
-            return Frame(self.graph, None, variables, constants=dict(self.constants),
-                         plan=Plan(self, steps, budget))
+        current = budget()
+        if current is not None:
+            return self._planned(steps, current)
         return self._hop_eager(steps)
 
-    def _hop_eager(self, steps):
-        """The walk itself, taken here and now."""
+    def _planned(self, steps, current):
+        """The walk described rather than taken: it runs when something reads
+        the frame, in slices and from whichever end is cheaper (plan/plan.py).
+        A hop after a hop that has not run yet extends the same plan, so the
+        middle of the walk never exists whole."""
+        plan = (self._plan.extended(steps) if self._plan is not None
+                else Plan.of(self, steps, current))
+        variables, constants = dict(self.vars), dict(self.constants)
+        for spec, name in steps:
+            if name is None:
+                continue
+            variables[name] = self._target_type(spec)
+            single = _single(spec)
+            if single is not None:
+                constants[(VIA, name)] = single
+        return Frame(self.graph, None, variables, constants=constants, plan=plan)
+
+    def _hop_eager(self, steps, toward=None):
+        """The walk itself, taken here and now -- from the far end when the
+        planner found that cheaper (`toward`, for a single step)."""
         graph = self.graph
         base = self._df
         source = self._rightmost()
@@ -238,7 +250,8 @@ class Frame:
         constants = dict(self.constants)
 
         for spec, name in steps:
-            walked, targets, codes, weights, single = _walk(graph, nodes, spec)
+            walked, targets, codes, weights, single = _walk(
+                graph, nodes, spec, None if toward is None else toward.reaches)
             rows = rows[walked]
             added = {column: take(values, walked) for column, values in added.items()}
             nodes = targets
@@ -292,24 +305,40 @@ class Frame:
         nodes = self._df[self._rightmost()].to_numpy()
         return int(self._step_degree(spec)[nodes].sum())
 
-    def _step_degree(self, spec):
-        """Per node, how many edges one step would follow."""
+    def _step_degree(self, spec, flipped=False):
+        """Per node, how many edges one step would follow -- or, `flipped`,
+        how many would arrive at it."""
         relations = _relations(spec)
         if relations is None:                 # any relation, either way
             return self.graph.degree(None, False) + self.graph.degree(None, True)
         total = None
         for name, backwards in relations:
-            counts = self.graph.degree(name, backwards)
+            counts = self.graph.degree(name, backwards != flipped)
             total = counts if total is None else total + counts
         return total
 
-    def _slices(self, spec, budget):
+    def _arriving(self, spec, targets):
+        """Exactly how many edges of one step land in `targets`: what walking
+        the step from that end would cost."""
+        targets = np.unique(np.asarray(targets, dtype=np.int64))
+        return int(self._step_degree(spec, flipped=True)[targets].sum())
+
+    def _reaches(self, spec, targets):
+        """The step's edges into `targets`, found from that end: one Reach per
+        relation it names, in the order `_walk` concatenates them."""
+        relations = _relations(spec)
+        if relations is None:
+            return [traverse.Reach(self.graph, targets)]
+        return [traverse.Reach(self.graph, targets, name, backwards)
+                for name, backwards in relations]
+
+    def _slices(self, degree, budget):
         """This frame cut so one step out of each piece makes about `budget`
-        rows. A slice out of a hub is shorter than one out of a leaf, which is
-        the whole reason to count what a step produces rather than what it is
-        given."""
+        rows, given how many rows each node's step makes (`degree`). A slice
+        out of a hub is shorter than one out of a leaf, which is the whole
+        reason to count what a step produces rather than what it is given."""
         nodes = self._df[self._rightmost()].to_numpy()
-        expansion = self._step_degree(spec)[nodes].astype(np.int64)
+        expansion = degree[nodes].astype(np.int64)
         running = np.cumsum(expansion)
         if not len(running) or running[-1] <= budget:
             yield self
@@ -317,8 +346,10 @@ class Frame:
         # cut wherever the running total crosses another budget's worth, and
         # never leave a slice empty: a node bigger than the budget on its own is
         # a slice of one, which is as small as a walk can be made
+        # a node starts a new slice when its running total passes a mark, so a
+        # slice never makes more than the budget unless one node alone does
         marks = np.arange(budget, int(running[-1]), budget)
-        edges = np.unique(np.searchsorted(running, marks, side="left") + 1)
+        edges = np.unique(np.searchsorted(running, marks, side="right"))
         starts = np.concatenate([[0], edges])
         stops = np.concatenate([edges, [len(expansion)]])
         for start, stop in zip(starts.tolist(), stops.tolist()):
@@ -511,6 +542,11 @@ class Frame:
 
         To fold by a rule instead, `group_by(...).agg(...)`, which says what
         becomes of a confidence rather than inheriting one."""
+        if self._plan is not None and keep in ("first", "last", "any"):
+            # folded a slice at a time and again across them: the first of a
+            # row in the first slice holding it is its first anywhere
+            from ..plan import stream
+            return stream.unique(self, subset, keep, maintain_order)
         columns = None if subset is None else [name_of(one) for one in _listed(subset)]
         return self._wrap(self._df.unique(subset=columns, keep=keep,
                                           maintain_order=maintain_order))
@@ -600,6 +636,26 @@ class Frame:
         reduced = rule(*scores) if callable(rule) else _REDUCE[rule](scores)
         return self._wrap(self._df.with_columns(reduced.alias(into)))
 
+    def batches(self):
+        """The frame a slice at a time, as frames.
+
+        A walk planned inside `optimize` hands out each slice as it is walked,
+        filtered and reduced, and none is kept once the next is asked for -- so
+        an answer that does not fit can still be written out, or folded, as it
+        comes. Anything else is one batch, itself.
+
+            with jb.optimize():
+                walk = seeds.hop(peer="~has_interact", rec="has_interact")
+            for part in walk.batches():
+                part.pl.write_parquet(...)
+
+        Each call walks again: a plan is a description, and reading it twice
+        takes it twice."""
+        if self._plan is None:
+            yield self
+            return
+        yield from self._plan.parts()
+
     def chunked(self, size):
         """The frame in slices of `size` rows, as frames.
 
@@ -686,6 +742,12 @@ class Frame:
         trick is Gumbel's -- perturb each score by `-log(-log(u))` and take the
         top n -- which is exactly sampling without replacement from that
         distribution, at the cost of one array of noise."""
+        if (self._plan is not None and not temperature
+                and (by is None or row_local(by, self.graph))):
+            # the n best of the whole are among the n best of some slice, so
+            # keeping n per slice is enough -- and all a planned walk keeps
+            from ..plan import stream
+            return stream.top(self, n, by, descending, over)
         if by is None:
             by = "score" if "score" in self._df.columns else None
         if by is None:
@@ -707,20 +769,19 @@ class Frame:
         return resolver.wrap(resolver.detach(data))
 
     def _defer(self, predicates):
-        """Hand a condition to a walk that has not happened, so the batch it
-        runs in is the batch it filters."""
-        plan = self._plan
-        target = next(name for _spec, name in reversed(plan.steps) if name is not None)
-        joins, stays = [], []
-        for one in predicates:
-            paths = one.reads() if isinstance(one, Expr) else _root_paths(one)
-            (joins if paths and all(path[0] == target for path in paths)
-             else stays).append(one)
-        if not joins:
-            return self, stays
+        """Hand conditions to a walk that has not happened, so the slice each
+        runs in is the slice it filters.
+
+        All of them or none: a condition whose verdict depends on other rows (a
+        mean, a rank, a `like` keeping the k best) has to see the whole answer,
+        and the others written beside it have to wait with it -- applied first,
+        slice by slice, they would change which rows its mean is taken over."""
+        flat = list(_flat(predicates))
+        if not all(row_local(one, self.graph) for one in flat):
+            return self, predicates
         return Frame(self.graph, None, dict(self.vars),
                      constants=dict(self.constants),
-                     plan=plan.narrowed(joins)), stays
+                     plan=self._plan.narrowed(flat)), []
 
     # --- pushing a predicate into a hop that has not built its rows ----------
 
@@ -747,7 +808,11 @@ class Frame:
         exprs = [_resolved(one, resolver) for one in pushed]
         keep = (resolver.attach(narrow._df)
                 .select(_all(exprs).fill_null(False).alias("keep"))["keep"].to_numpy())
-        return Frame(self.graph, None, self.vars, pending=pending.masked(keep)), stays
+        # what the predicate measured stays, as it would on the rows: a `like`'s
+        # closeness is the column's confidence from here on
+        measured = pending.with_added(resolver.keep)
+        return Frame(self.graph, None, self.vars, pending=measured.masked(keep),
+                     constants={**self.constants, **resolver.constants}), stays
 
     def _var(self, variable=None):
         if variable is not None:
@@ -778,7 +843,8 @@ class Frame:
         Suffixing it to `tag_2` is what a dataframe would do, and it is wrong
         here: the two are different steps, and a filter written against the
         obvious name would silently read the other one."""
-        if target in self._df.columns:
+        present = self._plan.names() if self._plan is not None else self._df.columns
+        if target in present:
             raise ValueError(
                 f"this hop would land on {target!r}, which the frame already has. "
                 f"Give the new column its own name: hop(<name>=<relation>).")
@@ -890,6 +956,11 @@ class _GroupBy:
         self.confidence = confidence
 
     def agg(self, *exprs, **named):
+        if self.frame._plan is not None:
+            from ..plan import stream
+            folded = stream.agg(self, exprs, named)
+            if folded is not None:
+                return folded
         resolver = Resolver(self.frame)
         columns = [_resolved(one, resolver) for one in _flat(exprs)]
         keyed = {name: _resolved(value, resolver) for name, value in named.items()}
@@ -899,6 +970,9 @@ class _GroupBy:
         return resolver.wrap(resolver.detach(grouped.agg(*columns, **keyed)))
 
     def len(self, name="len"):
+        if self.frame._plan is not None:
+            from ..plan import stream
+            return stream.agg(self, (), {}, length=name)
         grouped = self.frame._df.group_by(self.by, maintain_order=self.maintain_order)
         return self.frame._wrap(grouped.agg(pl.len().alias(name), **self._confidence()))
 
@@ -1018,24 +1092,36 @@ def _perturbed(ordering, temperature, resolver, height, seed):
              .otherwise(pl.col(_JITTER))
 
 
-def _walk(graph, nodes, spec):
+def _walk(graph, nodes, spec, reaches=None):
     """One step, over whatever relations it names.
 
     Returns the four arrays a traversal produces plus, when every row walked the
     same relation the same way, the name of it -- a constant that needs no
-    column to say so."""
+    column to say so. `reaches`, when given, are the step's edges into a set
+    found from that end (Frame._reaches): the same arrays, restricted to the
+    set, without walking out of every node."""
     specs = _relations(spec)
-    if specs is None:                                   # any relation, either way
-        return traverse.expand(graph, nodes, None, None, normalized=True) + (None,)
-    parts = [traverse.expand(graph, nodes, name, backwards, normalized=True)
-             for name, backwards in specs]
-    single = None
-    if len(specs) == 1:
-        name, backwards = specs[0]
-        single = reverse(name) if backwards else name
+    if reaches is not None:
+        parts = [reach.gather(nodes, normalized=True) for reach in reaches]
+    elif specs is None:                                 # any relation, either way
+        parts = [traverse.expand(graph, nodes, None, None, normalized=True)]
+    else:
+        parts = [traverse.expand(graph, nodes, name, backwards, normalized=True)
+                 for name, backwards in specs]
+    single = _single(spec)
     if len(parts) == 1:
         return parts[0] + (single,)
-    return tuple(np.concatenate(column) for column in zip(*parts)) + (single,)
+    return traverse.interleave(parts) + (single,)
+
+
+def _single(spec):
+    """The one relation a step walks, as `v.x.via` names it, or None when it
+    may walk several."""
+    specs = _relations(spec)
+    if specs is None or len(specs) != 1:
+        return None
+    name, backwards = specs[0]
+    return reverse(name) if backwards else name
 
 
 def _relations(spec):

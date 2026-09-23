@@ -44,6 +44,12 @@ class Pending:
         return pl.DataFrame({name: _series(name, values)
                              for name, values in self.added.items()})
 
+    def with_added(self, columns):
+        """The same hop, carrying more columns beside what the step produced."""
+        if not columns:
+            return self
+        return Pending(self.base, self.rows, {**self.added, **columns}, self.var)
+
     def masked(self, keep):
         return Pending(self.base, self.rows[keep],
                         {name: take(values, keep) for name, values in self.added.items()},
@@ -199,11 +205,16 @@ class Resolver:
         name = shadow(kind, column)
         if self._present(name):
             return pl.col(name)
+        # one value for every row -- as a column of them rather than a literal,
+        # because a literal is one value in an aggregate too: `v.x.score.sum()`
+        # over a group of three unweighted rows is 3.0, and `lit(1.0).sum()` is 1.0
         constant = self.frame.constants.get((kind, column))
         if constant is not None:
-            return pl.lit(constant)                   # one value, every row
+            return pl.repeat(constant, pl.len())
         # nothing measured this column, so nothing is in doubt about it
-        return pl.lit(1.0) if kind == SCORE else pl.lit(None, dtype=pl.String)
+        if kind == SCORE:
+            return pl.repeat(1.0, pl.len())
+        return pl.repeat(None, pl.len(), dtype=pl.String)
 
     def _types(self, column):
         name = shadow(TYPE, column)
@@ -280,7 +291,11 @@ def _series(name, values):
 
 
 def take(values, keep):
-    """Index an array or a python column, by mask or by position."""
+    """Index an array, a polars series or a python column, by mask or by
+    position."""
+    if isinstance(values, pl.Series):
+        return (values.filter(pl.Series(keep)) if keep.dtype == bool
+                else values.gather(keep))
     if not isinstance(values, list):
         return values[keep]
     if keep.dtype == bool:

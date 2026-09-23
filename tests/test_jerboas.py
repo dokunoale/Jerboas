@@ -1491,9 +1491,9 @@ def test_a_condition_joins_the_walk_it_is_written_after(small_graph):
     what the condition rejects is never built at all."""
     with jb.optimize(rows=1):
         frame = small_graph.nodes(user="user").hop(rec="has_interact")
-        assert frame._plan is not None and not frame._plan.predicates
+        assert frame._plan is not None and not frame._plan.stages[-1][1]
         narrowed = frame.filter(v.rec.year >= 1999)
-        assert narrowed._plan is not None and len(narrowed._plan.predicates) == 1
+        assert narrowed._plan is not None and len(narrowed._plan.stages[-1][1]) == 1
     assert sorted(names(narrowed, "rec")) == ["movie.2", "movie.2"]
 
 
@@ -1504,12 +1504,13 @@ def test_a_condition_about_anything_else_runs_the_walk_first(small_graph):
     assert sorted(names(frame, "rec")) == ["movie.0", "movie.1"]
 
 
-def test_a_walk_inside_the_budget_is_not_deferred(small_graph):
-    """Describing a walk that would be taken whole costs a plan and saves
-    nothing -- and what it would produce is known before it is taken."""
+def test_a_walk_inside_the_budget_is_one_slice(small_graph):
+    """Planned all the same -- the planner may still walk it from the other
+    end -- but what it would produce is known before it is taken, and it fits."""
     with jb.optimize(rows=1000):
         frame = small_graph.nodes(user="user").hop(rec="has_interact")
-    assert frame._plan is None
+    assert frame._plan is not None
+    assert len(list(frame.batches())) == 1
 
 
 def test_the_budget_is_what_a_step_produces(small_graph):
@@ -1518,18 +1519,19 @@ def test_the_budget_is_what_a_step_produces(small_graph):
     users = small_graph.nodes(user="user")
     assert users._produces("has_interact") == 6
     with jb.optimize(rows=6):
-        assert users.hop(rec="has_interact")._plan is None
+        assert len(list(users.hop(rec="has_interact").batches())) == 1
     with jb.optimize(rows=5):
-        assert users.hop(rec="has_interact")._plan is not None
+        assert len(list(users.hop(rec="has_interact").batches())) == 2
 
 
 def test_slices_are_cut_where_the_walk_grows(small_graph):
     """A slice out of a hub is shorter than one out of a leaf, which is the
     reason to count what a step makes rather than what it is handed."""
     users = small_graph.nodes(user="user")
-    pieces = list(users._slices("has_interact", 2))
+    degree = users._step_degree("has_interact")
+    pieces = list(users._slices(degree, 2))
     assert [len(one) for one in pieces] == [1, 1, 1]      # two edges each
-    assert [len(one) for one in users._slices("has_interact", 4)] == [2, 1]
+    assert [len(one) for one in users._slices(degree, 4)] == [2, 1]
 
 
 def test_several_steps_are_one_plan(small_graph):
