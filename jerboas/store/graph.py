@@ -240,7 +240,7 @@ class Graph:
         self._prepare(renumber, readable)
         stamp = None
         if cache is not None:
-            stamp = stored.fingerprint(self._files(), renumber)
+            stamp = stored.fingerprint(self._files(), renumber, cache)
             state = stored.load(cache, stamp)
             if state is not None:
                 self._restore(state)

@@ -25,8 +25,10 @@ Three signals, and the query says how much each counts:
     *the same decade*.
 """
 
+import logging
 import os
-from contextlib import asynccontextmanager
+import time
+from contextlib import asynccontextmanager, contextmanager
 
 import polars as pl
 from fastapi import FastAPI, HTTPException
@@ -187,17 +189,25 @@ def clustered(graph, model, seeds, concentration):
     return seeds.with_columns(part=pl.Series("part", labels, dtype=pl.Int32))
 
 
-def candidates(graph, seeds):
-    """Every song the playlists holding your songs also hold, and how many of
-    them do -- counted within the part of the playlist the seed belongs to.
+def candidates(graph, seeds, known):
+    """Every song the factorization knows that the playlists holding your songs
+    also hold, and how many of them do -- counted within the part of the
+    playlist the seed belongs to.
 
     Two steps out and one back: seed -> the playlists containing it -> what else
-    they contain. The playlists are named because the count is over them."""
-    return (seeds
-            .hop(playlist=reverse("contains"))
-            .hop(rec="contains")
-            .filter(~v.rec.is_in(seeds))
-            .group_by(v.rec, v.part).agg(shared=pl.len().cast(pl.Float64)))
+    they contain. The playlists are named because the count is over them.
+
+    Planned (`jb.optimize`): on the whole graph a handful of popular seeds reach
+    tens of thousands of playlists and millions of rows. The walk runs a slice at
+    a time, each slice keeps only the songs worth counting, and the count is
+    folded across slices -- so the rows never exist all at once."""
+    with jb.optimize():
+        counted = (seeds
+                   .hop(playlist=reverse("contains"))
+                   .hop(rec="contains")
+                   .filter(~v.rec.is_in(seeds), v.rec.is_in(known))
+                   .group_by(v.rec, v.part).len("shared"))
+    return counted.with_columns(shared=v.shared.cast(pl.Float64))
 
 
 def rank(counted, seeds, model, k, parts, temperature):
@@ -243,7 +253,7 @@ def extend(graph, model, known, songs, k, concentration=0.0, temperature=0.0):
              for row in found.rows(named=True)]
 
     parts = clustered(graph, model, seeds, concentration)
-    counted = (candidates(graph, parts).filter(v.rec.is_in(known))
+    counted = (candidates(graph, parts, known)
                .attrs(rec="name")
                # another master of a song you gave me is not a suggestion
                .filter(~v.rec.name.is_in(found.pl["seed.name"].to_list())))
@@ -311,10 +321,38 @@ def fit(graph):
     return model, known
 
 
+def warm(graph, model, known):
+    """One request before the first caller's.
+
+    The first request builds what every later one reads -- the word index over
+    song titles, each relation's bounds in the store, `Concentration`'s
+    products over the whole graph -- which on the whole graph is half a minute.
+    Asked here, with the title of whichever song comes first, it is paid while
+    the service is starting rather than by whoever asks first."""
+    title = graph.nodes(song="song").head(1).attrs(song="name").pl["song.name"][0]
+    extend(graph, model, known, [title], 5)
+
+
+log = logging.getLogger("uvicorn.error")
+
+
+@contextmanager
+def timed(step):
+    """Say how long a startup step took: on the whole graph startup is minutes,
+    and a container log that is silent for minutes looks like a hang."""
+    start = time.perf_counter()
+    yield
+    log.info("spotify: %s ready in %.1f s", step, time.perf_counter() - start)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.graph = load_graph()
-    app.state.model, app.state.known = fit(app.state.graph)
+    with timed("graph"):
+        app.state.graph = load_graph()
+    with timed("fit"):
+        app.state.model, app.state.known = fit(app.state.graph)
+    with timed("warm"):
+        warm(app.state.graph, app.state.model, app.state.known)
     yield
     app.state.graph = app.state.model = app.state.known = None
 

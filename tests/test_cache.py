@@ -86,3 +86,17 @@ def test_a_changed_file_is_read_again(files, tmp_path):
     rewritten = _graph(files, cache=tmp_path / "cache")
     assert isinstance(rewritten.out_indices, np.memmap)       # and the cache is current
     _same(again, rewritten)
+
+
+def test_the_same_data_mounted_elsewhere_finds_its_cache(files, tmp_path):
+    """The host writes it, a container reading the same files under another
+    root maps it: the cache names files relative to itself."""
+    _graph(files, cache=tmp_path / "cache")
+    moved = tmp_path.parent / (tmp_path.name + "-mounted")
+    os.rename(tmp_path, moved)
+    try:
+        elsewhere = {name: moved / path.name for name, path in files.items()}
+        again = _graph(elsewhere, cache=moved / "cache")
+        assert isinstance(again.out_indices, np.memmap)
+    finally:
+        os.rename(moved, tmp_path)

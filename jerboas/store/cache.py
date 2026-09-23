@@ -29,7 +29,7 @@ import polars as pl
 
 from .columns import Column
 
-FORMAT = 1
+FORMAT = 2
 
 # the finalized arrays, by the attribute of Graph that holds them
 _ARRAYS = ("start", "_type_tag_of",
@@ -37,12 +37,20 @@ _ARRAYS = ("start", "_type_tag_of",
            "in_indptr", "in_indices", "in_rels", "in_weights")
 
 
-def fingerprint(files, renumber):
-    """What a cache has to have been built from to be this graph."""
+def fingerprint(files, renumber, directory):
+    """What a cache has to have been built from to be this graph.
+
+    Each file by its path relative to the cache, its size and its modification
+    time to the second. Relative because the same data is mounted at different
+    places -- `/Volumes/...` on the host, `/app/data/...` in a container -- and
+    both should find the cache the other wrote; to the second because a mount
+    does not always carry the nanoseconds."""
+    base = os.path.abspath(directory)
     record = []
     for path in files:
         stat = os.stat(path)
-        record.append([os.path.abspath(path), stat.st_size, stat.st_mtime_ns])
+        record.append([os.path.relpath(os.path.abspath(path), base),
+                       stat.st_size, int(stat.st_mtime)])
     return {"format": FORMAT, "renumber": bool(renumber), "files": record}
 
 
