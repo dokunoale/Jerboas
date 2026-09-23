@@ -32,6 +32,7 @@ import numpy as np
 import polars as pl
 import scipy.sparse as sp
 
+from . import cache as stored
 from .columns import Column, build as build_column
 from ..search.fuzzy import words_of
 from ..query.frame import Frame, RELATION
@@ -227,13 +228,47 @@ def _weights(column):
 
 
 class Graph:
-    def __init__(self, kg=None, edges=None, attrs=None, renumber=False, readable=None):
+    def __init__(self, kg=None, edges=None, attrs=None, renumber=False, readable=None,
+                 cache=None):
+        """`cache` is a directory to keep the finalized graph in: the first load
+        writes it, and every later one maps it back instead of reading the
+        files again -- for as long as the files are the ones it was built from
+        (store/cache.py)."""
         self.kg = kg
         self.edge_files = edges or []
         self.attr_files = attrs or []
         self._prepare(renumber, readable)
+        stamp = None
+        if cache is not None:
+            stamp = stored.fingerprint(self._files(), renumber)
+            state = stored.load(cache, stamp)
+            if state is not None:
+                self._restore(state)
+                return
         self._load()
         self._finalize()
+        if cache is not None:
+            stored.save(self, cache, stamp)
+
+    def _files(self):
+        """Every file this graph is read from, in the order it reads them."""
+        return ([self.kg] if self.kg else []) + list(self.edge_files) + list(self.attr_files)
+
+    def _restore(self, state):
+        """Take a finalized graph as the cache saved it: nothing to parse,
+        nothing to sort, and the large arrays mapped rather than read."""
+        for name in stored._ARRAYS:
+            setattr(self, name, state[name])
+        self.types = list(state["types"])
+        self._type_pos = {type_: tag for tag, type_ in enumerate(self.types)}
+        self.relations = list(state["relations"])
+        self._relation_code = {name: code for code, name in enumerate(self.relations)}
+        self.n_nodes = int(state["n_nodes"])
+        self.columns = state["columns"]
+        self.vectors = state["vectors"]
+        self._e_src = self._e_rel = self._e_tgt = self._e_weight = None
+        self._attr_rows = self._id = self._keys = self._new_of_old = None
+        self._vector_rows = None
 
     def _prepare(self, renumber, readable):
         """The mutable state a build needs, whether it reads files or frames."""
@@ -584,7 +619,12 @@ class Graph:
             self._csr(tgt, src, rel, weight)
 
     def _csr(self, key, value, rel, weight):
-        order = np.lexsort((rel, key))               # by source, then by relation
+        # by source, then by relation, then by the other end: canonical, so the
+        # order a node's edges come back in is a fact about the graph rather
+        # than about the file -- and the two directions agree on it, which is
+        # what lets a walk taken from the far end give the same rows in the
+        # same order (see query/traverse.py, `toward`)
+        order = np.lexsort((value, rel, key))
         indptr = np.zeros(self.n_nodes + 1, dtype=np.int64)
         np.cumsum(np.bincount(key, minlength=self.n_nodes), out=indptr[1:])
         return indptr, value[order], rel[order], weight[order]
