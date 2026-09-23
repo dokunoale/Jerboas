@@ -84,34 +84,31 @@ convenience, and it lands on the existing design without bending it.
 
 ---
 
-## 3. `jb.optimize`: laziness and a planner — the batching done, the planner not
+## 3. `jb.optimize`: laziness and a planner — done
 
-**What exists.** `jb.optimize(rows=n)` defers a hop and the conditions about
-where it lands, then runs the walk in slices. The budget is on what a step
-*produces* and is exact rather than estimated -- the graph keeps every node's
-degree, so an expansion's size is `degree[nodes].sum()` before a step is taken.
-Slices are cut where that running total crosses the budget, so a slice out of a
-hub is shorter than one out of a leaf, a walk that fits is not deferred at all,
-and the budget is applied again at every step -- which is what makes
-`.hop(a=..., b=...)` and `.hop(a=...).hop(b=...)` cost the same. A query the
-kernel kills eagerly completes in 1.9 GB.
+Inside `optimize` every hop is planned (plan/). A plan is a list of stages.
+Each row-local condition joins the earliest stage that can decide it, and a
+condition that reads other rows waits for the whole answer, together with the
+conditions written beside it. A stage that must land in a set cheaper than the
+frame's expansion is walked from the set (`traverse.Reach`). The budget is
+rows, or bytes priced at the frame's row width, and by default half the free
+memory. The slices are a generator: `Frame.batches()` streams them, and `top`,
+`unique` and decomposable `group_by` aggregates fold them without building the
+whole. On the README's MovieLens walk that is 89 s -> 6.6 s.
 
-**What does not.**
+**What is left.**
 
-*Nothing chooses the budget.* The default is a number, not a decision. A planner
-would pick it from the memory it is allowed and the width of the rows.
+*Direction is chosen per stage, from its own landing set only.* A condition two
+stages later that narrows the end does not reach back to choose where the walk
+starts. Meeting in the middle across stages would need the stages' sets
+propagated backwards.
 
-*The answer is accumulated, not streamed.* The slices are concatenated without a
-rechunk, so the result exists once rather than twice, but a walk whose *answer*
-does not fit is still not helped -- and below a floor a smaller budget buys
-nothing, because what is left is the answer.
+*`agg` over raw polars expressions is not folded.* `pl.len()` in an `agg` is
+taken whole. `group_by(...).len()` and `v.x.count()` are folded.
 
-*Nothing chooses the direction.* Which end of a pattern to expand from is a
-choice with a large cost difference and nobody makes it, though the degrees that
-would decide it are the same ones the slicing already reads.
-
-*A predicate that aggregates sees its slice.* A planner would know which
-predicates are row-local and refuse to defer the others; this one assumes.
+*The row-local test for a raw polars expression reads its printed form.* An
+allowlist would be safer, but there is no way to walk a polars expression tree
+from Python.
 
 ## 4. Reducing several confidences to one — done
 
@@ -223,7 +220,7 @@ space with `top(over="part")` answering each. Asked
 | **A model has no checkpoint** | An embedding is fitted by a batch job and loaded from a file; a factorization is fitted at startup and refitted at every restart -- 23 s on the Spotify cut, and minutes on the whole of it. The arrays are the same shape as an embedding's, so `checkpoint.py` already knows how to store them. |
 | **`.to_pandas()` needs pyarrow** | An extra (`jerboas[pandas]`), which is fine, but the error when it is missing is polars' and mentions neither jerboas nor the extra. |
 | **No 0.1 compatibility** | Deliberate, and the migration table in the README is the whole of it. If anyone is on 0.1, a `jerboas.legacy` shim is a week of work and probably not worth it. |
-| **The whole Spotify graph is untried** | 70.8 M edges, and everything here was measured on the 100 000-playlist cut. |
+| **The first request on the whole Spotify graph is slow** | Tried: with `cache=` the graph maps back in 0.4 s (140 s to build the first time), warm requests take 2-5 s, peak RSS 2.7 GB on an 8 GB machine. The first request takes 33 s because it builds the word index, the relation bounds and `Concentration`'s products; a service could warm them at startup. The factorization fit (250 s) is the item above. |
 
 Done since this list was written: `.pl` hides the shadow columns and `.raw` does
 not; `unique` says whose confidence survives; `frame.py` gave up the resolver

@@ -699,45 +699,86 @@ before any filter can reduce it. On a small frame that is nothing; on a large on
 it is the whole problem.
 
 ```python
-with jb.optimize(rows=5_000_000):
+with jb.optimize():
     frame = (watched.hop(peer="~has_interact", rec="has_interact")
                     .filter(v.rec.is_in(wanted)))
 ```
 
-Inside `optimize` a hop describes itself instead of taking place, the filters
-written after it join the description, and the whole of it runs when something
-reads the frame — in slices, each walked, filtered and reduced before the next
-one starts. The answer is the same; the peak is a slice instead of the lot. On
-MovieLens the query above is killed by the kernel eagerly and completes in
-1.9 GB deferred.
+Inside `optimize` a hop describes itself instead of taking place. The filters
+written after it join the description, a hop written after it extends it, and
+the whole of it runs when something reads the frame. What comes back is the
+frame the eager walk would have built: the same rows, in the same order, with
+the same confidences. The planner decides three things with the numbers the
+graph already keeps, which are exact:
 
-**`rows` is a budget on what a step produces, and it is not an estimate.** The
-graph keeps every node's degree, so the exact size of an expansion is
-`degree[nodes].sum()` before a step is taken — 16 807 190 for the walk above.
-The slices are cut where that running total crosses the budget, so a slice out
-of a hub is shorter than one out of a leaf, and a walk that fits inside the
-budget is not deferred at all.
+**Where a condition is decided.** A plan is a list of stages, one per named
+step, and a condition joins the earliest stage after which everything it reads
+exists. A condition on the middle of a walk therefore prunes the middle before
+the next step multiplies it. A condition whose verdict depends on other rows (a
+`mean`, a `rank`, a `like` that keeps the k best) waits for the whole answer,
+and so do the conditions written beside it.
 
-The budget is applied again at **every** step, which is what makes the spelling
-stop mattering: `.hop(a=..., b=...)` and `.hop(a=...).hop(b=...)` are the same
-walk and now cost the same, because either way the second step is cut against
-the middle it actually landed on.
+**Which end to walk from.** A stage that must land in a set
+(`v.rec.is_in(wanted)`) is walked backwards from the set when the set has fewer
+edges than the frame would produce. Order comes out the same both ways because
+the store is canonical: within a node and a relation, both directions order
+their edges by the node at the other end.
 
-| | | |
+**How big a slice.** The size of an expansion is `degree[nodes].sum()`, known
+before a step is taken. Slices are cut where that running total crosses the
+budget, so a slice out of a hub is shorter than one out of a leaf. The budget
+is applied again at every step, so `.hop(a=..., b=...)` and
+`.hop(a=...).hop(b=...)` cost the same.
+
+```python
+jb.optimize()                  # half the memory free right now
+jb.optimize(memory=2 << 30)    # two gigabytes, priced at the frame's row width
+jb.optimize(rows=5_000_000)    # five million rows a step, however wide
+```
+
+On MovieLens the query above, with 20 wanted films, produces 39.9 M rows out of
+a 16.8 M-row middle:
+
+| | time | peak RSS |
 |---|---:|---:|
-| one call, `rows=5M` | 97 s | 1.95 GB |
-| two calls, `rows=5M` | 101 s | 2.42 GB |
-| one call, `rows=1M` | 80 s | 3.13 GB |
-| one call, `rows=20M` | — | killed |
+| 0.2.0, `rows=5M` | 89.0 s | 0.98 GB |
+| planned, `rows=5M` | 6.6 s | 1.28 GB |
 
-Below a floor the budget stops buying anything, because what is left is the
-answer itself: the surviving slices are accumulated rather than streamed. They
-are concatenated without a rechunk, so the result exists once rather than twice,
-but a query whose *answer* does not fit is still not helped. That, and choosing
-the budget for you, is what a planner would add.
+### An answer that does not fit
 
-One more thing follows from working in slices: a predicate that aggregates
-(`>= v.rec.score.mean()`) sees its slice rather than the whole result.
+The slices are a generator. `batches()` hands them out one at a time, so an
+answer can be written out or folded as it comes:
+
+```python
+for part in frame.batches():
+    part.pl.write_parquet(...)
+```
+
+`top`, `unique` and `group_by(...).agg(...)` do that folding themselves when the
+reduction decomposes. For `top`, the n best of the whole are among the n best
+of some slice. For `unique`, a row's first occurrence is in the first slice
+that has it. For `group_by`, sum, count, min, max, first, last and mean merge
+across slices, and so do the confidence rules. A reduction that does not
+decompose (a `std`, a `norm`, a sample) is taken on the whole answer, which is
+slower and never wrong. Folded sums can differ from the eager ones in the last
+bit, because floats were added in a different order.
+
+## A graph read once
+
+```python
+g = jb.Graph(kg=..., edges=[...], attrs=[...], cache="data/spotify/graph/.cache")
+```
+
+The first load writes the finalized graph to that directory: the two CSRs, the
+type blocks and numeric columns as `.npy`, text columns as Arrow IPC. Every
+later load maps it back with `mmap_mode="r"` instead of parsing the files. It
+uses a directory of `.npy` files rather than one `.npz`, because `np.load`
+ignores `mmap_mode` for an archive. The manifest records each source file's
+path, size and modification time, and a cache that does not match the files is
+rebuilt rather than trusted.
+
+On the whole Spotify graph (4.29 M nodes, 70.8 M edges) the first load takes
+140 s and writes 2.5 GB. After that, a load takes 0.4 s.
 
 ## Install
 
