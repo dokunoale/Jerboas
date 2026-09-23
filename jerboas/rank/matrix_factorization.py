@@ -10,7 +10,12 @@ import copy
 import numpy as np
 import scipy.sparse as sp
 
+from ..store.checkpoint import (IDENTITY, NODE, load as load_checkpoint, provenance,
+                                save as save_checkpoint)
 from .core import Strategy
+
+# what a checkpoint holds: one row of factors per node of the two blocks
+TABLES = (("factors", NODE),)
 
 
 class MatrixFactorization(Strategy):
@@ -32,7 +37,16 @@ class MatrixFactorization(Strategy):
     existence, which turns the same solver into explicit feedback: the target is
     the rating rather than a 1. Implicit stays the default because "she watched
     it" and "she rated it 2" are different claims, and only the caller knows
-    which one their edges carry."""
+    which one their edges carry.
+
+    Fitting takes minutes on a large graph, so a fitted factorization is stored
+    the way an embedding is -- rebound by name on load:
+
+        model.save("checkpoints/spotify.dmf.npz", graph, alias="uri")
+        DiffusedMatrixFactorization.load("checkpoints/spotify.dmf.npz", graph)
+    """
+
+    name = "mf"          # the key a checkpoint records
 
     def __init__(self, factors=8, iterations=20, regularization=0.05, seed=42,
                  item_type="movie", user_type="user", relation="has_interact",
@@ -47,6 +61,48 @@ class MatrixFactorization(Strategy):
         self.weighted = weighted
         self.user = user                 # one user for the whole frame, if named
         self.where = where               # the interactions it may learn from
+
+    def config(self):
+        """The hyperparameters, as a checkpoint records them: what has to match
+        for a stored factorization to be this one."""
+        return {"factors": self.factors, "iterations": self.iterations,
+                "regularization": self.regularization, "seed": self.seed,
+                "item_type": self.item_type, "user_type": self.user_type,
+                "relation": self.relation, "weighted": self.weighted}
+
+    def save(self, path, graph, alias=IDENTITY, **details):
+        """Write the fitted factors, rebindable to any graph by name.
+
+        Only the two blocks that have factors are stored. `details` go into the
+        provenance beside the hyperparameters -- whatever narrowed `where` is
+        the caller's to record, since a frame of edges has no name."""
+        users, items, user_factors, item_factors = self.fit(graph)
+        nodes = np.concatenate([np.arange(*users), np.arange(*items)])
+        table = np.concatenate([user_factors, item_factors]).astype(np.float32)
+        meta = provenance(graph, model=self.name, **self.config(), **details)
+        return save_checkpoint(path, self.name, TABLES, self.factors, graph,
+                               {"factors": table}, meta, alias=alias, nodes=nodes)
+
+    @classmethod
+    def load(cls, path, graph, alias=None, **kwargs):
+        """A stored factorization, rebound to `graph` and ready to score.
+
+        The hyperparameters come off the file; `kwargs` are the per-query ones
+        (`to=`, `user=`). What the file recorded is `model.meta`, so a caller can
+        check it is the factorization it meant."""
+        stored = load_checkpoint(path, graph, cls.name, TABLES, alias=alias)
+        meta = stored.meta
+        model = cls(factors=stored.factors, iterations=meta["iterations"],
+                    regularization=meta["regularization"], seed=meta["seed"],
+                    item_type=meta["item_type"], user_type=meta["user_type"],
+                    relation=meta["relation"], weighted=meta["weighted"], **kwargs)
+        model.meta = meta
+        model.missing_nodes = stored.missing_nodes
+        users, items = graph.block(model.user_type), graph.block(model.item_type)
+        table = stored.tensors["factors"].astype(np.float64)
+        fitted = (users, items, table[users[0]:users[1]], table[items[0]:items[1]])
+        model.cached(graph, ("factors", None), lambda: fitted)
+        return model
 
     def fit(self, graph):
         self._graph = graph
@@ -169,6 +225,8 @@ class DiffusedMatrixFactorization(MatrixFactorization):
     The embedding table is one (n_nodes, factors) array. Nodes being integers is
     what allows that -- and with it, scoring a whole result set is one matrix
     product instead of a Python loop over rows."""
+
+    name = "dmf"
 
     def __init__(self, *args, to=None, **kwargs):
         super().__init__(*args, **kwargs)

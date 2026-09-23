@@ -934,6 +934,49 @@ def test_a_fitted_factorization_re_aims_without_refitting(small_graph):
     assert frame.pl["d"].to_list()[0] > 0                          # movie.0 against itself
 
 
+def test_a_factorization_is_stored_and_loaded_back(small_graph, tmp_path):
+    """Fitting is the expensive half, so a service loads what a previous start
+    fitted. Same scores, to float32; the hyperparameters come off the file."""
+    path = tmp_path / "ml.dmf.npz"
+    liked = small_graph.edges("has_interact").filter(v.score >= 2)
+    fitted = DiffusedMatrixFactorization(factors=2, iterations=3, where=liked)
+    fitted.fit(small_graph)
+    fitted.save(path, small_graph, support=2)
+
+    loaded = DiffusedMatrixFactorization.load(path, small_graph)
+    assert loaded.config() == fitted.config()
+    assert loaded.meta["support"] == 2 and loaded.meta["model"] == "dmf"
+    frame = small_graph.nodes(rec="movie")
+    before = frame.with_columns(s=fitted.seeded(["movie.0"]).on("rec")).pl["s"]
+    after = frame.with_columns(s=loaded.seeded(["movie.0"]).on("rec")).pl["s"]
+    np.testing.assert_allclose(after.to_numpy(), before.to_numpy(), rtol=1e-6)
+
+
+def test_a_stored_factorization_rebinds_by_name(tmp_path):
+    """Positions move when a node joins the graph; the name does not."""
+    edges = pl.DataFrame({"source": ["u.b", "u.b", "u.c", "u.c"],
+                          "target": ["i.x", "i.y", "i.y", "i.z"]})
+    first = Graph.from_frames({"likes": edges}, renumber=True)
+    model = MatrixFactorization(factors=2, iterations=3, item_type="i", user_type="u",
+                                relation="likes", user="u.b")
+    model.fit(first)
+    path = tmp_path / "m.mf.npz"
+    model.save(path, first, alias="label")
+
+    grown = pl.concat([pl.DataFrame({"source": ["u.a"], "target": ["i.w"]}), edges])
+    second = Graph.from_frames({"likes": grown}, renumber=True)   # every id shifts
+    loaded = MatrixFactorization.load(path, second, user="u.b")
+
+    def scores(graph, strategy):
+        frame = graph.nodes(item="i").labels("item").with_columns(s=strategy.on("item"))
+        return dict(zip(frame.pl["item.label"].to_list(), frame.pl["s"].to_list()))
+
+    before, after = scores(first, model), scores(second, loaded)
+    for item in ("x", "y", "z"):
+        assert after[item] == pytest.approx(before[item], rel=1e-6)
+    assert after["w"] == 0.0                       # never seen: no affinity
+
+
 def test_matrix_factorization_needs_to_be_told_whose_taste(small_graph):
     """It used to fall back to the first user the search walked through, which
     is an arbitrary person's ranking wearing the shape of an answer."""

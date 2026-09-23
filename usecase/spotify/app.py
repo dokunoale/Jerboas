@@ -41,6 +41,15 @@ from jerboas import Concentration, DiffusedMatrixFactorization, Words, reverse, 
 
 DATA_DIR = os.environ.get("SPOTIFY_DIR", "./data/spotify/graph-100k")
 
+# startup takes minutes on the whole graph, and says so in uvicorn's own log
+log = logging.getLogger("uvicorn.error")
+
+# where the fitted factorization is kept between starts: one per graph, under
+# checkpoints/, which the container mounts from the host
+CHECKPOINT = os.environ.get(
+    "SPOTIFY_CHECKPOINT",
+    f"./checkpoints/spotify.{os.path.basename(os.path.normpath(DATA_DIR))}.dmf.npz")
+
 # how many playlists a song must appear in before the factorization may learn
 # from it (see `supported`) -- a claim about the data rather than a tuning knob,
 # which is why it is here and not hidden in the strategy
@@ -308,17 +317,41 @@ def load_graph():
 
 
 def fit(graph):
-    """The factorization, fitted once at startup on the supported subgraph.
+    """The factorization on the supported subgraph: loaded when a previous start
+    stored this one, fitted and stored otherwise.
 
-    Seconds rather than milliseconds, so it belongs here and not in a request --
-    and unlike an embedding there is no checkpoint to load it from, so a restart
-    refits it."""
+    Minutes on the whole graph, so it is paid once rather than at every start.
+    "This one" means the hyperparameters and the support threshold the
+    checkpoint recorded are the ones declared here -- a stored model fitted
+    with other settings is refitted and replaced, never served."""
     kept, known = supported(graph)
-    model = DiffusedMatrixFactorization(
+    wanted = DiffusedMatrixFactorization(
         factors=FACTORS, iterations=ITERATIONS, where=kept,
         item_type="song", user_type="playlist", relation="contains")
-    model.fit(graph)
-    return model, known
+    stored = _stored(graph, {**wanted.config(), "support": SUPPORT})
+    if stored is not None:
+        log.info("spotify: factorization loaded from %s", CHECKPOINT)
+        return stored, known
+    wanted.fit(graph)
+    os.makedirs(os.path.dirname(CHECKPOINT) or ".", exist_ok=True)
+    # by uri: a song's position is the graph's numbering, its uri is Spotify's
+    wanted.save(CHECKPOINT, graph, alias="uri", support=SUPPORT)
+    log.info("spotify: factorization fitted and stored in %s", CHECKPOINT)
+    return wanted, known
+
+
+def _stored(graph, expected):
+    """The stored factorization, when there is one and it is the one expected."""
+    if not os.path.exists(CHECKPOINT):
+        return None
+    model = DiffusedMatrixFactorization.load(CHECKPOINT, graph)
+    differs = {key: (model.meta.get(key), value) for key, value in expected.items()
+               if model.meta.get(key) != value}
+    if differs:
+        log.info("spotify: %s was fitted with other settings %s; refitting",
+                 CHECKPOINT, differs)
+        return None
+    return model
 
 
 def warm(graph, model, known):
@@ -332,8 +365,6 @@ def warm(graph, model, known):
     title = graph.nodes(song="song").head(1).attrs(song="name").pl["song.name"][0]
     extend(graph, model, known, [title], 5)
 
-
-log = logging.getLogger("uvicorn.error")
 
 
 @contextmanager

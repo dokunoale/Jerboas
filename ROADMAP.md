@@ -217,12 +217,11 @@ space with `top(over="part")` answering each. Asked
 
 | | |
 |---|---|
-| **A model has no checkpoint** | An embedding is fitted by a batch job and loaded from a file; a factorization is fitted at startup and refitted at every restart -- 23 s on the Spotify cut, and minutes on the whole of it. The arrays are the same shape as an embedding's, so `checkpoint.py` already knows how to store them. |
 | **`.to_pandas()` needs pyarrow** | An extra (`jerboas[pandas]`), which is fine, but the error when it is missing is polars' and mentions neither jerboas nor the extra. |
 | **No 0.1 compatibility** | Deliberate, and the migration table in the README is the whole of it. If anyone is on 0.1, a `jerboas.legacy` shim is a week of work and probably not worth it. |
-| **The first request on the whole Spotify graph is slow** | Tried: with `cache=` the graph maps back in 0.4 s (140 s to build the first time), warm requests take 2-5 s, peak RSS 2.7 GB on an 8 GB machine. The first request takes 33 s because it builds the word index, the relation bounds and `Concentration`'s products; a service could warm them at startup. The factorization fit (250 s) is the item above. |
+| **The first request on the whole Spotify graph is slow** | Tried: with `cache=` the graph maps back in 0.4 s (140 s to build the first time), warm requests take 2-5 s, peak RSS 2.7 GB on an 8 GB machine. The first request takes 33 s because it builds the word index, the relation bounds and `Concentration`'s products; a service could warm them at startup. The factorization is checkpointed now: 280 s to fit and store once, a few seconds to load. |
 
-Done since this list was written: `.pl` hides the shadow columns and `.raw` does
+Done since this list was written: a factorization is stored and loaded like an embedding (`save` / `load`, rebound by name); `.pl` hides the shadow columns and `.raw` does
 not; `unique` says whose confidence survives; `frame.py` gave up the resolver
 and the pending hop to `resolve.py`; and `chunked(n)` is the interim the
 benchmark was doing by hand.
