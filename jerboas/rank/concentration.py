@@ -22,15 +22,19 @@ class Concentration(Strategy):
     without one, every edge does, in either direction.
 
     Two sparse products over the whole graph, memoized: it costs the same for
-    one node as for all of them, so it is worth asking of all of them."""
+    one node as for all of them, so it is worth asking of all of them. The memo
+    lives on the space when the space is a strategy, because a model outlives
+    the query that asks -- a service that writes `Concentration(model)` per
+    request pays for the products once, not once a request."""
 
     def __init__(self, space, relation=None):
         self.space = space
         self.relation = relation
 
     def fit(self, graph):
-        self._gathered = self.cached(graph, ("concentration", self.relation),
-                                     lambda: self._compute(graph))
+        holder = self.space if isinstance(self.space, Strategy) else self
+        self._gathered = holder.cached(graph, ("concentration", self.relation),
+                                       lambda: self._compute(graph))
         return self._gathered
 
     def scores(self, graph, columns):

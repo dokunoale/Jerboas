@@ -1810,3 +1810,29 @@ def test_concentration_refuses_a_space_of_the_wrong_size(gathered_graph):
     with pytest.raises(ValueError, match="rows and the graph has"):
         gathered_graph.nodes(node="node").with_columns(
             g=Concentration(np.zeros((3, 2))).on("node"))
+
+
+def test_concentration_is_computed_once_per_model(gathered_graph, monkeypatch):
+    """A service writes `Concentration(model)` per request; the products over
+    the whole graph are the model's to remember, not the request's."""
+    space = gathered_graph.vector("ctx", "embedding")
+    whole = np.zeros((gathered_graph.n_nodes, space.shape[1]), dtype=np.float32)
+    low, high = gathered_graph.block("ctx")
+    whole[low:high] = space
+
+    class Model(jb.Strategy):
+        def embeddings(self, graph):
+            return whole
+
+        def scores(self, graph, columns):
+            return np.zeros(len(columns[0]))
+
+    computed = []
+    original = Concentration._compute
+    monkeypatch.setattr(Concentration, "_compute",
+                        lambda self, graph: computed.append(1) or original(self, graph))
+    model = Model()
+    for _ in range(3):
+        gathered_graph.nodes(node="node").with_columns(
+            g=Concentration(model, relation="holds").on("node"))
+    assert len(computed) == 1

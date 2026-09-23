@@ -283,13 +283,17 @@ def load_graph():
 
     `spotify.contains` carries a score per edge -- a song's place in the
     playlist -- which nothing here reads: what a position means is a question
-    this service does not ask."""
+    this service does not ask.
+
+    Cached beside the data: the whole graph takes minutes to read and under a
+    second to map back, and the files are what the cache checks itself against."""
     return jb.Graph(
         kg=f"{DATA_DIR}/spotify.kg",
         edges=[f"{DATA_DIR}/spotify.contains"],
         attrs=[f"{DATA_DIR}/spotify.{one}"
                for one in ("song", "artist", "album", "playlist")],
         readable=READABLE,
+        cache=f"{DATA_DIR}/.cache",
     )
 
 
