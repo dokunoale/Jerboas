@@ -33,8 +33,8 @@ import polars as pl
 import scipy.sparse as sp
 
 from .columns import Column, build as build_column
-from .fuzzy import words_of
-from .frame import Frame, RELATION
+from ..search.fuzzy import words_of
+from ..query.frame import Frame, RELATION
 from .keys import Key
 
 # Every type has these two columns and they are generated, not read: `id` is the

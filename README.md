@@ -959,23 +959,38 @@ which is what tells it apart from `group_by(...).agg(count)`. Neither expands
 the frame: existence with a set walks the *given* side backwards and collects
 what reaches it, so the cost is the degree of that set. Pass the smaller one.
 
+One directory per stage a query passes through, in the order it passes:
+
 ```
 jerboas/
-  core.py         Strategy, and the Signal that aims one at columns
-  graph.py        the data: integer ids, CSR adjacency, typed columns, nodes()/edges()
-  frame.py        the query: a polars frame that knows its graph
-  traverse.py     one hop, as a gather over CSR slices
-  expr.py         v / col -- names, resolved by the frame that has the graph
-  resolve.py      a hop that has not built its rows, and what resolves a name
-  optimize.py     deferring a walk so its cost has a ceiling
-  rules.py        Fuzzy / Words / Semantic -- what a search measures with
-  fuzzy.py        character similarity, the measure Fuzzy is written in terms of
-  columns.py      typed, nullable attribute columns
-  keys.py         Key -- a node, outside the frame
-  checkpoint.py   storing a trained model, and rebinding it by name
-  strategies/     the ranking family
-  models/         embeddings: strategies you train -- the only place torch lives
+  store/          the data, and what outlives a process
+    graph.py        integer ids in typed blocks, CSR adjacency, typed columns, nodes()/edges()
+    columns.py      typed, nullable attribute columns
+    keys.py         Key -- a node, outside the frame
+    checkpoint.py   storing a trained model, and rebinding it by name
+  query/          the frame and the names in it
+    frame.py        a polars frame that knows its graph
+    expr.py         v / col -- names, resolved by the frame that has the graph
+    resolve.py      a hop that has not built its rows, and what resolves a name
+    traverse.py     one hop, as a gather over CSR slices
+  plan/           deferring a walk so its cost has a ceiling
+    optimize.py     the context, and the budget it sets
+    plan.py         a walk described but not taken, and how it is run
+  search/         what `like` and `near` measure closeness with
+    rules.py        Fuzzy / Words / Semantic
+    fuzzy.py        character similarity, the measure Fuzzy is written in terms of
+  rank/           the scores a column cannot hold on its own
+    core.py         Strategy, and the Signal that aims one at columns
+    pagerank.py, matrix_factorization.py, concentration.py, connectivity.py, weight.py
+  learn/          strategies you train -- the only place torch lives
+    base.py, transd.py, transe.py, train.py
 ```
+
+The imports say what depends on what. `query` is the hub: it reads `store`,
+hands deferred walks to `plan` and measures closeness through `search`. `rank`
+needs only the expression type from `query`, and `learn` builds on `rank` and
+`store`. The one loop is `store` <-> `query`: a graph hands out frames
+(`g.nodes(...)`), so it knows the frame's constructor.
 
 ## Tests
 

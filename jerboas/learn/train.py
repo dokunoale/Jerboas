@@ -23,7 +23,7 @@ import time
 import numpy as np
 import torch
 
-from ..frame import RELATION
+from ..query.frame import RELATION
 
 
 

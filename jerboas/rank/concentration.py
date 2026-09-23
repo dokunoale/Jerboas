@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from ..core import Strategy
+from .core import Strategy
 
 
 class Concentration(Strategy):

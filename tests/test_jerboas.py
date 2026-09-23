@@ -1236,7 +1236,7 @@ def test_without_renumber_the_label_is_the_position(tmp_path):
 # --- the loader --------------------------------------------------------------
 
 def test_chunk_boundaries_are_invisible(tmp_path, monkeypatch):
-    from jerboas import graph as graph_module
+    from jerboas.store import graph as graph_module
 
     rows = [(f"user.{i}", f"movie.{i % 7}", str(1 + i % 5)) for i in range(200)]
     path = tmp_path / "chunky.has_interact"
@@ -1275,7 +1275,7 @@ def test_a_ragged_edge_file_falls_back(tmp_path):
 # --- traversal is a gather ---------------------------------------------------
 
 def test_ranges_concatenates_slices():
-    from jerboas.traverse import ranges
+    from jerboas.query.traverse import ranges
     starts = np.array([10, 0, 5])
     counts = np.array([3, 0, 2])
     assert ranges(starts, counts).tolist() == [10, 11, 12, 5, 6]
@@ -1545,7 +1545,7 @@ def test_several_steps_are_one_plan(small_graph):
 
 
 def test_the_context_puts_it_back(small_graph):
-    from jerboas.optimize import row_budget
+    from jerboas.plan.optimize import row_budget
     assert row_budget() is None
     with jb.optimize(rows=7):
         assert row_budget() == 7

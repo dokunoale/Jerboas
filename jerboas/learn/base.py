@@ -23,9 +23,9 @@ import numpy as np
 import torch
 from torch import nn
 
-from ..checkpoint import (IDENTITY, load as load_checkpoint, provenance,
+from ..store.checkpoint import (IDENTITY, load as load_checkpoint, provenance,
                           save as save_checkpoint)
-from ..core import Strategy
+from ..rank.core import Strategy
 
 NODE = "node"            # a table with one row per node
 RELATION = "relation"    # a table with one row per relation

@@ -12,7 +12,7 @@ edges, which `count()` cannot say and no traversal reveals.
 
 import numpy as np
 
-from ..core import Strategy
+from .core import Strategy
 
 
 class Weight(Strategy):

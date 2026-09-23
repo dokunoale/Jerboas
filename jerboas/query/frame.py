@@ -28,9 +28,10 @@ import polars as pl
 from . import traverse
 from .expr import (SCORE, VIA, Col, Expr, direction, is_shadow, name_of,
                    reverse, shadow, shadowed)
-from .keys import Key
-from .optimize import row_budget
-from .resolve import Pending, Plan, Resolver, take
+from ..store.keys import Key
+from ..plan.optimize import row_budget
+from ..plan.plan import Plan
+from .resolve import Pending, Resolver, take
 
 RELATION = "relation"
 
@@ -63,7 +64,7 @@ class Frame:
         # itself to the arrays instead of to the rows they would become
         self._pending = pending
         # a hop that has not even walked: inside `optimize`, so that the walk
-        # can run a batch at a time with the filters that follow it (resolve.Plan)
+        # can run a batch at a time with the filters that follow it (plan/plan.py)
         self._plan = plan
 
     @property
@@ -217,7 +218,7 @@ class Frame:
         budget = row_budget()
         if budget is not None and self._produces(steps[0][0]) > budget:
             # described rather than taken: the walk runs when something reads the
-            # frame, in slices cut by what each step produces (see optimize.py)
+            # frame, in slices cut by what each step produces (see plan/optimize.py)
             variables = dict(self.vars)
             for spec, name in steps:
                 if name is not None:

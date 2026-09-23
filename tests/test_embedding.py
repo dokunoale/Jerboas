@@ -7,13 +7,13 @@ import numpy as np
 import pytest
 
 from jerboas import Graph, Strategy, v
-from jerboas.checkpoint import FORMAT
+from jerboas.store.checkpoint import FORMAT
 
 torch = pytest.importorskip("torch", reason="fitting needs the [torch] extra")
 
-from jerboas.models import MODELS, train                       # noqa: E402
-from jerboas.models.base import NODE, RELATION                 # noqa: E402
-from jerboas.models.train import examples, type_bounds         # noqa: E402
+from jerboas.learn import MODELS, train                       # noqa: E402
+from jerboas.learn.base import NODE, RELATION                 # noqa: E402
+from jerboas.learn.train import examples, type_bounds         # noqa: E402
 
 
 @pytest.fixture(params=sorted(MODELS))
@@ -86,7 +86,7 @@ def test_type_bounds_cover_each_node_with_its_own_block(small_graph):
 
 
 def test_corruptions_stay_inside_the_type(small_graph):
-    from jerboas.models.train import _corrupt
+    from jerboas.learn.train import _corrupt
     low, high = type_bounds(small_graph)
     rng = np.random.default_rng(0)
     nodes = np.arange(small_graph.n_nodes)
@@ -435,7 +435,7 @@ def _rebuild(tmp_path, rows):
 def test_training_weights_each_example_by_its_edge(small_graph):
     """The weighted run is a different fit, not the same one relabelled -- which
     is the whole claim of moving the score filter out of the loader."""
-    from jerboas.models import TransE
+    from jerboas.learn import TransE
 
     def fit(weighted):
         return train(TransE(factors=4, seed=1), small_graph, epochs=3, batch_size=8,
@@ -446,7 +446,7 @@ def test_training_weights_each_example_by_its_edge(small_graph):
 
 
 def test_weighting_is_inert_on_an_unweighted_graph(tmp_path):
-    from jerboas.models import TransE
+    from jerboas.learn import TransE
 
     kg = tmp_path / "u.kg"
     kg.write_text("movie.0\tdirected_by\tperson.0\nmovie.1\tdirected_by\tperson.1\n")
@@ -485,7 +485,7 @@ def test_a_filter_can_leave_the_other_relations_alone(small_graph):
 
 
 def test_the_filter_is_recorded_in_the_checkpoint(small_graph, tmp_path):
-    from jerboas.models import TransE
+    from jerboas.learn import TransE
 
     kept = small_graph.edges("has_interact").filter(v.score >= 3)
     model = train(TransE(factors=4, seed=1), small_graph, epochs=1, batch_size=8,
@@ -499,7 +499,7 @@ def test_the_filter_is_recorded_in_the_checkpoint(small_graph, tmp_path):
 
 
 def test_a_filter_that_admits_nothing_says_so(small_graph):
-    from jerboas.models import TransE
+    from jerboas.learn import TransE
 
     with pytest.raises(ValueError, match="filter frame is empty"):
         train(TransE(factors=4), small_graph, epochs=1,

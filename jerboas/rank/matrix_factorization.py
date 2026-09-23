@@ -10,7 +10,7 @@ import copy
 import numpy as np
 import scipy.sparse as sp
 
-from ..core import Strategy
+from .core import Strategy
 
 
 class MatrixFactorization(Strategy):

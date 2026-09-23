@@ -22,7 +22,7 @@ like a relation, and `.expr` drops out to raw polars.
 import numpy as np
 import polars as pl
 
-from .keys import Key
+from ..store.keys import Key
 
 # the two escapes, for a type whose attribute is named like a relation
 ATTR, REL = "attr", "rel"

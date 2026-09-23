@@ -22,7 +22,7 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 
-from .expr import Expr
+from ..query.expr import Expr
 
 
 class Signal(Expr):

@@ -23,7 +23,7 @@ Nodes are integers throughout, which is what makes an embedding table a single
 (N, factors) array a strategy can index directly.
 
 fit() means "prepare to score", and is expected to cost milliseconds. A model
-whose training is orders of magnitude slower than that lives in jerboas.models,
+whose training is orders of magnitude slower than that lives in jerboas.learn,
 where it is a Strategy too -- fitted by an explicit batch job, then loaded from a
 checkpoint and used in a column like any other.
 """

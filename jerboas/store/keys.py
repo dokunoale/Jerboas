@@ -1,7 +1,7 @@
 """Key: one node, outside the frame.
 
 Internally a node is an integer and a relation is a small code -- that is what
-makes CSR slices and per-node arrays possible (see graph.py). A frame carries
+makes CSR slices and per-node arrays possible (see store/graph.py). A frame carries
 those integers, because that is what indexes an array; `frame.keys(...)` is
 where one becomes a thing that knows what it is.
 
