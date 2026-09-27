@@ -12,8 +12,7 @@ needle admits nothing rather than everything.
 
 Admission and weight come from one measure, which is what keeps them from
 disagreeing: the rows that come back are exactly the ones the ranking would have
-put on top, and the measure stays on the frame as a `similarity` column instead
-of quietly becoming a ranking term nobody wrote.
+put on top, and the measure stays on the frame as the column's confidence.
 """
 
 import heapq
@@ -36,8 +35,7 @@ def scorer(needle, cutoff=0.0):
     difflib indexes its *second* sequence, so the needle belongs there and gets
     indexed once instead of once per candidate; `real_quick_ratio` and
     `quick_ratio` are O(n) upper bounds that skip the quadratic work for anything
-    that cannot reach `cutoff` anyway. Measured on a column of 12 649 names:
-    5.6x, and not one score above the cutoff moved."""
+    that cannot reach `cutoff` anyway."""
     text_needle = str(needle).lower()
     if not text_needle:
         # contained in everything, which would make a blank search the broadest
@@ -60,14 +58,11 @@ def closest(needle, texts, k, cutoff, exclusive=False):
     """The k rows closest to one needle, as [(row, similarity)].
 
     A needle that is literally present is already as close as anything can be, so
-    the expensive comparison only runs when plain containment cannot fill k --
-    the difference between a millisecond and a fifth of a second on a column of
-    twelve thousand names.
+    the expensive comparison only runs when plain containment cannot fill k.
 
     Shortest first among the containing ones: "alien" is inside Alien, Aliens,
     Alien 3 and Alien: Resurrection, and the one that adds least is the one that
-    was meant. Column order instead let an exact match lose to whatever loaded
-    first."""
+    was meant."""
     text_needle = str(needle).lower()
     contained = sorted((len(text), row) for row, text in texts
                        if text_needle and text_needle in text

@@ -5,10 +5,6 @@ makes CSR slices and per-node arrays possible (see store/graph.py). A frame carr
 those integers, because that is what indexes an array; `frame.keys(...)` is
 where one becomes a thing that knows what it is.
 
-There is no `Rel` here any more. A traversed relation is a column of names, with
-a leading `~` for a step taken against the stored direction -- readable when the
-frame prints, and comparable with `==` like any other string column.
-
 Key is not an int subclass: variable-length builtins cannot carry __slots__, and
 `str(key)` would then have to fight int's own formatting. It defines __index__
 instead, so a Key still works directly as a numpy index or a dict key -- a
@@ -79,14 +75,12 @@ class Key:
     __repr__ = __str__
 
     def __format__(self, spec):
-        # int.__format__ would win for an int subclass; here the only risk is an
-        # empty spec silently falling back to object.__format__, so be explicit
+        # explicit, so an empty spec does not fall back to object.__format__
         return format(str(self), spec)
 
     def __reduce__(self):
         """A Key holds its graph so a caller can read a label off it, which the
-        default pickling would then serialise -- 4.6 MB for one MovieLens node,
-        gigabytes for one Spotify song. It is a *reference into* a graph, and a
+        default pickling would then serialise whole. It is a *reference into* a graph, and a
         reference is meaningless without the thing it points at, so it refuses
         rather than quietly copying one. `str(key)` is what travels."""
         raise TypeError(

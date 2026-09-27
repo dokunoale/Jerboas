@@ -162,8 +162,7 @@ def stack(frames):
         return frames[0]
     order = _union(frames)
     # rechunk=False keeps the slices' own buffers instead of copying them into
-    # one: the answer exists once rather than twice, which on a walk whose
-    # result is most of its cost is the difference between finishing and not
+    # one, so the answer exists once rather than twice
     data = pl.concat(frames, how="diagonal_relaxed", rechunk=False)
     missing = [name for name in order
                if (shadowed(name) or ("",))[0] == SCORE

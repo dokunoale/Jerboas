@@ -81,8 +81,7 @@ def expand(graph, nodes, relation=None, reverse=None, normalized=False):
     """Every edge leaving a set of nodes, as four parallel arrays.
 
     `reverse` is False forwards, True backwards, None both -- the wildcard's
-    natural reading, and what closes a bridge pattern without the store holding
-    each edge twice. A code comes back negated (`~code`) when the edge was walked
+    natural reading. A code comes back negated (`~code`) when the edge was walked
     against the direction it is stored in, so one integer carries both.
 
     The order is the store's: by the row walked from, then forwards before

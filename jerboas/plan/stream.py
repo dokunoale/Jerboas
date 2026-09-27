@@ -13,7 +13,7 @@ Each reduces a slice, sets it aside, and folds what is set aside whenever it
 outgrows what was already folded -- so the peak is about twice the answer plus
 one slice, and the work stays linear. A reduction that does not decompose (a
 median, a `norm`, a sample) is not taken here: the frame builds the whole and
-reduces it as it always did, which is slower and never wrong.
+reduces it, which is slower and never wrong.
 """
 
 import polars as pl

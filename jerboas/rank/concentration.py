@@ -76,8 +76,7 @@ class Concentration(Strategy):
 
         The two directions as two products rather than one symmetric matrix:
         `matrix.T` is a view, and `matrix + matrix.T` would be two more copies
-        of the relation -- on the whole Spotify graph, the difference between a
-        6 GB peak and one a container survives."""
+        of the relation."""
         if self.relation is None:
             return graph.matrices()
         matrix = graph.relation_matrix(self.relation)

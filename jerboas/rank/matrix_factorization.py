@@ -1,9 +1,8 @@
 """Implicit-feedback matrix factorization, and its diffused variant.
 
 Both read the user-item matrix as a block slice of the relation matrix the
-Graph already holds, rather than assembling their own CSR from the adjacency --
-or, with `where`, from a frame of the interactions they are allowed to learn
-from."""
+Graph already holds -- or, with `where`, from a frame of the interactions they
+are allowed to learn from."""
 
 import copy
 
@@ -32,8 +31,7 @@ class MatrixFactorization(Strategy):
 
     Whose taste is being applied is *named*, either as a second column holding
     the user of each row or as one user for the whole frame. It is not inferred:
-    this used to fall back to the first user node the search happened to walk
-    through, which is an arbitrary person's ranking wearing the shape of an
+    a guessed user is an arbitrary person's ranking wearing the shape of an
     answer.
 
     `weighted=True` reads the interaction's stored score instead of its mere
@@ -118,8 +116,7 @@ class MatrixFactorization(Strategy):
 
     def _compute_factors(self, graph):
         """The user-item matrix is the interaction relation restricted to the two
-        type blocks -- a slice of a matrix the Graph already holds, where this
-        used to be a hand-built CSR with its own index arrays.
+        type blocks -- a slice of a matrix the Graph already holds.
 
         `where` narrows it to a frame of interactions, the same way `train`
         narrows what a model may learn from. It is not a nicety: a factorization
@@ -200,9 +197,8 @@ class MatrixFactorization(Strategy):
         # Who interacted with what never changes across iterations, so read it
         # straight off the sparse layout once: CSR stores row i's column indices
         # contiguously in indices[indptr[i]:indptr[i+1]], and CSC does the same
-        # per column. That is the alternative to re-scanning a boolean mask (and
-        # a strided column of it) on every pass. The values travel with them, so
-        # implicit and explicit feedback run the same loop.
+        # per column. The values travel with them, so implicit and explicit
+        # feedback run the same loop.
         csr, csc = matrix.tocsr(), matrix.tocsc()
         by_user = [_slice(csr, i) for i in range(n_users)]
         by_item = [_slice(csc, j) for j in range(n_items)]
@@ -281,9 +277,9 @@ class DiffusedMatrixFactorization(MatrixFactorization):
         #
         # Neighbours in either direction are two products, one per direction of
         # the store, over a vector that is zero outside the item block -- rather
-        # than a symmetric adjacency sliced to the items, which on the whole
-        # Spotify graph is two gigabytes held to be multiplied once. The sum is
-        # taken a few dimensions at a time for the same reason.
+        # than a symmetric adjacency sliced to the items, which would be held
+        # whole to be multiplied once. The sum is taken a few dimensions at a
+        # time for the same reason.
         directions = graph.matrices("norm" if self.weighted else None)
         represented = np.zeros(graph.n_nodes, dtype=np.float32)
         represented[items[0]:items[1]] = (item_factors != 0).any(axis=1)

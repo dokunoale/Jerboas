@@ -14,9 +14,9 @@ polars' group_by, `sort` polars' sort. The forwarded verbs are listed one by one
 rather than caught by `__getattr__`, so this class has an API instead of an
 accident, and `.pl` hands back the DataFrame for anything not listed.
 
-The frame is eager. Every verb here returns a materialized frame, which is what
-makes `print(g.nodes("movie"))` a table rather than a plan -- and a hop has to
-read its source ids anyway, so laziness would only defer the cheap half.
+The frame is eager, so `print(g.nodes("movie"))` is a table rather than a plan.
+Inside `optimize` a hop is deferred instead, and runs in slices when something
+reads the frame (plan/).
 """
 
 import operator
@@ -36,14 +36,7 @@ from .resolve import Pending, Resolver, take
 
 RELATION = "relation"
 
-# Every column carries a confidence, and where something measured one it is kept
-# here: an ordinary polars column under a reserved prefix, so filter, sort, join
-# and group_by keep it aligned with its values without a line of code from us.
-# Hidden from `columns` and from `print`, because it is an attribute of a column
-# rather than a column -- `v.rec.score` is how it is read.
-#
-# Absent means 1.0. A graph with no weights and a query with no fuzzy matching
-# therefore allocate nothing at all.
+
 class Frame:
     """A table of node ids, joined to the graph that gave them meaning."""
 
@@ -195,8 +188,7 @@ class Frame:
         be named, because where the walk ends is what the frame holds.
 
         A step is a relation, `~name` for it read backwards, or a collection for
-        any of several. The empty collection is any relation at all, either way,
-        which is what closes a bridge without the store holding every edge twice.
+        any of several. The empty collection is any relation at all, either way.
 
         Walking leaves from the rightmost column of nodes; to leave from
         another, `select` it and `join` the result back.
@@ -343,9 +335,6 @@ class Frame:
         if not len(running) or running[-1] <= budget:
             yield self
             return
-        # cut wherever the running total crosses another budget's worth, and
-        # never leave a slice empty: a node bigger than the budget on its own is
-        # a slice of one, which is as small as a walk can be made
         # a node starts a new slice when its running total passes a mark, so a
         # slice never makes more than the budget unless one node alone does
         marks = np.arange(budget, int(running[-1]), budget)
@@ -561,11 +550,9 @@ class Frame:
         `v.x.needle` leaves -- and `through` is one step to where two of them
         meet.
 
-        `connection` is what a meeting is worth. That they met at all beats
-        counting the meetings (which favours the popular) and beats dividing
-        that count by how far each reaches (which overshoots to the obscure):
-        resolving real playlists back to their songs, 98.4% against 89.1% and
-        77.5%.
+        `connection` is what a meeting is worth: "meet" (that they met at all),
+        "count" (how often, which favours the popular), or "share"/"damped"
+        (the count divided by how far each reaches, which leans to the obscure).
 
         The choice is `k**n` combinations and is not enumerated. Starting from
         the frame's own order, each group takes the candidate best connected to
@@ -588,9 +575,8 @@ class Frame:
         """How often each pair of candidates meets, as a dense (rows, rows)
         matrix -- small, being one per name times a handful.
 
-        One step out to the meeting places and a self-join there. Walking back
-        would visit everything else those places hold, which is a million rows
-        to keep a few hundred."""
+        One step out to the meeting places and a self-join there, rather than
+        walking back and visiting everything else those places hold."""
         marked = self._wrap(self._df.with_row_index(_ROW))
         met = marked.hop(**{_MEET: through}).pl.select([_ROW, _MEET])
         paired = (met.join(met, on=_MEET, suffix="_other")
@@ -659,10 +645,8 @@ class Frame:
     def chunked(self, size):
         """The frame in slices of `size` rows, as frames.
 
-        What a caller does by hand when a walk out of the whole thing would not
-        fit -- the benchmark expands its users a block at a time for exactly
-        this reason. A planner would choose the size; until there is one, the
-        caller does."""
+        The manual counterpart of `batches`, for when a walk out of the whole
+        frame would not fit: here the caller chooses the size."""
         for start in range(0, max(self._df.height, 1), size):
             part = self._wrap(self._df.slice(start, size))
             if len(part):
@@ -789,8 +773,7 @@ class Frame:
         """Apply what can be applied to the arrays, and hand back the rest.
 
         A predicate is pushable when everything it reads is about the node the
-        hop just reached, or about the step itself -- which is exactly the class
-        of constraint the old compiler folded into an admission mask."""
+        hop just reached, or about the step itself."""
         pending = self._pending
         stays, pushed = [], []
         for one in predicates:

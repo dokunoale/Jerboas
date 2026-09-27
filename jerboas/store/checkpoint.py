@@ -68,8 +68,7 @@ def identities(graph, alias, nodes=None):
     `alias` where the node's type has that column, and its own id where it does
     not -- so a graph of mixed types needs one alias, not one per type.
 
-    A type block at a time rather than a node at a time: on the whole Spotify
-    graph that is four gathers instead of four million Python calls."""
+    A type block at a time rather than a node at a time: one gather per type."""
     nodes = (np.arange(graph.n_nodes) if nodes is None
              else np.asarray(nodes, dtype=np.int64))
     names = np.empty(len(nodes), dtype=object)

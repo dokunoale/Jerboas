@@ -27,8 +27,7 @@ class Pending:
     of a hop. Holding them one step lets a filter about the node just reached be
     applied here -- to arrays -- instead of to rows that would then be dropped.
 
-    Nothing else is deferred: any other verb reads `_df` and pays for it. This
-    is a peephole, not a query planner."""
+    Nothing else is deferred: any other verb reads `_df` and pays for it."""
 
     __slots__ = ("base", "rows", "added", "var")
 
@@ -159,9 +158,7 @@ class Resolver:
         questions, and only the frame can tell them apart.
 
         A node column takes source keys, Keys and frames, all resolved against
-        the graph. Anything else takes its values as they are -- resolving
-        "Alpha" as a node key on a column of titles admitted nothing, which is
-        the worst way to be wrong."""
+        the graph. Anything else takes its values as they are."""
         path = path_of(target)
         nodes = (path is not None and len(path) == 1 and path[0] in self.frame.vars)
         if nodes or hasattr(values, "ids"):

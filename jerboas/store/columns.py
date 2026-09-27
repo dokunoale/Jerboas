@@ -2,9 +2,7 @@
 
 A column is typed once at load instead of every value staying text. That is what
 lets `year >= 1990` be one array comparison rather than a per-candidate string
-coercion -- and it removes a class of bug the text-only loader had, where
-`year == 1994` and `year == '1994'` disagreed unless every operator remembered
-to coerce. Reading one into a frame is a gather at its local ids; comparing it
+coercion. Reading one into a frame is a gather at its local ids; comparing it
 is polars' business from there.
 
 Absence is carried by an explicit `present` mask rather than by NaN. NaN would

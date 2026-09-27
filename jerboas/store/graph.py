@@ -8,8 +8,8 @@ graph whose contents depend on how it was written. From that: the universe is
 `range(N)`, so every per-node fact is a plain array; a type's block is a slice;
 and a hop is a gather over CSR slices (traverse.py) rather than a join.
 
-Relations are stored once, as an edge-labeled CSR plus its transpose, so walking
-backwards reads the transpose rather than a duplicated `_r` relation.
+Relations are stored once, as an edge-labeled CSR plus its transpose; walking
+backwards reads the transpose.
 
 Every edge carries a weight defaulting to 1.0 -- there is no unweighted edge,
 only one whose weight nobody wrote down -- and what counts as good enough is a
@@ -53,9 +53,7 @@ DEFAULT_WEIGHT = 1.0
 
 # how much of an edge file becomes columns at a time. Splitting the whole file
 # at once would hold one Python string per *field* until the load finished --
-# millions of them, costing more than the graph they describe. Between 1 KB and
-# 32 MB the time is flat and only the memory moves, so the size is chosen for
-# the memory.
+# costing more than the graph they describe.
 CHUNK = 1 << 16
 
 
@@ -114,9 +112,8 @@ def _table(path, header, minimum):
 def _rectangle(block, width):
     """Columns from a chunk of equal-width lines, or None when it is not one.
 
-    Two separators and one pass: making the newline a tab as well leaves a flat
-    field list that strides into columns, where the obvious reading makes two
-    Python calls per line."""
+    Making the newline a tab as well leaves a flat field list that strides
+    into columns in one pass."""
     fields = block.replace("\n", "\t").split("\t")
     del fields[-1]                       # the chunk ends on a newline
     if not fields or len(fields) % width:
@@ -274,7 +271,7 @@ class Graph:
     def _prepare(self, renumber, readable):
         """The mutable state a build needs, whether it reads files or frames."""
         self.renumber = renumber         # ids are not positions: assign them here
-        # {type: column a person reads}. Declared, never inferred -- see labels()
+        # {type: column a person reads}. Declared, never inferred
         self.readable = dict(readable or {})
 
         self._cache = {}                 # name -> memoized value; safe for the graph's lifetime
@@ -297,9 +294,8 @@ class Graph:
 
         self._attr_rows = {}             # type -> (column names, {provisional id: values})
         # type -> {name: (provisional ids, matrix)}. A vector is not a column:
-        # it has no value a row can print and no order to sort by, and what a
-        # query asks of one is nearness. Kept as one (n, d) float32 block per
-        # type, so scoring a candidate set is a matmul and not a gather of lists
+        # what a query asks of one is nearness, so it is kept as one (n, d)
+        # float32 block per type and scoring a candidate set is a matmul
         self._vector_rows = {}
         # a frame build sets neither, and _load reads both as "nothing to read"
         self.kg = getattr(self, "kg", None)
@@ -589,8 +585,7 @@ class Graph:
 
         Sorting each node's slice by relation is what makes both access patterns
         cheap from a single store: a wildcard hop is the whole slice, and a
-        named relation is a searchsorted sub-range of it. Two arrays per
-        direction, versus a dict of dicts of lists holding 2x the edges.
+        named relation is a searchsorted sub-range of it.
 
         The weight rides along as a third array per direction, permuted by the
         same order: `out_weights[p]` is the weight of the edge ending at
@@ -658,8 +653,7 @@ class Graph:
         Built once per column and memoized, the way a degree or a normalized
         weight is. It answers the question a search actually asks -- which rows
         hold this word -- instead of walking every value to find out, and it
-        answers it by *word*, which is the difference between `Toxic` matching
-        `Toxicity` and not.
+        answers it by *word*, so `Toxic` does not match `Toxicity`.
 
         None when the column is not text, since there is nothing to tokenize."""
         column = self.column(type_, name)
@@ -707,7 +701,7 @@ class Graph:
         return self.types[self._type_tag_of[index]]
 
     def block(self, type_):
-        """The half-open index range of a type: `keys_by_type`, as arithmetic."""
+        """The half-open index range of a type."""
         tag = self._type_pos.get(type_)
         if tag is None:
             return 0, 0
@@ -737,8 +731,7 @@ class Graph:
     def column(self, type_, name):
         """A whole typed attribute column, for building a mask in one go.
 
-        None when the type has no such column, which then simply matches nothing
-        rather than falling back to some synthetic string."""
+        None when the type has no such column, which then matches nothing."""
         table = self.columns.get(type_)
         return None if table is None else table.get(name)
 
@@ -840,10 +833,8 @@ class Graph:
         offsets: `indptr` says where each node's block starts, this says which
         node each position belongs to.
 
-        int32 because it holds node ids, and memoized because a relation's hop
-        bounds are counted from it -- on the full Spotify graph this array is
-        283 MB, and rebuilding it per relation is what that would otherwise
-        cost."""
+        int32 because it holds node ids, and memoized because every relation's
+        hop bounds are counted from it."""
         return self.cached(("sources", reverse), lambda: self._expand_sources(reverse))
 
     def _expand_sources(self, reverse):
@@ -872,8 +863,7 @@ class Graph:
         count = max(len(self.relations), 1)
         low, high = np.full(count, np.inf), np.full(count, -np.inf)
         # one masked pass per relation rather than `np.minimum.at`, which is
-        # numpy's unbuffered fallback: 3x on 2.78M edges and three relations.
-        # Relations stay few, so a handful of extra passes is the cheap side
+        # numpy's slow unbuffered path; relations are few
         for code in range(len(self.relations)):
             weights = self.out_weights[self.out_rels == code]
             if weights.size:
@@ -915,9 +905,8 @@ class Graph:
 
     # Matrices are built from the store on every call and not memoized. The CSR
     # already is one: a node's edges are contiguous and sorted, so a matrix
-    # over it needs no conversion, only a column of cell values. On the whole
-    # Spotify graph one of these is a gigabyte or more, and every strategy that
-    # asks for one fits once and keeps what it computed, not the matrix.
+    # over it needs no conversion, only a column of cell values. A strategy
+    # that asks for one keeps what it computed, not the matrix.
     # Multi-edges stay as repeated cells; a product sums them, which is what
     # "counting multi-edges" means.
 
@@ -940,8 +929,7 @@ class Graph:
     def adjacency(self, weights=None):
         """The undirected adjacency as one N x N CSR, counting multi-edges.
 
-        Both directions, so random-walk mass flows symmetrically -- the property
-        `rv=True` used to buy by physically duplicating every edge. A walk wants
+        Both directions, so random-walk mass flows symmetrically. A walk wants
         `weights="norm"` rather than "raw": a negative score is not a
         transition."""
         forwards, backwards = self.matrices(weights)
@@ -956,8 +944,7 @@ class Graph:
         code = self._relation_code.get(relation)
         shape = (self.n_nodes, self.n_nodes)
         if code is None:
-            # a name the graph never saw matches nothing. Reading it as "all of
-            # them" is how a typo used to become the whole graph
+            # a name the graph never saw matches nothing, never every relation
             return sp.csr_matrix(shape, dtype=np.float32)
         # within a node, a relation's edges are one contiguous run of its slice,
         # so the rows stay in order and only their lengths change
@@ -1027,8 +1014,7 @@ class Graph:
         the edges themselves asks, and what a training run is handed to say which
         of them it may learn from.
 
-        The relation rides along as an Enum: dictionary-encoded, so naming it on
-        seventy million rows costs a byte each rather than a string each."""
+        The relation rides along as an Enum, dictionary-encoded."""
         sources = self.sources()
         keep = slice(None)
         if relation is not None:

@@ -1,8 +1,7 @@
 """A finalized graph on disk, mapped back instead of rebuilt.
 
-Loading reads every edge once and runs Python once per distinct node: on the
-whole Spotify graph that is 77 s, and it is the same 77 s every time a process
-starts. What it produces is a handful of arrays that never change afterwards --
+Loading reads every edge once and runs Python once per distinct node, and it
+does so again every time a process starts. What it produces is a handful of arrays that never change afterwards --
 the two CSRs, the type blocks, the attribute columns -- so the second load can
 map them from disk instead:
 
