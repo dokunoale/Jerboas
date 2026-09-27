@@ -32,7 +32,8 @@ from ..store.keys import Key
 from ..plan.optimize import budget
 from ..plan.plan import Plan
 from ..plan.planner import row_local
-from .resolve import Pending, Resolver, take
+from .resolve import Pending, Resolver, _series, take
+from .step import Step, root_of
 
 RELATION = "relation"
 
@@ -189,6 +190,8 @@ class Frame:
 
         A step is a relation, `~name` for it read backwards, or a collection for
         any of several. The empty collection is any relation at all, either way.
+        `step(...)` says the same and can budget it: `step("~rated").top(20)`
+        follows the 20 best edges of each row rather than all of them (step.py).
 
         Walking leaves from the rightmost column of nodes; to leave from
         another, `select` it and `join` the result back.
@@ -197,8 +200,8 @@ class Frame:
         confidence (`v.genre.score`) and which relation it walked is
         `v.genre.via`.
         """
-        steps = [(spec, None) for spec in through]
-        steps += [(spec, name) for name, spec in named.items()]
+        steps = [(Step.of(spec), None) for spec in through]
+        steps += [(Step.of(spec), name) for name, spec in named.items()]
         if not named:
             raise ValueError(
                 "the last step of a hop must be named: where the walk ends is "
@@ -206,7 +209,7 @@ class Frame:
         for spec, name in steps:
             if name is not None:
                 self._claim(name)
-            self._known(spec)
+            spec.known(self.graph)
 
         current = budget()
         if current is not None:
@@ -224,8 +227,8 @@ class Frame:
         for spec, name in steps:
             if name is None:
                 continue
-            variables[name] = self._target_type(spec)
-            single = _single(spec)
+            variables[name] = spec.target_type(self.graph)
+            single = spec.single()
             if single is not None:
                 constants[(VIA, name)] = single
         return Frame(self.graph, None, variables, constants=constants, plan=plan)
@@ -242,8 +245,10 @@ class Frame:
         constants = dict(self.constants)
 
         for spec, name in steps:
-            walked, targets, codes, weights, single = _walk(
-                graph, nodes, spec, None if toward is None else toward.reaches)
+            walked, targets, codes, weights = spec.walk(
+                graph, nodes, name, self._context(base, rows, added, variables),
+                None if toward is None else toward.reaches)
+            single = spec.single()
             rows = rows[walked]
             added = {column: take(values, walked) for column, values in added.items()}
             nodes = targets
@@ -275,62 +280,31 @@ class Frame:
         return Frame(graph, None, variables, pending=Pending(base, rows, added, last),
                      constants=constants)
 
-    def _known(self, spec):
-        """Refuse a step over a relation the graph has never seen.
+    def _context(self, base, rows, added, variables):
+        """What a step's map may read of the frame the walk leaves from: the
+        columns of the variables it names, at the rows the candidates came from
+        -- and only those, so a map that reads a user builds one column, not
+        the frame."""
+        def context(roots, walked):
+            names = [name for name in base.columns if root_of(name) in roots]
+            columns = base.select(names)[rows[walked]] if names else pl.DataFrame()
+            carried = [_series(name, take(values, walked))
+                       for name, values in added.items() if root_of(name) in roots]
+            if carried:
+                columns = columns.hstack(carried) if names else pl.DataFrame(carried)
+            return columns, {root: variables[root] for root in roots if root in variables}
+        return context
 
-        Walking one matches nothing, which is a defensible answer to a question
-        about a relation that exists elsewhere and an indefensible one to a
-        typo -- and a hop names its relation on purpose, so a name the graph
-        does not have is the second."""
-        for name, _backwards in (_relations(spec) or ()):
-            if self.graph.relation_code(name) is None:
-                raise ValueError(
-                    f"no relation {name!r} in this graph; it has: "
-                    f"{', '.join(self.graph.relations)}")
-
-    def _produces(self, spec):
-        """Exactly how many rows one step out of this frame would make.
-
-        Not an estimate: a node's degree is a number the graph keeps, so the
-        size of an expansion is known before a step is taken. It is what decides
-        whether a walk is worth deferring, and where its slices are cut."""
-        nodes = self._df[self._rightmost()].to_numpy()
-        return int(self._step_degree(spec)[nodes].sum())
-
-    def _step_degree(self, spec, flipped=False):
-        """Per node, how many edges one step would follow -- or, `flipped`,
-        how many would arrive at it."""
-        relations = _relations(spec)
-        if relations is None:                 # any relation, either way
-            return self.graph.degree(None, False) + self.graph.degree(None, True)
-        total = None
-        for name, backwards in relations:
-            counts = self.graph.degree(name, backwards != flipped)
-            total = counts if total is None else total + counts
-        return total
-
-    def _arriving(self, spec, targets):
-        """Exactly how many edges of one step land in `targets`: what walking
-        the step from that end would cost."""
-        targets = np.unique(np.asarray(targets, dtype=np.int64))
-        return int(self._step_degree(spec, flipped=True)[targets].sum())
-
-    def _reaches(self, spec, targets):
-        """The step's edges into `targets`, found from that end: one Reach per
-        relation it names, in the order `_walk` concatenates them."""
-        relations = _relations(spec)
-        if relations is None:
-            return [traverse.Reach(self.graph, targets)]
-        return [traverse.Reach(self.graph, targets, name, backwards)
-                for name, backwards in relations]
+    def _nodes(self):
+        """The ids a walk leaves from."""
+        return self._df[self._rightmost()].to_numpy()
 
     def _slices(self, degree, budget):
         """This frame cut so one step out of each piece makes about `budget`
         rows, given how many rows each node's step makes (`degree`). A slice
         out of a hub is shorter than one out of a leaf, which is the whole
         reason to count what a step produces rather than what it is given."""
-        nodes = self._df[self._rightmost()].to_numpy()
-        expansion = degree[nodes].astype(np.int64)
+        expansion = degree[self._nodes()].astype(np.int64)
         running = np.cumsum(expansion)
         if not len(running) or running[-1] <= budget:
             yield self
@@ -354,15 +328,6 @@ class Frame:
             if name in self.vars:
                 return name
         raise ValueError("hop(...) needs a column of nodes to leave from")
-
-    def _target_type(self, spec):
-        """What a step will land in, before it is taken: a schema fact, since
-        there is no data yet to read one off."""
-        relations = _relations(spec)
-        if relations is None or len(relations) != 1:
-            return None
-        name, backwards = relations[0]
-        return self.graph.target_types(name, backwards)
 
     def _one_type(self, targets):
         """The type these nodes are, when they are all of one -- read off the
@@ -593,7 +558,7 @@ class Frame:
         if connection not in ("share", "damped"):
             raise ValueError(f"unknown connection {connection!r}; expected "
                              f"'share', 'damped' or 'count'")
-        reach = self._step_degree(through)[self._df[node].to_numpy()].astype(float)
+        reach = Step.of(through).degree(self.graph)[self._df[node].to_numpy()].astype(float)
         power = 0.5 if connection == "share" else 0.25
         scale = np.outer(reach, reach) ** power
         return np.divide(weights, scale, out=np.zeros_like(weights), where=scale > 0)
@@ -716,10 +681,10 @@ class Frame:
         than a sort, so it costs one pass instead of one query per group:
 
             .top(10, by="score", over="user")
-            .hop(mid=()).top(5, by=v.pr, over="seed").hop(rec=())
 
-        That second line is a beam search: keep the k most promising partial
-        walks at each step and expand only those.
+        The k best edges out of each row *during* a walk are a budgeted step
+        instead (`step(...).top(k)`, step.py): cutting here, after the hop,
+        pays for the whole expansion first.
 
         `temperature` makes the choice a sample rather than a maximum: at zero
         the n best, above it the n drawn in proportion to `exp(score / t)`. The
@@ -1073,51 +1038,6 @@ def _perturbed(ordering, temperature, resolver, height, seed):
     return pl.when(spread > 0) \
              .then(ordering / (spread * temperature) + pl.col(_JITTER)) \
              .otherwise(pl.col(_JITTER))
-
-
-def _walk(graph, nodes, spec, reaches=None):
-    """One step, over whatever relations it names.
-
-    Returns the four arrays a traversal produces plus, when every row walked the
-    same relation the same way, the name of it -- a constant that needs no
-    column to say so. `reaches`, when given, are the step's edges into a set
-    found from that end (Frame._reaches): the same arrays, restricted to the
-    set, without walking out of every node."""
-    specs = _relations(spec)
-    if reaches is not None:
-        parts = [reach.gather(nodes, normalized=True) for reach in reaches]
-    elif specs is None:                                 # any relation, either way
-        parts = [traverse.expand(graph, nodes, None, None, normalized=True)]
-    else:
-        parts = [traverse.expand(graph, nodes, name, backwards, normalized=True)
-                 for name, backwards in specs]
-    single = _single(spec)
-    if len(parts) == 1:
-        return parts[0] + (single,)
-    return traverse.interleave(parts) + (single,)
-
-
-def _single(spec):
-    """The one relation a step walks, as `v.x.via` names it, or None when it
-    may walk several."""
-    specs = _relations(spec)
-    if specs is None or len(specs) != 1:
-        return None
-    name, backwards = specs[0]
-    return reverse(name) if backwards else name
-
-
-def _relations(spec):
-    """A step's relations as [(name, reverse)], or None for the wildcard.
-
-    An empty collection is the wildcard: no constraint on the relation is the
-    empty set of constraints, which is also why there is no magic string."""
-    if isinstance(spec, str):
-        spec = (spec,)
-    specs = tuple(spec)
-    if not specs:
-        return None
-    return [direction(name) for name in specs]
 
 
 def _distinct(graph, rows, nodes):

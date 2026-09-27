@@ -75,9 +75,10 @@ def roots(predicate):
     """The columns a predicate reads, by their root name, or None when it does
     not say (a raw polars expression, a strategy's ids)."""
     if isinstance(predicate, Expr):
-        columns = getattr(predicate, "columns", None)
-        if getattr(predicate, "strategy", None) is not None:
-            return set(columns)
+        # a column answers any attribute by growing its path, so it is asked
+        # first: `v.x.strategy` is a column, not a strategy
+        if not isinstance(predicate, Col) and getattr(predicate, "strategy", None) is not None:
+            return set(predicate.columns)
         paths = predicate.reads()
         return {path[0] for path in paths} if paths else None
     if isinstance(predicate, pl.Expr):

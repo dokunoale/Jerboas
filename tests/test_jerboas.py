@@ -1560,7 +1560,7 @@ def test_the_budget_is_what_a_step_produces(small_graph):
     """Not what it is given: six interactions out of three users is six rows,
     so a budget of six fits and a budget of five does not."""
     users = small_graph.nodes(user="user")
-    assert users._produces("has_interact") == 6
+    assert jb.step("has_interact").degree(small_graph)[users.ids("user")].sum() == 6
     with jb.optimize(rows=6):
         assert len(list(users.hop(rec="has_interact").batches())) == 1
     with jb.optimize(rows=5):
@@ -1571,7 +1571,7 @@ def test_slices_are_cut_where_the_walk_grows(small_graph):
     """A slice out of a hub is shorter than one out of a leaf, which is the
     reason to count what a step makes rather than what it is handed."""
     users = small_graph.nodes(user="user")
-    degree = users._step_degree("has_interact")
+    degree = jb.step("has_interact").degree(small_graph)
     pieces = list(users._slices(degree, 2))
     assert [len(one) for one in pieces] == [1, 1, 1]      # two edges each
     assert [len(one) for one in users._slices(degree, 4)] == [2, 1]

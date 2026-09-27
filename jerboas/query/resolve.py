@@ -202,6 +202,12 @@ class Resolver:
         name = shadow(kind, column)
         if self._present(name):
             return pl.col(name)
+        root = column.partition(".")[0]
+        if not self._present(column) and not self._present(root):
+            # the provenance of nothing: answering 1.0 would be an answer
+            raise ValueError(
+                f"no column {column!r} to read the {kind} of -- this frame has: "
+                f"{', '.join(self.frame.columns)}")
         # one value for every row -- as a column of them rather than a literal,
         # because a literal is one value in an aggregate too: `v.x.score.sum()`
         # over a group of three unweighted rows is 3.0, and `lit(1.0).sum()` is 1.0
