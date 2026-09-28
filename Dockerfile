@@ -14,7 +14,7 @@ WORKDIR /app
 # __init__.py outlives the real one and ends up in the installed package.
 # EXTRAS picks what the image is for: serving a use case by default, or the
 # whole of it when the image is being built to run the tests (see test.sh).
-ARG EXTRAS=api,torch
+ARG EXTRAS=api,torch,ui
 
 # Torch, from the CPU index rather than PyPI. The default wheel for aarch64 is a
 # CUDA build -- 2.9GB of nvidia-* and triton that nothing here can reach, there

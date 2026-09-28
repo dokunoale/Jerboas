@@ -28,6 +28,10 @@ api = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
 ]
+# the page a use case can mount beside its API (usecase/spotify/ui.py)
+ui = [
+    "gradio>=5.0",
+]
 dev = [
     "pytest>=8.0",
 ]
@@ -37,7 +41,7 @@ pandas = [
     "pyarrow>=15.0",
 ]
 all = [
-    "jerboas[torch,api,dev,pandas]",
+    "jerboas[torch,api,ui,dev,pandas]",
 ]
 
 [build-system]

@@ -12,7 +12,7 @@ cd "$(dirname "$0")"
 
 IMAGE=jerboas-test
 
-container build --build-arg EXTRAS=api,torch,dev,pandas -t "$IMAGE" . >/dev/null
+container build --build-arg EXTRAS=api,torch,ui,dev,pandas -t "$IMAGE" . >/dev/null
 
 exec container run --rm \
     -v "$PWD/jerboas:/app/jerboas" \
