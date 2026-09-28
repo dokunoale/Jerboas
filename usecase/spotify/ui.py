@@ -18,7 +18,8 @@ from recommend import PLAYLISTS, extend
 EXAMPLES = [
     ["Smells Like Teen Spirit\nCome As You Are\nLithium\nPoker Face\nBad Romance\nToxic",
      5, 0.5, 0.0, PLAYLISTS],
-    ["Wonderwall | Oasis\nChampagne Supernova\nDon't Look Back in Anger", 5, 0.0, 0.0, PLAYLISTS],
+    ["Wonderwall | Oasis\nChampagne Supernova | Oasis\nDon't Look Back in Anger | Oasis",
+     5, 0.0, 0.0, PLAYLISTS],
     ["Toxic\nLose Control\nBad Romance", 5, 0.0, 0.0, 0],
 ]
 

@@ -99,20 +99,23 @@ def _by_performer(graph: jb.Graph, wanted: list[tuple[str, str | None]]) -> jb.F
     is the only answer there is.
 
     One query for every pinned name: the performers are searched together and
-    `v.artist.name.needle` says which one each is, so the title that goes with
-    it is a join rather than an iteration."""
-    pins = {performer: title for title, performer in wanted if performer}
-    if not pins:
+    `v.artist.name.needle` says which one each is, so the titles that go with
+    it are a join rather than an iteration -- all of them, since several names
+    may pin the same performer."""
+    pins = pl.DataFrame([(performer, title) for title, performer in wanted if performer],
+                        schema={"who": pl.String, "asked": pl.String}, orient="row")
+    if not len(pins):
         return _no_candidates(graph)
     people = (graph.nodes(artist="artist")
-              .filter(v.artist.name.like(list(pins), rule=Words(k=PERFORMERS)))
-              .with_columns(who=v.artist.name.needle))
+              .filter(v.artist.name.like(pins["who"].unique(maintain_order=True).to_list(),
+                                         rule=Words(k=PERFORMERS)))
+              .with_columns(who=v.artist.name.needle.cast(pl.String)))
     if not len(people):
         return _no_candidates(graph)
-    songs = (people.hop(seed=reverse("performed_by"))
-             .attrs(seed="name")
-             .with_columns(asked=pl.col("who").cast(pl.String)
-                           .replace_strict(pins, default=None)))
+    # each performer found, once per title asked of them
+    songs = (people.join(pins, on="who")
+             .hop(seed=reverse("performed_by"))
+             .attrs(seed="name"))
     return (songs
             .filter(pl.col("seed.name").str.to_lowercase()
                     .str.contains(pl.col("asked").str.to_lowercase(), literal=True))
