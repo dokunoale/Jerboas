@@ -199,7 +199,10 @@ class Ranked:
         self.count = np.asarray(count, dtype=np.int64)
         self.start = np.cumsum(self.count) - self.count
         self.ranking = self.order = self.cumulative = self.descending = None
-        if ranking is None or not len(ranking) or ranking.min() == ranking.max():
+        # a map alike for every edge orders nothing -- unless it is nothing
+        # everywhere, which leaves nothing to draw
+        if (ranking is None or not len(ranking)
+                or ranking.min() == ranking.max() != 0):
             return
         self.ranking = ranking
         index = np.int32 if len(ranking) < 2**31 else np.int64
@@ -237,38 +240,99 @@ class Ranked:
         return rows, (chosen if self.order is None else self.order[chosen])
 
     def draw(self, segments, width, seed, keys):
-        """(rows, index): `width` draws per segment in proportion to the map,
-        with replacement, folded to the distinct edges.
+        """(rows, index): `width` distinct edges per segment, drawn without
+        replacement in proportion to the map -- or all of them, when a segment
+        holds no more. Rows come out in the order of `segments`.
 
         A draw is a function of the seed, the segment's key and which draw it
         is (`_uniform`), never of where the segment sits in what was asked: a
         node reached twice draws the same edges both times, and a walk taken in
         slices draws what it would have whole.
 
-        A segment whose edges all weigh nothing has nothing to draw from and
-        contributes no rows, as one with no edges does."""
-        lo = self.start[segments]
-        hi = lo + self.count[segments]
+        Two ways, one distribution. A segment up to a few times the budget gives
+        every edge a key, `log(u) / weight`, and keeps the `width` largest:
+        exactly a weighted draw without replacement (Efraimidis & Spirakis), at
+        a cost bounded by the budget. A larger one draws with replacement and
+        drops the repeats, round after round, until it has `width` distinct --
+        which is the same draw, and repeats are rare where the segment is large.
+        An edge that weighs nothing is never drawn."""
+        segments = np.asarray(segments)
+        keys = np.asarray(keys)
+        count = self.count[segments]
+        near = count <= _EXACT * width
+        parts = [self._by_keys(np.flatnonzero(near & (count > 0)), segments, width,
+                               seed, keys),
+                 self._by_rounds(np.flatnonzero(~near), segments, width, seed, keys)]
+        rows = np.concatenate([one[0] for one in parts])
+        index = np.concatenate([one[1] for one in parts])
+        order = np.lexsort((index, rows))
+        return rows[order], index[order]
+
+    def _by_keys(self, which, segments, width, seed, keys):
+        """Every edge of these segments keyed, the `width` best keys kept."""
+        empty = np.zeros(0, dtype=np.int64)
+        if not len(which):
+            return empty, empty
+        lo, count = self.start[segments[which]], self.count[segments[which]]
+        rows = np.repeat(which, count)
+        index = ranges(lo, count)
+        offset = index - np.repeat(lo, count)
         if self.ranking is None:
-            live = np.flatnonzero(hi > lo)
-            rows = np.repeat(live, width)
-            uniform = _uniform(seed, np.asarray(keys)[rows], width)
-            index = lo[rows] + (uniform * (hi - lo)[rows]).astype(np.int64)
+            weight = np.ones(len(index))
+        else:
+            weight = self.ranking[index].astype(np.float64)
+            live = weight > 0
+            rows, index, offset, weight = rows[live], index[live], offset[live], weight[live]
+        key = np.log(_uniform(seed, keys[rows], offset, salt=1)) / weight
+        order = np.lexsort((-key, rows))
+        rows, index = rows[order], index[order]
+        kept = _within(rows) < width
+        return rows[kept], index[kept]
+
+    def _by_rounds(self, which, segments, width, seed, keys):
+        """Draws with replacement, repeats dropped, until each segment has
+        `width` distinct -- or the rounds run out, which only a map putting
+        nearly all of a segment's mass on fewer than `width` edges gets to."""
+        empty = np.zeros(0, dtype=np.int64)
+        if not len(which):
+            return empty, empty
+        lo = self.start[segments[which]]
+        hi = lo + self.count[segments[which]]
+        if self.ranking is None:
+            live = np.arange(len(which))
         else:
             if self.cumulative is None:
                 self.cumulative = np.cumsum(self.ranking, dtype=np.float64)
-            cumulative = self.cumulative
-            below = np.where(lo > 0, cumulative[np.maximum(lo - 1, 0)], 0.0)
-            mass = np.where(hi > lo, cumulative[np.maximum(hi - 1, 0)], 0.0) - below
-            live = np.flatnonzero(mass > 0)
-            rows = np.repeat(live, width)
-            drawn = below[rows] + _uniform(seed, np.asarray(keys)[rows], width) * mass[rows]
-            index = np.clip(np.searchsorted(cumulative, drawn, side="right"),
-                            lo[rows], hi[rows] - 1)
-        # one row per distinct edge: a draw landing twice is one arrival
-        keep = np.unique(rows * (int(self.count.sum()) + 1) + index, return_index=True)[1]
-        keep.sort()
-        return rows[keep], index[keep]
+            below = np.where(lo > 0, self.cumulative[np.maximum(lo - 1, 0)], 0.0)
+            mass = self.cumulative[hi - 1] - below
+            live = np.flatnonzero(mass > 0)        # nothing to draw from the rest
+        pending = live
+        span = int(hi.max()) + 1
+        drawn_rows, drawn_index = [], []
+        rows = index = empty
+        for turn in range(_ROUNDS):
+            if not len(pending):
+                break
+            fresh = np.repeat(pending, width)
+            draws = turn * width + np.tile(np.arange(width), len(pending))
+            uniform = _uniform(seed, keys[which[fresh]], draws)
+            if self.ranking is None:
+                landed = lo[fresh] + (uniform * (hi - lo)[fresh]).astype(np.int64)
+            else:
+                landed = np.clip(np.searchsorted(self.cumulative,
+                                                 below[fresh] + uniform * mass[fresh],
+                                                 side="right"), lo[fresh], hi[fresh] - 1)
+            drawn_rows.append(fresh)
+            drawn_index.append(landed)
+            # each edge once, at its first draw, grouped by segment in draw order
+            every_row = np.concatenate(drawn_rows)
+            every_index = np.concatenate(drawn_index)
+            first = np.unique(every_row * span + every_index, return_index=True)[1]
+            first = first[np.lexsort((first, every_row[first]))]
+            rows, index = every_row[first], every_index[first]
+            pending = live[np.bincount(rows, minlength=len(which))[live] < width]
+        kept = _within(rows) < width
+        return which[rows[kept]], index[kept]
 
 
 class Fused:
@@ -326,18 +390,37 @@ class Fused:
         return index + self.shift[nodes]
 
 
-def _uniform(seed, nodes, width):
-    """One number in [0, 1) per (node, draw), from a counter-based hash
-    (splitmix64): the same seed, node and draw give the same number anywhere.
-    `nodes` holds each node `width` times in a row, one per draw."""
-    draw = np.arange(len(nodes), dtype=np.uint64) % np.uint64(width)
+# a segment up to this many times the budget is drawn from by keying all of its
+# edges; a larger one by rounds of draws, at most this many
+_EXACT = 4
+_ROUNDS = 16
+
+
+def _within(rows):
+    """Each element's place within its run of equal `rows`, which are grouped."""
+    if not len(rows):
+        return np.zeros(0, dtype=np.int64)
+    starts = np.flatnonzero(np.r_[True, rows[1:] != rows[:-1]])
+    return np.arange(len(rows)) - np.repeat(starts, np.diff(np.r_[starts, len(rows)]))
+
+
+def _uniform(seed, keys, draws, salt=0):
+    """One number in (0, 1) per (key, draw), from a counter-based hash
+    (splitmix64, twice): the same seed, key and draw give the same number
+    anywhere. `salt` keeps two uses of one (key, draw) apart."""
     with np.errstate(over="ignore"):
-        state = (np.uint64(seed) * np.uint64(0x9E3779B97F4A7C15)
-                 + nodes.astype(np.uint64) * np.uint64(width) + draw)
-        state = (state ^ (state >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
-        state = (state ^ (state >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
-        state = state ^ (state >> np.uint64(31))
-    return (state >> np.uint64(11)).astype(np.float64) / float(1 << 53)
+        state = _mix(np.uint64(seed) * np.uint64(0x9E3779B97F4A7C15)
+                     + np.asarray(keys).astype(np.uint64) + np.uint64(salt << 32))
+        state = _mix(state + np.asarray(draws).astype(np.uint64)
+                     * np.uint64(0xD1B54A32D192ED03))
+    # the top 53 bits, moved off zero so that a logarithm of one is finite
+    return ((state >> np.uint64(11)).astype(np.float64) + 0.5) / float(1 << 53)
+
+
+def _mix(state):
+    state = (state ^ (state >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+    state = (state ^ (state >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+    return state ^ (state >> np.uint64(31))
 
 
 def gathered(graph, rows, positions, reverse, normalized=False):

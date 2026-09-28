@@ -101,8 +101,9 @@ class Step:
         return Step(self.specs, self.stages + (Select(n, by),), self.measure)
 
     def sample(self, n, by=None, seed=None):
-        """n edges of each row drawn with replacement in proportion to `by`,
-        which must not be negative, and folded to the distinct ones.
+        """n distinct edges of each row, drawn without replacement in
+        proportion to `by`, which must not be negative -- or every edge of a
+        row that has no more than n.
 
         With a seed the draw is a function of the node (traverse.Ranked.draw):
         the same answer every time and however the walk is sliced. Without one

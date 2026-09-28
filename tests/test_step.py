@@ -1,11 +1,15 @@
 """A budgeted step: at most n edges per row, the best or a draw, fused into the
 store so it costs what it keeps. The fixture graph is in conftest.py."""
 
+import itertools
+
+import numpy as np
 import polars as pl
 import pytest
 
 import jerboas as jb
 from jerboas import step, v
+from jerboas.query import traverse
 
 
 def pairs(frame, *columns):
@@ -100,6 +104,55 @@ def test_a_sample_by_weight_never_draws_an_edge_weighing_nothing(small_graph):
     drawn = step("has_interact").sample(20, seed=0)
     kept = small_graph.nodes(user=["user.0"]).hop(movie=drawn)
     assert as_str(pairs(kept, "user", "movie")) == {("user.0", "movie.0")}
+
+
+def test_a_sample_wider_than_a_node_takes_all_of_it(small_graph):
+    # with replacement, two draws out of two edges miss one a quarter of the time
+    users = small_graph.nodes(user="user")
+    full = pairs(users.hop(movie="has_interact"), "user", "movie")
+    for seed in range(20):
+        drawn = step("has_interact").sample(2, by=1, seed=seed)
+        assert pairs(users.hop(movie=drawn), "user", "movie") == full
+
+
+@pytest.mark.parametrize("size", [10, 50])     # keyed, and drawn in rounds
+def test_a_draw_is_distinct_and_uniform(size):
+    ranked = traverse.Ranked(np.array([size]))
+    seen = np.zeros(size)
+    for seed in range(3000):
+        _rows, index = ranked.draw([0], 5, seed, [7])
+        assert len(index) == len(set(index.tolist())) == 5
+        seen[index] += 1
+    expected = 3000 * 5 / size
+    assert np.all(np.abs(seen - expected) < 0.2 * expected)
+
+
+def _inclusion(weights, n, item):
+    """The exact chance `item` is among n drawn without replacement in
+    proportion to the weights, one after another: summed over every order."""
+    total = 0.0
+    for order in itertools.permutations(np.flatnonzero(weights > 0).tolist(), n):
+        chance, left = 1.0, weights.sum()
+        for one in order:
+            chance *= weights[one] / left
+            left -= weights[one]
+        total += chance if item in order else 0.0
+    return total
+
+
+@pytest.mark.parametrize("size", [10, 50])     # keyed, and drawn in rounds
+def test_a_weighted_draw_follows_the_weights(size):
+    weights = np.ones(size)
+    weights[0], weights[1] = 0.0, 9.0          # never, and nine times as often
+    ranked = traverse.Ranked(np.array([size]), weights)
+    hits = np.zeros(size)
+    for seed in range(3000):
+        _rows, index = ranked.draw([0], 3, seed, [7])
+        assert len(set(index.tolist())) == 3
+        hits[index] += 1
+    assert hits[0] == 0
+    for item in (1, 2):
+        assert abs(hits[item] / 3000 - _inclusion(weights, 3, item)) < 0.03
 
 
 def test_a_budgeted_step_plans_like_any_other(small_graph):
