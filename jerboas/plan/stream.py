@@ -167,6 +167,8 @@ _CONFIDENCE = {
             lambda column: pl.col(f"__jb_c_{column}")),
     "product": (lambda measured, column: [measured.product().alias(f"__jb_c_{column}")],
                 lambda column: pl.col(f"__jb_c_{column}")),
+    "sum": (lambda measured, column: [measured.sum().alias(f"__jb_c_{column}")],
+            lambda column: pl.col(f"__jb_c_{column}")),
     "first": (lambda measured, column: [measured.first().alias(f"__jb_c_{column}")],
               lambda column: pl.col(f"__jb_c_{column}")),
 }
@@ -179,7 +181,7 @@ def _MERGE_OF(name, wanted, rule):
     if name.startswith(("__jb_s", "__jb_n", "__jb_len", "__jb_cs_", "__jb_cn_")):
         return "sum"
     if name.startswith("__jb_c_"):
-        return rule                    # min, max, product, first: themselves
+        return rule                    # min, max, product, sum, first: themselves
     raise AssertionError(name)
 
 

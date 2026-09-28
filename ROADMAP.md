@@ -226,13 +226,14 @@ from. How they are stored, ordered and combined is the second half of the work.
    Lin & Metzler 2011), the same idea as Viola & Jones's cascade (2001). What
    is missing is stopping on bounds: II.1's order gives each segment's maximum
    for free, so a cascade could stop as TA does.
-4. **The space maps stack in (in part).** For a walk the natural space is
-   probabilities: `probability()` on each step and their product
-   (`.confidence("product")` already reduces several confidences so) is the
-   probability of the walk. The README's reading, which does not compose
-   confidence along a walk, stays the default for the exact walk. The two now
-   coexist, one per step. What is not done is the sampled walk's
-   inclusion probability, which is what the estimator in I.2 needs.
+4. **The space maps stack in (done for walks).** For a walk the natural space
+   is probabilities: a `probability()` step multiplies its transition by the
+   confidence of the node it leaves from, so the last step's confidence is the
+   probability of the walk, and `group_by(confidence="sum")` is the chance of
+   ending on each node. Everywhere else confidence still does not compose, as
+   the README says. The two readings coexist, one per step. What is not done
+   is the sampled walk's inclusion probability, which is what the estimator in
+   I.2 needs.
 5. **Embedding maps behind an index.** A taste that is a dot product is a
    maximum-inner-product search: HNSW (Malkov & Yashunin 2018), FAISS (Johnson
    et al. 2019), asymmetric LSH for MIPS (Shrivastava & Li 2014). `near` already
@@ -261,6 +262,12 @@ no cleaner design.
   and the README and `Frame.top` now point to the step.
 - **`balanced` as a vote (done)**, as `probability()`. It is not a special
   vote: it is what a random walk measures.
+- **Selection in turns (done).** `top(k, spread="part")` takes k across
+  groups in turns, the partition form of diverse selection (I.3). It replaced
+  a quota, a top-up and two dedupes in the Spotify service.
+- **One table of confidence rules (done).** `FOLD` was defined twice,
+  identically, in `frame.py` and `resolve.py`. It is one table now, with
+  `"sum"` added for walks' mass.
 - **A provenance of nothing is refused (done).** `v.nobody.score` answered 1.0
   for a column the frame does not have, which is the worst way to be wrong.
   Found by the step's map, fixed in the resolver.

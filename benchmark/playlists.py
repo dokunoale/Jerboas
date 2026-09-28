@@ -58,7 +58,8 @@ SPECIFIC = 1 / v.playlist.contains.count().log1p()
 #             which also divides a playlist's vote among its songs
 VOTES = {"count": ((False, False), None),
          "balanced": ((True, False), v.playlist.score),
-         "walk": ((True, True), v.playlist.score * v.rec.score)}
+         # the last step's confidence composes the first's: the walk's probability
+         "walk": ((True, True), v.rec.score)}
 
 # Which edges the walk follows: (to the playlists, to their songs).
 BUDGETS = {"exact": (step("~contains"), step("contains")),

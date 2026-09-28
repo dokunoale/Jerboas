@@ -268,11 +268,15 @@ class Resolver:
         return pl.col(name)
 
 
+# what a group's confidence becomes: the rules `group_by(confidence=...)`
+# takes, here because the planner folds a walk's slices by the same ones
 FOLD = {
     "mean": lambda expr: expr.mean(),
     "min": lambda expr: expr.min(),
     "max": lambda expr: expr.max(),
     "product": lambda expr: expr.product(),
+    # the mass of a set of walks: their probabilities, added
+    "sum": lambda expr: expr.sum(),
     "first": lambda expr: expr.first(),
 }
 

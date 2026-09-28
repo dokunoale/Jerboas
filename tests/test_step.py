@@ -133,3 +133,34 @@ def test_the_nucleus_keeps_the_fewest_edges_holding_a_share(small_graph):
     # the same, evaluated on the candidates rather than fused
     dynamic = step("has_interact").top_p(0.5, by=(v.user >= 0).cast(pl.Float64) * v.movie.score)
     assert pairs(users.hop(movie=dynamic), "user", "movie") == pairs(kept, "user", "movie")
+
+
+def _walk_home(frame):
+    # user.0 -> its two films, each 0.5 -> each film's two fans, each 0.25
+    return (frame.hop(movie=step("has_interact").probability(by=1))
+                 .hop(fan=step("~has_interact").probability(by=1)))
+
+
+def test_a_probability_composes_along_the_walk(small_graph):
+    walked = _walk_home(small_graph.nodes(user=["user.0"]))
+    p = walked.with_columns(p=v.fan.score).pl["p"].to_list()
+    assert p == [0.25] * 4 and sum(p) == 1.0
+    ended = walked.group_by(v.fan, confidence="sum").len()
+    mass = dict(zip((str(one) for one in ended.keys("fan")),
+                    ended.with_columns(p=v.fan.score).pl["p"].to_list()))
+    assert mass == {"user.0": 0.5, "user.1": 0.25, "user.2": 0.25}
+
+
+def test_the_mass_of_a_planned_walk_is_folded_across_slices(small_graph):
+    with jb.optimize(rows=1):
+        ended = _walk_home(small_graph.nodes(user=["user.0"])) \
+            .group_by(v.fan, confidence="sum").len()
+    mass = dict(zip((str(one) for one in ended.keys("fan")),
+                    ended.with_columns(p=v.fan.score).pl["p"].to_list()))
+    assert mass == {"user.0": 0.5, "user.1": 0.25, "user.2": 0.25}
+
+
+def test_a_probability_step_must_be_named(small_graph):
+    with pytest.raises(ValueError, match="must be named"):
+        small_graph.nodes(user="user").hop(step("has_interact").probability(),
+                                           fan="~has_interact")

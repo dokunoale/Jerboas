@@ -32,7 +32,7 @@ from ..store.keys import Key
 from ..plan.optimize import budget
 from ..plan.plan import Plan
 from ..plan.planner import row_local
-from .resolve import Pending, Resolver, _series, take
+from .resolve import FOLD, Pending, Resolver, _series, take
 from .step import Step, root_of
 
 RELATION = "relation"
@@ -209,6 +209,11 @@ class Frame:
         for spec, name in steps:
             if name is not None:
                 self._claim(name)
+            elif spec.measure is not None:
+                raise ValueError(
+                    "a step measuring a probability must be named: two routes "
+                    "through an unnamed step are folded into one, and the walk "
+                    "would lose the mass of the other")
             spec.known(self.graph)
 
         current = budget()
@@ -243,11 +248,20 @@ class Frame:
         nodes = base[source].to_numpy()
         added, variables = {}, dict(self.vars)
         constants = dict(self.constants)
+        # the confidence of the node each row stands on: what a probability
+        # step multiplies its transition by, so that its arrival's confidence is
+        # the probability the walk got there (None: 1.0 everywhere)
+        held = shadow(SCORE, source)
+        carried = (base[held].fill_null(1.0).to_numpy() if held in base.columns
+                   else None)
 
         for spec, name in steps:
             walked, targets, codes, weights = spec.walk(
                 graph, nodes, name, self._context(base, rows, added, variables),
                 None if toward is None else toward.reaches)
+            if spec.measure is not None and carried is not None:
+                weights = weights * carried[walked]
+            carried = weights
             single = spec.single()
             rows = rows[walked]
             added = {column: take(values, walked) for column, values in added.items()}
@@ -256,7 +270,7 @@ class Frame:
                 # nothing names these, so nothing tells two routes through them
                 # apart: keep one of each and carry that forward
                 keep = _distinct(graph, rows, nodes)
-                rows, nodes = rows[keep], nodes[keep]
+                rows, nodes, carried = rows[keep], nodes[keep], carried[keep]
                 added = {column: take(values, keep) for column, values in added.items()}
                 continue
             added[name] = nodes.astype(np.int32)
@@ -666,13 +680,16 @@ class Frame:
         doubted stays certain and a group of weak matches says so.
 
         `"min"` reads a group as its weakest member, `"max"` as its best,
-        `"product"` as independent evidence multiplied, `None` drops it. A
-        callable is given the shadow's expression and returns whatever it
-        should become."""
+        `"product"` as independent evidence multiplied, `"sum"` as the mass of
+        the rows folded -- the probability of any of several walks, when each
+        row's confidence is the probability of its own (`step.probability()`)
+        -- and `None` drops it. A callable is given the shadow's expression and
+        returns whatever it should become."""
         return _GroupBy(self, [name_of(one) for one in _flat(by)], maintain_order,
                         confidence)
 
-    def top(self, n, by=None, descending=True, over=None, temperature=0.0, seed=None):
+    def top(self, n, by=None, descending=True, over=None, spread=None, temperature=0.0,
+            seed=None):
         """The n best rows. `by` defaults to a `score` column when there is one,
         because that is what the frame was building up to.
 
@@ -686,12 +703,23 @@ class Frame:
         instead (`step(...).top(k)`, step.py): cutting here, after the hop,
         pays for the whole expansion first.
 
+        `spread` makes it n in all, taken in turns from each group: the best of
+        every group, then the second best of every group, and so on, each turn
+        in order of score. A group with little to offer runs out and the others
+        fill in, so an answer about several things covers all of them without
+        a quota to size -- the partition form of choosing for diversity.
+
+            .top(10, by="score", spread="part")
+
         `temperature` makes the choice a sample rather than a maximum: at zero
         the n best, above it the n drawn in proportion to `exp(score / t)`. The
         trick is Gumbel's -- perturb each score by `-log(-log(u))` and take the
         top n -- which is exactly sampling without replacement from that
         distribution, at the cost of one array of noise."""
-        if (self._plan is not None and not temperature
+        if over is not None and spread is not None:
+            raise ValueError("top() takes n per group (`over`) or n across groups "
+                             "(`spread`), not both")
+        if (self._plan is not None and not temperature and spread is None
                 and (by is None or row_local(by, self.graph))):
             # the n best of the whole are among the n best of some slice, so
             # keeping n per slice is enough -- and all a planned walk keeps
@@ -708,6 +736,11 @@ class Frame:
         if temperature:
             ordering = _perturbed(ordering, temperature, resolver, self._df.height, seed)
         data = resolver.attach(self._df)
+        if spread is not None:
+            groups = [name_of(one) for one in _flat([spread])]
+            turn = ordering.rank("ordinal", descending=descending).over(groups)
+            data = data.sort([turn, ordering], descending=[False, descending]).head(n)
+            return resolver.wrap(resolver.detach(data))
         if over is None:
             data = data.sort(ordering, descending=descending).head(n)
             return resolver.wrap(resolver.detach(data))
@@ -885,13 +918,6 @@ _REDUCE = {
 }
 
 
-FOLD = {
-    "mean": lambda expr: expr.mean(),
-    "min": lambda expr: expr.min(),
-    "max": lambda expr: expr.max(),
-    "product": lambda expr: expr.product(),
-    "first": lambda expr: expr.first(),
-}
 
 
 class _GroupBy:

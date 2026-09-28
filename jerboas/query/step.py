@@ -21,11 +21,12 @@ n per row, whatever the degree. A map that also reads the frame the walk leaves
 from -- whose taste, which seed -- is evaluated on each row's candidates,
 without building a row of the frame for any of them.
 
-`probability()` makes what the step measured a transition probability: each
-kept edge's share of its row's mass under a map, as a random walk would take it.
-A seed's arrivals then share one unit between them however many there are, and
-the product of the steps' confidences along a walk is the probability of that
-walk.
+`probability()` makes what the step measured the probability a random walk
+gets there: each kept edge's share of its row's mass under a map, times the
+confidence of the node it left from. A seed's arrivals then share one unit
+between them however many there are, the last step's confidence is the
+probability of the whole walk, and `group_by(confidence="sum")` is the chance
+of ending on each node.
 
 The trade a budget makes is the only one it makes: an answer the walk would
 have reached through an edge it did not follow is not in the frame. What a
@@ -115,10 +116,15 @@ class Step:
         return Step(self.specs, self.stages + (Select(by=by, share=p),), self.measure)
 
     def probability(self, by=None):
-        """What the step measured becomes a transition probability: each kept
-        edge's share of its row's mass under `by` (the edge's weight by
-        default, `1` for every edge alike). Over the edges kept, as a decoder
-        renormalizes over its top k."""
+        """What the step measured becomes the probability a random walk gets
+        there: each kept edge's share of its row's mass under `by` (the edge's
+        weight by default, `1` for every edge alike), times the confidence of
+        the node the row stands on -- 1.0 for a node nothing measured, so a
+        walk starts with one unit per row. Renormalized over the edges kept, as
+        a decoder renormalizes over its top k.
+
+        Along several such steps the last confidence is the walk's probability,
+        and `group_by(confidence="sum")` adds up the walks that end together."""
         return Step(self.specs, self.stages, (by,))
 
     # -- what the planner reads off it --

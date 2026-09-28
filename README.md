@@ -468,19 +468,23 @@ draws exactly what it would have run whole: for one seed, it is a walk over one
 sparsified graph.
 
 **What was measured can be a probability.** `.probability()` makes each kept
-edge's confidence its share of the row's mass — the transition probability of a
-random walk, renormalized over what the budget kept as a decoder renormalizes
-over its top k:
+edge's confidence the probability a random walk gets there: its share of the
+row's mass — renormalized over what the budget kept, as a decoder renormalizes
+over its top k — times the confidence of the node it left from. Along a walk
+the last confidence is the probability of the whole walk, and
+`group_by(confidence="sum")` adds up the walks that end on the same node:
 
 ```python
 (seeds.hop(playlist=step("~contains").sample(100, by=1, seed=0).probability(by=1))
       .hop(rec=step("contains").probability(by=1))
-      .group_by(v.rec).agg(p=(v.playlist.score * v.rec.score).sum()))
+      .group_by(v.rec, confidence="sum").len())     # v.rec.score: the chance of ending there
 ```
 
 A seed's playlists then share one vote however many there are, instead of a
-seed in fifty thousand outvoting four in fifty, and the product along the walk
-is the probability of reaching the song from the seeds.
+seed in fifty thousand outvoting four in fifty. This is the one place a
+confidence composes along a walk: an edge weight and a string similarity are
+not the same measure, but the probabilities of consecutive steps of one walk
+are, and multiplying them is what they mean.
 
 The trade a budget makes is the only one it makes: an answer the walk would
 have reached through an edge it did not follow is not in the frame. What it
@@ -605,7 +609,12 @@ node as for all of them.
 .top(5, by=v.score)                       # the five best
 .top(5, by=v.score, temperature=0.5)      # five, sampled
 .top(5, by=v.score, over="part")          # the five best per group
+.top(5, by=v.score, spread="part")        # five in all, taken in turns from each group
 ```
+
+`spread` is the one to reach for when an answer should cover several things: the
+best of every group first, then the second best of every group, and a group
+with little to offer leaves its turns to the others — no quota to size.
 
 `temperature` makes the choice a sample rather than a maximum: at zero the n
 best, above it n drawn in proportion to `exp(score / t)`. It is Gumbel's trick —

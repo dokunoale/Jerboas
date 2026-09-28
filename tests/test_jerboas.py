@@ -1879,3 +1879,14 @@ def test_concentration_is_computed_once_per_model(gathered_graph, monkeypatch):
         gathered_graph.nodes(node="node").with_columns(
             g=Concentration(model, relation="holds").on("node"))
     assert len(computed) == 1
+
+
+def test_top_spread_takes_turns_across_groups(small_graph):
+    movies = small_graph.nodes(movie="movie").with_columns(
+        part=pl.Series(["a", "a", "b"]), s=pl.Series([9.0, 8.0, 1.0]))
+    assert names(movies.top(2, by=v.s)) == ["movie.0", "movie.1"]
+    # the best of each part first, however poor the best of one of them is
+    assert names(movies.top(2, by=v.s, spread="part")) == ["movie.0", "movie.2"]
+    assert names(movies.top(3, by=v.s, spread="part")) == ["movie.0", "movie.2", "movie.1"]
+    with pytest.raises(ValueError, match="not both"):
+        movies.top(2, by=v.s, over="part", spread="part")

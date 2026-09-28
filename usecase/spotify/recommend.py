@@ -79,10 +79,10 @@ def clustered(graph: jb.Graph, model: DiffusedMatrixFactorization, seeds: jb.Fra
 
 def candidates(graph: jb.Graph, seeds: jb.Frame, known: jb.Frame,
                playlists: int = PLAYLISTS) -> jb.Frame:
-    """Every song the factorization knows that the walk reaches, with how likely
-    the walk is to end there (`reached`) and in how many of the playlists it
-    went through (`shared`) -- within the part of the playlist each seed
-    belongs to.
+    """Every song the factorization knows that the walk reaches, within the
+    part of the playlist each seed belongs to: how likely the walk is to end
+    there is its confidence (`v.rec.score`), and `shared` is in how many of the
+    playlists it went through.
 
     Planned (`jb.optimize`): walked in full, a handful of popular seeds reach
     tens of thousands of playlists and millions of rows, and the plan runs it a
@@ -93,33 +93,32 @@ def candidates(graph: jb.Graph, seeds: jb.Frame, known: jb.Frame,
                 .hop(playlist=to_playlists)
                 .hop(rec=to_songs)
                 .filter(~v.rec.is_in(seeds), v.rec.is_in(known))
-                .group_by(v.rec, v.part)
-                .agg(reached=(v.playlist.score * v.rec.score).sum(),
-                     shared=v.rec.count()))
+                # the walks that end on a song, added up
+                .group_by(v.rec, v.part, confidence="sum")
+                .agg(shared=v.rec.count()))
 
 
 def rank(counted: jb.Frame, seeds: jb.Frame, model: DiffusedMatrixFactorization, k: int,
-         parts: int, temperature: float) -> jb.Frame:
+         temperature: float) -> jb.Frame:
     """Three signals, and the query says how much each counts.
 
-    `reached` is the crowd's evidence, damped: twice as likely is a better
-    answer, not twice as good a one, and undamped it buries the other two.
-    `taste` is the model's, `gathered` whether the song belongs anywhere.
+    How likely the walk is to end on a song is the crowd's evidence, damped:
+    twice as likely is a better answer, not twice as good a one, and undamped it
+    buries the other two. `taste` is the model's, `gathered` whether the song
+    belongs anywhere.
 
-    Then the best of each part, so a playlist about two things is answered about
-    both, topped up from the best of anywhere when the parts cannot fill k."""
-    scored = (counted
-              .with_columns(taste=model.seeded(seeds).on("rec"),
-                            gathered=Concentration(model, relation="contains").on("rec"))
-              .with_columns(score=v.taste * (SCALE * v.reached).log1p() * v.gathered))
-    each = -(-k // max(parts, 1))
-    covered = (scored.top(each, by=v.score, over="part", temperature=temperature)
-               .unique("rec"))
-    if len(covered) < k:
-        rest = (scored.filter(~v.rec.is_in(covered))
-                .top(k - len(covered), by=v.score, temperature=temperature))
-        covered = jb.concat(covered, rest).unique("rec")
-    return covered.sort("score", descending=True).head(k)
+    Then k taken in turns from each part, so a playlist about two things is
+    answered about both, and a part with little to offer leaves its turns to
+    the others. A song reached from two parts counts in the one it scores
+    best in."""
+    return (counted
+            .with_columns(taste=model.seeded(seeds).on("rec"),
+                          gathered=Concentration(model, relation="contains").on("rec"))
+            .with_columns(score=v.taste * (SCALE * v.rec.score).log1p() * v.gathered)
+            .sort("score", descending=True).unique("rec")
+            .top(k, by=v.score, spread="part", temperature=temperature)
+            # the turns decide which songs; the score, the order they are read in
+            .sort("score", descending=True))
 
 
 def extend(graph: jb.Graph, model: DiffusedMatrixFactorization, known: jb.Frame,
@@ -131,8 +130,8 @@ def extend(graph: jb.Graph, model: DiffusedMatrixFactorization, known: jb.Frame,
     if seeds is None or not len(seeds):
         return [], []
     found = describe(seeds, "seed")
-    named = [f"{row['seed.name']} -- {row['artist.name']}"
-             for row in found.rows(named=True)]
+    named = (found.pl.select(pl.format("{} -- {}", "seed.name", "artist.name"))
+             .to_series().to_list())
 
     parts = clustered(graph, model, seeds, concentration)
     counted = (candidates(graph, parts, known, playlists)
@@ -142,14 +141,7 @@ def extend(graph: jb.Graph, model: DiffusedMatrixFactorization, known: jb.Frame,
     if not len(counted):
         return named, []
 
-    ranked = describe(rank(counted, seeds, model, k,
-                           parts.pl["part"].n_unique(), temperature), "rec")
-    return named, [
-        {
-            "song": row["rec.name"],
-            "artist": row["artist.name"],
-            "score": row["score"],
-            "playlists": int(row["shared"]),
-        }
-        for row in ranked.rows(named=True)
-    ]
+    ranked = describe(rank(counted, seeds, model, k, temperature), "rec")
+    return named, (
+        ranked.pl.select(song="rec.name", artist="artist.name", score="score",
+                         playlists="shared").rows(named=True))
