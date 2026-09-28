@@ -28,6 +28,7 @@ Three signals, and the query says how much each counts:
 import logging
 import os
 import time
+from collections.abc import AsyncGenerator, Iterator
 from contextlib import asynccontextmanager, contextmanager
 
 import polars as pl
@@ -70,7 +71,7 @@ ITERATIONS = 8
 READABLE = {"song": "name", "artist": "name", "album": "name", "playlist": "name"}
 
 
-def asked_for(names):
+def asked_for(names: list[str]) -> Iterator[tuple[str, str | None]]:
     """What was typed, as (title, performer or None).
 
     A tab is the only structure the input has: `"Wonderwall\tOasis"` says which
@@ -84,7 +85,7 @@ def asked_for(names):
             yield title, (performer or None)
 
 
-def resolve(graph, names):
+def resolve(graph: jb.Graph, names: list[str]) -> jb.Frame | None:
     """The songs you named, one each.
 
     A name typed by a person is a search box, not a key: `like` admits the
@@ -122,7 +123,7 @@ def resolve(graph, names):
             .select("seed"))
 
 
-def _by_title(graph, titles):
+def _by_title(graph: jb.Graph, titles: list[str]) -> jb.Frame:
     """Every title's closest candidates, all of them in one query.
 
     `v.seed.name.needle` says which title each candidate answers, so what would
@@ -136,7 +137,7 @@ def _by_title(graph, titles):
             .select("seed", "asked", "closeness", "seen", PINNED))
 
 
-def _by_performer(graph, wanted):
+def _by_performer(graph: jb.Graph, wanted: list[tuple[str, str | None]]) -> jb.Frame:
     """The candidates a performer allows, for the names that named one.
 
     The performer is not a filter over the titles that matched -- it narrows
@@ -168,7 +169,7 @@ def _by_performer(graph, wanted):
             .select("seed", "asked", "closeness", "seen", PINNED))
 
 
-def _no_candidates(graph):
+def _no_candidates(graph: jb.Graph) -> jb.Frame:
     """An empty pool shaped like the others, so a concat of it is a concat and
     not a special case."""
     return (graph.nodes(seed="song").head(0)
@@ -178,7 +179,8 @@ def _no_candidates(graph):
             .select("seed", "asked", "closeness", "seen", PINNED))
 
 
-def clustered(graph, model, seeds, concentration):
+def clustered(graph: jb.Graph, model: DiffusedMatrixFactorization, seeds: jb.Frame,
+              concentration: float) -> jb.Frame:
     """The seeds, each labelled with the part of the playlist it belongs to.
 
     A playlist is one thing when it is about one thing and several when it is
@@ -198,7 +200,7 @@ def clustered(graph, model, seeds, concentration):
     return seeds.with_columns(part=pl.Series("part", labels, dtype=pl.Int32))
 
 
-def candidates(graph, seeds, known):
+def candidates(graph: jb.Graph, seeds: jb.Frame, known: jb.Frame) -> jb.Frame:
     """Every song the factorization knows that the playlists holding your songs
     also hold, and how many of them do -- counted within the part of the
     playlist the seed belongs to.
@@ -219,7 +221,8 @@ def candidates(graph, seeds, known):
     return counted.with_columns(shared=v.shared.cast(pl.Float64))
 
 
-def rank(counted, seeds, model, k, parts, temperature):
+def rank(counted: jb.Frame, seeds: jb.Frame, model: DiffusedMatrixFactorization, k: int,
+         parts: int, temperature: float) -> jb.Frame:
     """Three signals, and the query says how much each counts.
 
     `shared` is the crowd's evidence, damped: six hundred of those playlists is
@@ -245,7 +248,7 @@ def rank(counted, seeds, model, k, parts, temperature):
     return covered.sort("score", descending=True).head(k)
 
 
-def describe(frame, column):
+def describe(frame: jb.Frame, column: str) -> jb.Frame:
     """A column of songs as "title -- performer", which is the only form in
     which a song is identifiable: titles are not unique and this dataset holds
     several masters of the same recording."""
@@ -253,7 +256,9 @@ def describe(frame, column):
             if len(frame) else frame.attrs(**{column: "name"}))
 
 
-def extend(graph, model, known, songs, k, concentration=0.0, temperature=0.0):
+def extend(graph: jb.Graph, model: DiffusedMatrixFactorization, known: jb.Frame,
+           songs: list[str], k: int, concentration: float = 0.0,
+           temperature: float = 0.0) -> tuple[list[str], list[dict]]:
     seeds = resolve(graph, songs)
     if seeds is None or not len(seeds):
         return [], []
@@ -282,7 +287,7 @@ def extend(graph, model, known, songs, k, concentration=0.0, temperature=0.0):
     ]
 
 
-def supported(graph):
+def supported(graph: jb.Graph) -> jb.Frame:
     """The songs a factorization may learn from, and will then know anything
     about.
 
@@ -294,7 +299,7 @@ def supported(graph):
             .filter(v.seen >= SUPPORT).select("song"))
 
 
-def interactions(graph, known):
+def interactions(graph: jb.Graph, known: jb.Frame) -> jb.Frame:
     """The playlist edges into those songs: what the factorization is fitted on.
 
     Only a fit needs them, and on the whole graph they are 66 million rows, so
@@ -304,7 +309,7 @@ def interactions(graph, known):
 
 # --- startup -----------------------------------------------------------------
 
-def load_graph():
+def load_graph() -> jb.Graph:
     """The playlists and what they contain, plus who performed what.
 
     `spotify.contains` carries a score per edge -- a song's place in the
@@ -323,7 +328,7 @@ def load_graph():
     )
 
 
-def fit(graph):
+def fit(graph: jb.Graph) -> tuple[DiffusedMatrixFactorization, jb.Frame]:
     """The factorization on the supported subgraph: loaded when a previous start
     stored this one, fitted and stored otherwise.
 
@@ -348,7 +353,7 @@ def fit(graph):
     return wanted, known
 
 
-def _stored(graph, expected):
+def _stored(graph: jb.Graph, expected: dict) -> DiffusedMatrixFactorization | None:
     """The stored factorization, when there is one and it is the one expected."""
     if not os.path.exists(CHECKPOINT):
         return None
@@ -362,7 +367,7 @@ def _stored(graph, expected):
     return model
 
 
-def warm(graph, model, known):
+def warm(graph: jb.Graph, model: DiffusedMatrixFactorization, known: jb.Frame) -> None:
     """One request before the first caller's.
 
     The first request builds what every later one reads -- the word index over
@@ -376,7 +381,7 @@ def warm(graph, model, known):
 
 
 @contextmanager
-def timed(step):
+def timed(step: str) -> Iterator[None]:
     """Say how long a startup step took: on the whole graph startup is minutes,
     and a container log that is silent for minutes looks like a hang."""
     start = time.perf_counter()
@@ -385,7 +390,7 @@ def timed(step):
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     with timed("graph"):
         app.state.graph = load_graph()
     with timed("fit"):
@@ -426,7 +431,7 @@ class ExtendResponse(BaseModel):
 
 
 @app.post("/extend", response_model=ExtendResponse)
-def post_extend(body: ExtendRequest):
+def post_extend(body: ExtendRequest) -> ExtendResponse:
     if not body.songs:
         raise HTTPException(status_code=422, detail="name at least one song")
     named, suggestions = extend(app.state.graph, app.state.model, app.state.known,
@@ -438,7 +443,7 @@ def post_extend(body: ExtendRequest):
 
 
 @app.get("/health")
-def get_health():
+def get_health() -> dict:
     graph = app.state.graph
     sized = lambda kind: graph.block(kind)[1] - graph.block(kind)[0]
     return {"status": "ok", "playlists": sized("playlist"), "songs": sized("song"),
