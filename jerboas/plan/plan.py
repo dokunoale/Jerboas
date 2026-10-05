@@ -22,9 +22,10 @@ and what the streamed reductions consume; `build` is the one place they are
 accumulated.
 """
 
+import numpy as np
 import polars as pl
 
-from ..query.expr import SCORE, shadowed
+from ..query.expr import INCLUSION, SCORE, shadowed
 from .planner import landing, roots
 
 
@@ -102,7 +103,7 @@ def _parts(frame, stages, budget):
     """One stage at a time, each in slices, recursing for the rest."""
     (steps, conditions), rest = stages[0], stages[1:]
     toward = direction(frame, steps, conditions)
-    degree = toward.degree() if toward is not None else frame._step_degree(steps[0][0])
+    degree = toward.degree() if toward is not None else steps[0][0].degree(frame.graph)
     for piece in frame._slices(degree, budget.rows(frame, steps)):
         part = piece._hop_eager(steps, toward=toward)
         if conditions:
@@ -139,14 +140,20 @@ def direction(frame, steps, conditions):
     if len(steps) != 1:
         return None
     spec, name = steps[0]
-    wanted = landing(conditions, name, frame.graph)
+    if spec.stages:
+        # a budget keeps the best of what leaves each node; walked from the
+        # other end there is no "each node" to keep the best of
+        return None
+    graph = frame.graph
+    wanted = landing(conditions, name, graph)
     if wanted is None:
         return None
-    forwards = frame._produces(spec)
-    backwards = frame._arriving(spec, wanted) + frame._df.height
+    wanted = np.unique(np.asarray(wanted, dtype=np.int64))
+    forwards = int(spec.degree(graph)[frame._nodes()].sum())
+    backwards = int(spec.degree(graph, flipped=True)[wanted].sum()) + frame._df.height
     if backwards >= forwards:
         return None
-    return Toward(frame._reaches(spec, wanted))
+    return Toward(spec.reaches(graph, wanted))
 
 
 def stack(frames):
@@ -165,7 +172,7 @@ def stack(frames):
     # one, so the answer exists once rather than twice
     data = pl.concat(frames, how="diagonal_relaxed", rechunk=False)
     missing = [name for name in order
-               if (shadowed(name) or ("",))[0] == SCORE
+               if (shadowed(name) or ("",))[0] in (SCORE, INCLUSION)
                and any(name not in one.columns for one in frames)]
     if missing:
         data = data.with_columns(pl.col(missing).fill_null(1.0))

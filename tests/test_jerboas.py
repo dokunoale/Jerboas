@@ -1560,7 +1560,7 @@ def test_the_budget_is_what_a_step_produces(small_graph):
     """Not what it is given: six interactions out of three users is six rows,
     so a budget of six fits and a budget of five does not."""
     users = small_graph.nodes(user="user")
-    assert users._produces("has_interact") == 6
+    assert jb.step("has_interact").degree(small_graph)[users.ids("user")].sum() == 6
     with jb.optimize(rows=6):
         assert len(list(users.hop(rec="has_interact").batches())) == 1
     with jb.optimize(rows=5):
@@ -1571,7 +1571,7 @@ def test_slices_are_cut_where_the_walk_grows(small_graph):
     """A slice out of a hub is shorter than one out of a leaf, which is the
     reason to count what a step makes rather than what it is handed."""
     users = small_graph.nodes(user="user")
-    degree = users._step_degree("has_interact")
+    degree = jb.step("has_interact").degree(small_graph)
     pieces = list(users._slices(degree, 2))
     assert [len(one) for one in pieces] == [1, 1, 1]      # two edges each
     assert [len(one) for one in users._slices(degree, 4)] == [2, 1]
@@ -1879,3 +1879,14 @@ def test_concentration_is_computed_once_per_model(gathered_graph, monkeypatch):
         gathered_graph.nodes(node="node").with_columns(
             g=Concentration(model, relation="holds").on("node"))
     assert len(computed) == 1
+
+
+def test_top_spread_takes_turns_across_groups(small_graph):
+    movies = small_graph.nodes(movie="movie").with_columns(
+        part=pl.Series(["a", "a", "b"]), s=pl.Series([9.0, 8.0, 1.0]))
+    assert names(movies.top(2, by=v.s)) == ["movie.0", "movie.1"]
+    # the best of each part first, however poor the best of one of them is
+    assert names(movies.top(2, by=v.s, spread="part")) == ["movie.0", "movie.2"]
+    assert names(movies.top(3, by=v.s, spread="part")) == ["movie.0", "movie.2", "movie.1"]
+    with pytest.raises(ValueError, match="not both"):
+        movies.top(2, by=v.s, over="part", spread="part")

@@ -1,20 +1,22 @@
 FROM python:3.12-slim
 
+# uv, for parallel, resumable, retrying installs (pip's single-stream download
+# timed out on the big wheels -- gradio ~31 MB, polars-runtime ~46 MB, scipy
+# ~34 MB -- over a slow link). The uv image is tiny and only ships the binary.
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+# uv's own stalls: read timeout and retries, so a slow link does not abort
+ENV UV_HTTP_TIMEOUT=300
+
 WORKDIR /app
 
 # Dependency layer, cached separately from the source: editing jerboas/ or a use
 # case must not re-download torch. pyproject.toml is the only thing copied in,
 # so this layer invalidates when the dependency list changes and at no other
 # time -- the files it names (README, LICENSE, the package itself) are stubbed,
-# because nothing here is kept except what pip installed.
-#
-# Stubbing in /tmp and throwing it away, rather than in /app, matters: setuptools
-# leaves a build/ directory behind and will not re-copy a source file that is no
-# older than the one already in it. Built in place, the stub's empty
-# __init__.py outlives the real one and ends up in the installed package.
-# EXTRAS picks what the image is for: serving a use case by default, or the
-# whole of it when the image is being built to run the tests (see test.sh).
-ARG EXTRAS=api,torch
+# because nothing here is kept except what uv installed. EXTRAS picks what the
+# image is for: serving a use case by default, or the whole of it when the image
+# is being built to run the tests (see test.sh).
+ARG EXTRAS=api,torch,ui
 
 # Torch, from the CPU index rather than PyPI. The default wheel for aarch64 is a
 # CUDA build -- 2.9GB of nvidia-* and triton that nothing here can reach, there
@@ -23,7 +25,7 @@ ARG EXTRAS=api,torch
 # torch>=2.5 already satisfied and leaves it alone, so pyproject stays the only
 # place a version is bound. Guarded, because EXTRAS need not ask for torch.
 RUN case ",${EXTRAS}," in *,torch,*) \
-        pip install --no-cache-dir \
+        uv pip install --system --no-cache \
             --index-url https://download.pytorch.org/whl/cpu torch ;; \
     esac
 
@@ -31,15 +33,15 @@ COPY pyproject.toml /tmp/deps/
 RUN cd /tmp/deps \
     && touch README.md LICENSE NOTICE \
     && mkdir jerboas && touch jerboas/__init__.py \
-    && pip install --no-cache-dir "/tmp/deps[${EXTRAS}]" \
+    && uv pip install --system --no-cache "/tmp/deps[${EXTRAS}]" \
     && rm -rf /tmp/deps
 
-# Real source, installed without re-resolving dependencies. --force-reinstall
-# because the stub is already installed under this exact version, and pip would
-# otherwise call the requirement satisfied and keep serving the empty one.
+# Real source, installed without re-resolving dependencies. --reinstall because
+# the stub is already installed under this exact version, and uv would otherwise
+# call the requirement satisfied and keep serving the empty one.
 COPY pyproject.toml README.md LICENSE NOTICE ./
 COPY jerboas ./jerboas
-RUN pip install --no-cache-dir --no-deps --force-reinstall .
+RUN uv pip install --system --no-deps --no-cache --reinstall .
 
 # Every use case, so one image serves any of them: which one is a run-time
 # choice (USECASE), not a build-time one. `--app-dir` puts that directory on the

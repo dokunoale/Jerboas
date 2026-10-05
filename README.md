@@ -423,6 +423,97 @@ selectivity curve is worse than no knob — so a weight stays what it is, the
 column's confidence, and `.filter(v.rec.score >= 0.9)` after the hop is both the
 spelling and the fast path (it is pushed too, being about the step).
 
+## A step with a budget
+
+A hop costs what the degrees of its nodes sum to, and a walk multiplies them: a
+popular song reaches tens of thousands of playlists, and on the whole Spotify
+graph that is a request taking seconds rather than milliseconds. A **budget**
+follows at most n edges per row instead of all of them:
+
+```python
+from jerboas import step
+
+.hop(peer="~has_interact")                                  # every edge
+.hop(peer=step("~has_interact").top(20))                    # the 20 heaviest
+.hop(peer=step("~has_interact").sample(20, seed=0))         # 20 drawn by weight
+.hop(playlist=step("~contains").top(100, by=1 / v.playlist.contains.count().log1p()))
+```
+
+`step(...)` takes what a step always took — a relation, `~relation`, several,
+or none for any — and adds selectors, the way a decoder keeps the top k or
+samples. `by` is the map a selector ranks by or draws in proportion to: an
+expression over the step's arrival, the edge's weight by default, a number for
+every edge alike.
+
+**A map about the step is fused into the store.** When `by` reads nothing but
+the arrival and what the step measured, it is a fact about the graph: computed
+once over every edge of the relation and kept as an order and a running sum, so
+the n best of a node's edges are the first n of its slice and a draw is a binary
+search. The hop then costs n per row whatever the degree.
+
+**A map about the query is evaluated on the candidates.** When `by` also reads
+the frame the walk leaves from — whose taste, which seed — it cannot be
+precomputed. It is evaluated on each row's candidates, as arrays, before a row
+of the frame is built. Selectors chain, so the cheap map can choose the
+candidates the expensive one is paid for:
+
+```python
+step("contains").top(500, by=specific).top(50, by=v.rec.x * v.user.y)
+```
+
+**A draw belongs to the node.** With a seed, which edges a node draws is a hash
+of the seed, the node and the draw — not of where the node sits in the frame. A
+node reached twice draws the same edges both times, and a walk run in slices
+draws exactly what it would have run whole: for one seed, it is a walk over one
+sparsified graph.
+
+**What was measured can be a probability.** `.probability()` makes each kept
+edge's confidence the probability a random walk gets there: its share of the
+row's mass — renormalized over what the budget kept, as a decoder renormalizes
+over its top k — times the confidence of the node it left from. Along a walk
+the last confidence is the probability of the whole walk, and
+`group_by(confidence="sum")` adds up the walks that end on the same node:
+
+```python
+(seeds.hop(playlist=step("~contains").sample(100, by=1, seed=0).probability(by=1))
+      .hop(rec=step("contains").probability(by=1))
+      .group_by(v.rec, confidence="sum").len())     # v.rec.score: the chance of ending there
+```
+
+A seed's playlists then share one vote however many there are, instead of a
+seed in fifty thousand outvoting four in fifty. This is the one place a
+confidence composes along a walk: an edge weight and a string similarity are
+not the same measure, but the probabilities of consecutive steps of one walk
+are, and multiplying them is what they mean.
+
+**What a draw kept can be estimated, not just truncated.** `.inclusion()` on a
+sampled step keeps, beside the confidence, the chance each kept edge had of
+being drawn — readable as `v.playlist.inclusion`, one per sampled column, as a
+confidence is one per measured one. A count over the walk then estimates the
+exact walk's count (Horvitz-Thompson): each kept row stands for 1/π of it,
+and the estimate's standard error rides as the count's confidence:
+
+```python
+(seeds.hop(playlist=step("~contains").sample(100, by=1, seed=0).inclusion())
+      .hop(rec="contains")
+      .group_by(v.rec).len("shared"))
+# shared: in how many of the crowd's playlists the song sits, estimated;
+# v.shared.score: the standard error of that estimate
+```
+
+The chance is exact for a flat map (a uniform draw of n out of d keeps each
+edge with n/d) and for any map where the budget is small next to the degree —
+which is where a budget earns its place; between those it is the
+with-replacement reading of the draw, and the bias that makes is the
+benchmark's to say, not the documentation's to hide. A chain with no `sample`
+is refused: a deterministic cut is not a sample, and a column of certainties
+would call a truncated count an estimate.
+
+The trade a budget makes is the only one it makes: an answer the walk would
+have reached through an edge it did not follow is not in the frame. What it
+costs in answer quality, and what it saves in latency, is measured in
+`benchmark/playlists.py` and written down in the roadmap.
+
 ## What a training run may see
 
 A rating, a similarity, a confidence — every edge has one, defaulting to `1.0`
@@ -541,7 +632,12 @@ node as for all of them.
 .top(5, by=v.score)                       # the five best
 .top(5, by=v.score, temperature=0.5)      # five, sampled
 .top(5, by=v.score, over="part")          # the five best per group
+.top(5, by=v.score, spread="part")        # five in all, taken in turns from each group
 ```
+
+`spread` is the one to reach for when an answer should cover several things: the
+best of every group first, then the second best of every group, and a group
+with little to offer leaves its turns to the others — no quota to size.
 
 `temperature` makes the choice a sample rather than a maximum: at zero the n
 best, above it n drawn in proportion to `exp(score / t)`. It is Gumbel's trick —
@@ -977,9 +1073,10 @@ sub-range, counted once per relation and memoized.
 Everything else is a table operation, and therefore not ours: the anti-join that
 drops what a user has already seen, the `unique` that folds two routes to one
 node, the `group_by` that ranks by the whole pattern, the window in
-`top(k, by=..., over=...)` that keeps the best k per user — or, sitting between
-two hops, the k most promising partial walks, which is a beam search and was an
-engine once. Those used to be a backtracking search, a Python loop over result
+`top(k, by=..., over=...)` that keeps the best k per user. The k most promising
+edges out of each row — a beam, which was an engine once — is a budgeted step,
+and not a table operation: cutting after the walk would pay for the whole
+expansion first. Those used to be a backtracking search, a Python loop over result
 rows, a scope stack and a pluggable `Greedy`.
 
 Files are read by column, not by line. A chunk of an edge file becomes three

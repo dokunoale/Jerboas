@@ -14,7 +14,7 @@ read only to decide is taken off again; what was *measured* stays.
 import numpy as np
 import polars as pl
 
-from .expr import (ATTR, NEEDLE, PROVENANCE, REL, SCORE, TYPE, Relation,
+from .expr import (ATTR, INCLUSION, NEEDLE, PROVENANCE, REL, SCORE, TYPE, Relation,
                    path_of, shadow)
 from ..search.rules import Search, default_rule
 
@@ -202,14 +202,21 @@ class Resolver:
         name = shadow(kind, column)
         if self._present(name):
             return pl.col(name)
+        root = column.partition(".")[0]
+        if not self._present(column) and not self._present(root):
+            # the provenance of nothing: answering 1.0 would be an answer
+            raise ValueError(
+                f"no column {column!r} to read the {kind} of -- this frame has: "
+                f"{', '.join(self.frame.columns)}")
         # one value for every row -- as a column of them rather than a literal,
         # because a literal is one value in an aggregate too: `v.x.score.sum()`
         # over a group of three unweighted rows is 3.0, and `lit(1.0).sum()` is 1.0
         constant = self.frame.constants.get((kind, column))
         if constant is not None:
             return pl.repeat(constant, pl.len())
-        # nothing measured this column, so nothing is in doubt about it
-        if kind == SCORE:
+        # nothing measured this column, so nothing is in doubt about it -- and
+        # nothing cut it, so it was kept with certainty
+        if kind in (SCORE, INCLUSION):
             return pl.repeat(1.0, pl.len())
         return pl.repeat(None, pl.len(), dtype=pl.String)
 
@@ -262,11 +269,15 @@ class Resolver:
         return pl.col(name)
 
 
+# what a group's confidence becomes: the rules `group_by(confidence=...)`
+# takes, here because the planner folds a walk's slices by the same ones
 FOLD = {
     "mean": lambda expr: expr.mean(),
     "min": lambda expr: expr.min(),
     "max": lambda expr: expr.max(),
     "product": lambda expr: expr.product(),
+    # the mass of a set of walks: their probabilities, added
+    "sum": lambda expr: expr.sum(),
     "first": lambda expr: expr.first(),
 }
 

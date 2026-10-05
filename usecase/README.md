@@ -8,8 +8,13 @@ graph, a query or a model, because that is the part worth writing twice.
 usecase/
   coldstart/app.py     recommend films from people, genres or titles you name
   genome/app.py        recommend films that belong beside a watchlist
-  spotify/app.py       five songs to add to a handful you name
+  spotify/app.py       five songs to add to a handful you name, with a page at /ui
 ```
+
+A use case may hold more than `app.py`: `spotify/` splits into `names.py` (the
+names you typed, as songs), `recommend.py` (the walk and its ranking),
+`startup.py` (graph, factorization, warm-up) and `ui.py` (a Gradio page mounted
+beside the API, so it answers from the graph the service already holds).
 
 The two answer the same question from opposite ends, which is the point of
 having both. `coldstart` has nothing to go on but a few names, so it *fits* an
@@ -71,3 +76,15 @@ load it in seconds, as long as the hyperparameters and the support threshold it
 records are the ones the service declares; otherwise the service fits again and
 replaces the file. The service logs each startup step, so a long start does not
 look like a hang.
+
+The Spotify walk goes through 100 of each song's playlists rather than all of
+them. On the whole graph, a request naming six popular songs takes about one
+second instead of ten -- what is left is resolving the names and ranking, not
+the walk -- and over a thousand real playlists the budget costs about a point
+of hit rate (`benchmark/playlists.py`). A request sets it with `"playlists": n`, and `0`
+walks every playlist, exactly. What the budget costs the count, the answer
+says rather than hides: `playlists` is an estimate of the whole crowd's, drawn
+from the chance each sampled playlist had of being drawn, and `error` is how
+far it may be off -- zero when the walk was exact. The page at `/ui` shows it
+as `726 ± 78`, and has the budget as a slider, with the time each answer took
+under it.

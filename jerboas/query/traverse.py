@@ -182,6 +182,292 @@ class Reach:
         return rows, targets, codes, weights
 
 
+class Ranked:
+    """Segments of an array of edges, each ordered and summed by a map.
+
+    The edges lie segment after segment -- a node's edges in the store, a row's
+    candidates in a walk -- and the map says what each is worth. Ordered once,
+    the n best of a segment are the first n of its order; summed once, a draw in
+    proportion to the map is a binary search. Both cost what they keep.
+
+    A map that says the same of every edge orders nothing: the first n are as
+    good as any, and a draw is a uniform offset into the segment."""
+
+    __slots__ = ("count", "start", "ranking", "order", "cumulative", "descending")
+
+    def __init__(self, count, ranking=None):
+        self.count = np.asarray(count, dtype=np.int64)
+        self.start = np.cumsum(self.count) - self.count
+        self.ranking = self.order = self.cumulative = self.descending = None
+        # a map alike for every edge orders nothing -- unless it is nothing
+        # everywhere, which leaves nothing to draw
+        if (ranking is None or not len(ranking)
+                or ranking.min() == ranking.max() != 0):
+            return
+        self.ranking = ranking
+        index = np.int32 if len(ranking) < 2**31 else np.int64
+        segment = np.repeat(np.arange(len(self.count), dtype=index), self.count)
+        # within a segment the order is the map's; between them, the array's
+        self.order = np.lexsort((-ranking, segment)).astype(index)
+
+    def best(self, segments, width):
+        """(rows, index): the `width` best edges of each segment asked for,
+        best first -- `rows` says which of `segments` each came from."""
+        counts = np.minimum(self.count[segments], width)
+        rows = np.repeat(np.arange(len(segments), dtype=np.int64), counts)
+        chosen = ranges(self.start[segments], counts)
+        return rows, (chosen if self.order is None else self.order[chosen])
+
+    def nucleus(self, segments, share):
+        """(rows, index): the fewest best edges of each segment holding
+        `share` of its mass -- few where one edge dominates, many where none
+        does. A running sum in the map's order makes it a binary search."""
+        lo = self.start[segments]
+        count = self.count[segments]
+        if self.ranking is None:
+            counts = np.ceil(share * count).astype(np.int64)
+        else:
+            if self.descending is None:
+                self.descending = np.cumsum(self.ranking[self.order], dtype=np.float64)
+            running = self.descending
+            below = np.where(lo > 0, running[np.maximum(lo - 1, 0)], 0.0)
+            mass = np.where(count > 0, running[np.maximum(lo + count - 1, 0)], 0.0) - below
+            # the first edge whose running total reaches the share, inclusive
+            reach = np.searchsorted(running, below + share * mass * (1 - 1e-12), side="left")
+            counts = np.where(mass > 0, np.clip(reach - lo + 1, 1, count), 0)
+        rows = np.repeat(np.arange(len(segments), dtype=np.int64), counts)
+        chosen = ranges(lo, counts)
+        return rows, (chosen if self.order is None else self.order[chosen])
+
+    def draw(self, segments, width, seed, keys, inclusion=False):
+        """(rows, index): `width` distinct edges per segment, drawn without
+        replacement in proportion to the map -- or all of them, when a segment
+        holds no more. Rows come out in the order of `segments`.
+
+        With `inclusion`, a third array: the chance each kept edge had of
+        being kept (`_inclusion`).
+
+        A draw is a function of the seed, the segment's key and which draw it
+        is (`_uniform`), never of where the segment sits in what was asked: a
+        node reached twice draws the same edges both times, and a walk taken in
+        slices draws what it would have whole.
+
+        Two ways, one distribution. A segment up to a few times the budget gives
+        every edge a key, `log(u) / weight`, and keeps the `width` largest:
+        exactly a weighted draw without replacement (Efraimidis & Spirakis), at
+        a cost bounded by the budget. A larger one draws with replacement and
+        drops the repeats, round after round, until it has `width` distinct --
+        which is the same draw, and repeats are rare where the segment is large.
+        An edge that weighs nothing is never drawn."""
+        segments = np.asarray(segments)
+        keys = np.asarray(keys)
+        count = self.count[segments]
+        near = count <= _EXACT * width
+        parts = [self._by_keys(np.flatnonzero(near & (count > 0)), segments, width,
+                               seed, keys),
+                 self._by_rounds(np.flatnonzero(~near), segments, width, seed, keys)]
+        rows = np.concatenate([one[0] for one in parts])
+        index = np.concatenate([one[1] for one in parts])
+        order = np.lexsort((index, rows))
+        rows, index = rows[order], index[order]
+        if not inclusion:
+            return rows, index
+        return rows, index, self._inclusion(np.asarray(segments), width, rows, index)
+
+    def _inclusion(self, segments, width, rows, index):
+        """The chance each kept edge had of being kept.
+
+        A segment no wider than the budget keeps all of it: 1. Cut, a flat map
+        draws a uniform `width` out of `count`, exactly. A map draws in
+        proportion: 1 - (1 - w/W)^width, the edge's share of the segment's
+        mass drawn `width` times -- exact for one draw, and for any width
+        where the budget is small next to the segment, which is where a budget
+        earns its place. Between those it is the with-replacement reading of a
+        draw without one: an approximation, and the benchmark says how good.
+        """
+        count = self.count[segments]
+        pi = np.ones(len(index))
+        on = count[rows] > width
+        if not on.any():
+            return pi
+        if self.ranking is None:
+            pi[on] = width / count[rows[on]]
+            return pi
+        if self.cumulative is None:
+            self.cumulative = np.cumsum(self.ranking, dtype=np.float64)
+        lo = self.start[segments]
+        below = np.where(lo > 0, self.cumulative[np.maximum(lo - 1, 0)], 0.0)
+        mass = self.cumulative[lo + count - 1] - below
+        share = np.clip(self.ranking[index[on]].astype(np.float64) / mass[rows[on]],
+                        0.0, 1.0)
+        pi[on] = 1.0 - (1.0 - share) ** width
+        return pi
+
+    def _by_keys(self, which, segments, width, seed, keys):
+        """Every edge of these segments keyed, the `width` best keys kept."""
+        empty = np.zeros(0, dtype=np.int64)
+        if not len(which):
+            return empty, empty
+        lo, count = self.start[segments[which]], self.count[segments[which]]
+        rows = np.repeat(which, count)
+        index = ranges(lo, count)
+        offset = index - np.repeat(lo, count)
+        if self.ranking is None:
+            weight = np.ones(len(index))
+        else:
+            weight = self.ranking[index].astype(np.float64)
+            live = weight > 0
+            rows, index, offset, weight = rows[live], index[live], offset[live], weight[live]
+        key = np.log(_uniform(seed, keys[rows], offset, salt=1)) / weight
+        order = np.lexsort((-key, rows))
+        rows, index = rows[order], index[order]
+        kept = _within(rows) < width
+        return rows[kept], index[kept]
+
+    def _by_rounds(self, which, segments, width, seed, keys):
+        """Draws with replacement, repeats dropped, until each segment has
+        `width` distinct -- or the rounds run out, which only a map putting
+        nearly all of a segment's mass on fewer than `width` edges gets to."""
+        empty = np.zeros(0, dtype=np.int64)
+        if not len(which):
+            return empty, empty
+        lo = self.start[segments[which]]
+        hi = lo + self.count[segments[which]]
+        if self.ranking is None:
+            live = np.arange(len(which))
+        else:
+            if self.cumulative is None:
+                self.cumulative = np.cumsum(self.ranking, dtype=np.float64)
+            below = np.where(lo > 0, self.cumulative[np.maximum(lo - 1, 0)], 0.0)
+            mass = self.cumulative[hi - 1] - below
+            live = np.flatnonzero(mass > 0)        # nothing to draw from the rest
+        pending = live
+        span = int(hi.max()) + 1
+        drawn_rows, drawn_index = [], []
+        rows = index = empty
+        for turn in range(_ROUNDS):
+            if not len(pending):
+                break
+            fresh = np.repeat(pending, width)
+            draws = turn * width + np.tile(np.arange(width), len(pending))
+            uniform = _uniform(seed, keys[which[fresh]], draws)
+            if self.ranking is None:
+                landed = lo[fresh] + (uniform * (hi - lo)[fresh]).astype(np.int64)
+            else:
+                landed = np.clip(np.searchsorted(self.cumulative,
+                                                 below[fresh] + uniform * mass[fresh],
+                                                 side="right"), lo[fresh], hi[fresh] - 1)
+            drawn_rows.append(fresh)
+            drawn_index.append(landed)
+            # each edge once, at its first draw, grouped by segment in draw order
+            every_row = np.concatenate(drawn_rows)
+            every_index = np.concatenate(drawn_index)
+            first = np.unique(every_row * span + every_index, return_index=True)[1]
+            first = first[np.lexsort((first, every_row[first]))]
+            rows, index = every_row[first], every_index[first]
+            pending = live[np.bincount(rows, minlength=len(which))[live] < width]
+        kept = _within(rows) < width
+        return which[rows[kept]], index[kept]
+
+
+class Fused:
+    """Some relations' edges, one direction, ranked by a map once for all.
+
+    A map that reads only the edge and where it lands is a fact about the graph,
+    so it is folded into the store: a `Ranked` whose segments are the nodes.
+    A budgeted step out of any node then costs what it keeps rather than what
+    the node's degree is.
+
+        fused = Fused(graph, codes, reverse, ranking)   # ranking over `members`
+        rows, positions = fused.best(nodes, 20)
+        rows, positions = fused.draw(nodes, 20, seed)
+        rows, positions = fused.nucleus(nodes, 0.9)
+    """
+
+    __slots__ = ("ranked", "positions", "shift")
+
+    def __init__(self, graph, codes, reverse, ranking):
+        if len(codes) == 1:
+            # one relation is one contiguous run per node: its position is its
+            # place in the run plus where the run starts, and needs no array
+            lo, hi = bounds(graph, codes[0], reverse)
+            self.ranked = Ranked(hi - lo, ranking)
+            self.positions = None
+            self.shift = lo - self.ranked.start
+        else:
+            self.positions = Fused.members(graph, codes, reverse)
+            sources = graph.sources(reverse)[self.positions]
+            self.ranked = Ranked(np.bincount(sources, minlength=graph.n_nodes), ranking)
+            self.shift = None
+
+    @staticmethod
+    def members(graph, codes, reverse):
+        """Every CSR position of these relations, in store order: the edges a
+        map over them is evaluated on, and in that order."""
+        rels = graph.in_rels if reverse else graph.out_rels
+        return np.flatnonzero(np.isin(rels, codes))
+
+    def best(self, nodes, width):
+        rows, index = self.ranked.best(nodes, width)
+        return rows, self._position(index, nodes[rows])
+
+    def draw(self, nodes, width, seed, inclusion=False):
+        drawn = self.ranked.draw(nodes, width, seed, nodes, inclusion=inclusion)
+        rows, index = drawn[0], drawn[1]
+        return (rows, self._position(index, nodes[rows]), *drawn[2:])
+
+    def nucleus(self, nodes, share):
+        rows, index = self.ranked.nucleus(nodes, share)
+        return rows, self._position(index, nodes[rows])
+
+    def _position(self, index, nodes):
+        if self.positions is not None:
+            return self.positions[index]
+        return index + self.shift[nodes]
+
+
+# a segment up to this many times the budget is drawn from by keying all of its
+# edges; a larger one by rounds of draws, at most this many
+_EXACT = 4
+_ROUNDS = 16
+
+
+def _within(rows):
+    """Each element's place within its run of equal `rows`, which are grouped."""
+    if not len(rows):
+        return np.zeros(0, dtype=np.int64)
+    starts = np.flatnonzero(np.r_[True, rows[1:] != rows[:-1]])
+    return np.arange(len(rows)) - np.repeat(starts, np.diff(np.r_[starts, len(rows)]))
+
+
+def _uniform(seed, keys, draws, salt=0):
+    """One number in (0, 1) per (key, draw), from a counter-based hash
+    (splitmix64, twice): the same seed, key and draw give the same number
+    anywhere. `salt` keeps two uses of one (key, draw) apart."""
+    with np.errstate(over="ignore"):
+        state = _mix(np.uint64(seed) * np.uint64(0x9E3779B97F4A7C15)
+                     + np.asarray(keys).astype(np.uint64) + np.uint64(salt << 32))
+        state = _mix(state + np.asarray(draws).astype(np.uint64)
+                     * np.uint64(0xD1B54A32D192ED03))
+    # the top 53 bits, moved off zero so that a logarithm of one is finite
+    return ((state >> np.uint64(11)).astype(np.float64) + 0.5) / float(1 << 53)
+
+
+def _mix(state):
+    state = (state ^ (state >> np.uint64(30))) * np.uint64(0xBF58476D1CE4E5B9)
+    state = (state ^ (state >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)
+    return state ^ (state >> np.uint64(31))
+
+
+def gathered(graph, rows, positions, reverse, normalized=False):
+    """The four arrays `expand` returns, for edges already chosen by position."""
+    indices = graph.in_indices if reverse else graph.out_indices
+    rels = graph.in_rels if reverse else graph.out_rels
+    weights = graph.weights(normalized)[1 if reverse else 0]
+    codes = rels[positions].astype(np.int64)
+    return rows, indices[positions], (~codes if reverse else codes), weights[positions]
+
+
 def interleave(parts):
     """Several walks out of the same rows as one, each row's edges together.
 

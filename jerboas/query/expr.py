@@ -30,17 +30,19 @@ ATTR, REL = "attr", "rel"
 # What every column carries besides its values -- where each row came from, and
 # how much it is to be believed.
 #
-#   score    the confidence: the weight of the edge that revealed it, how close
+#   score     the confidence: the weight of the edge that revealed it, how close
 #            a `like` judged it, 1.0 where nothing measured anything
 #   via      the relation a hop walked to reach it
 #   needle   which of the things asked for this row is an answer to
 #   type     the node type its ids fall in
+#   inclusion the chance a drawn edge had of being drawn, 1.0 where nothing
+#            was cut: what turns a count over a sampled walk into an estimate
 #
 # A type whose own attribute is called one of these is reached with
 # v.x.attr.score. A provenance that says the same thing about every row is kept
 # as one value rather than as a column (see Frame.constants).
-SCORE, VIA, NEEDLE, TYPE = "score", "via", "needle", "type"
-PROVENANCE = (SCORE, VIA, NEEDLE, TYPE)
+SCORE, VIA, NEEDLE, TYPE, INCLUSION = "score", "via", "needle", "type", "inclusion"
+PROVENANCE = (SCORE, VIA, NEEDLE, TYPE, INCLUSION)
 
 # Every column carries a confidence, and where something measured one it is kept
 # under this prefix: an ordinary polars column, so filter, sort, join and

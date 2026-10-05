@@ -43,6 +43,7 @@ from .store.graph import Graph
 from .store.keys import Key
 from .query.expr import SCORE, VIA, col, norm, reverse, shadow, v
 from .query.frame import Frame, concat
+from .query.step import Step, step
 from .plan.optimize import optimize
 from .search.rules import Fuzzy, Rule, Search, Semantic, Words
 from .rank.core import Strategy, Signal
@@ -58,6 +59,8 @@ from .rank import (
 __all__ = [
     # the data, and what you ask it
     "Graph", "Frame", "concat",
+    # a step walked with a budget
+    "step", "Step",
     # naming a column, and its confidence
     "v", "col", "norm", "reverse", "shadow", "SCORE", "VIA",
     # a node, outside the frame
