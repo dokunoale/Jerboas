@@ -82,5 +82,9 @@ them. On the whole graph, a request naming six popular songs takes about one
 second instead of ten -- what is left is resolving the names and ranking, not
 the walk -- and over a thousand real playlists the budget costs about a point
 of hit rate (`benchmark/playlists.py`). A request sets it with `"playlists": n`, and `0`
-walks every playlist, exactly. The page at `/ui` has it as a slider, with the
-time each answer took under it.
+walks every playlist, exactly. What the budget costs the count, the answer
+says rather than hides: `playlists` is an estimate of the whole crowd's, drawn
+from the chance each sampled playlist had of being drawn, and `error` is how
+far it may be off -- zero when the walk was exact. The page at `/ui` shows it
+as `726 ± 78`, and has the budget as a slider, with the time each answer took
+under it.

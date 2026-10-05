@@ -25,7 +25,7 @@ accumulated.
 import numpy as np
 import polars as pl
 
-from ..query.expr import SCORE, shadowed
+from ..query.expr import INCLUSION, SCORE, shadowed
 from .planner import landing, roots
 
 
@@ -172,7 +172,7 @@ def stack(frames):
     # one, so the answer exists once rather than twice
     data = pl.concat(frames, how="diagonal_relaxed", rechunk=False)
     missing = [name for name in order
-               if (shadowed(name) or ("",))[0] == SCORE
+               if (shadowed(name) or ("",))[0] in (SCORE, INCLUSION)
                and any(name not in one.columns for one in frames)]
     if missing:
         data = data.with_columns(pl.col(missing).fill_null(1.0))

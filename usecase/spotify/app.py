@@ -58,14 +58,22 @@ class ExtendRequest(BaseModel):
     # how many of each song's playlists the walk goes through; 0 goes through
     # all of them, which is exact and, for a popular song, seconds slower
     playlists: int = Field(default=PLAYLISTS, ge=0, le=100_000)
+    # keep the performers you named out of the answer, and say what belongs
+    # beside them rather than more of the same
+    exclude_artists: bool = Field(default=False)
 
 
 class Suggestion(BaseModel):
     song: str
     artist: str | None = None
     score: float
-    # how many of the playlists the walk went through hold this one too
+    # in how many of the crowd's playlists it sits -- estimated from the
+    # draw's inclusion probabilities when the walk went through a budget of
+    # them (recommend.candidates)
     playlists: int
+    # how far that estimate may be off: its standard error, zero when the walk
+    # went through every playlist and the count is exact
+    error: int
 
 
 class ExtendResponse(BaseModel):
@@ -81,7 +89,8 @@ def post_extend(body: ExtendRequest) -> ExtendResponse:
         raise HTTPException(status_code=422, detail="name at least one song")
     named, suggestions = extend(app.state.graph, app.state.model, app.state.known,
                                 body.songs, body.k, body.concentration,
-                                body.temperature, body.playlists)
+                                body.temperature, body.playlists,
+                                body.exclude_artists)
     if not named:
         raise HTTPException(status_code=404, detail="no song matched")
     return ExtendResponse(songs=named, suggestions=suggestions)

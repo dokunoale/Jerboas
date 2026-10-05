@@ -486,6 +486,29 @@ confidence composes along a walk: an edge weight and a string similarity are
 not the same measure, but the probabilities of consecutive steps of one walk
 are, and multiplying them is what they mean.
 
+**What a draw kept can be estimated, not just truncated.** `.inclusion()` on a
+sampled step keeps, beside the confidence, the chance each kept edge had of
+being drawn — readable as `v.playlist.inclusion`, one per sampled column, as a
+confidence is one per measured one. A count over the walk then estimates the
+exact walk's count (Horvitz-Thompson): each kept row stands for 1/π of it,
+and the estimate's standard error rides as the count's confidence:
+
+```python
+(seeds.hop(playlist=step("~contains").sample(100, by=1, seed=0).inclusion())
+      .hop(rec="contains")
+      .group_by(v.rec).len("shared"))
+# shared: in how many of the crowd's playlists the song sits, estimated;
+# v.shared.score: the standard error of that estimate
+```
+
+The chance is exact for a flat map (a uniform draw of n out of d keeps each
+edge with n/d) and for any map where the budget is small next to the degree —
+which is where a budget earns its place; between those it is the
+with-replacement reading of the draw, and the bias that makes is the
+benchmark's to say, not the documentation's to hide. A chain with no `sample`
+is refused: a deterministic cut is not a sample, and a column of certainties
+would call a truncated count an estimate.
+
 The trade a budget makes is the only one it makes: an answer the walk would
 have reached through an edge it did not follow is not in the frame. What it
 costs in answer quality, and what it saves in latency, is measured in

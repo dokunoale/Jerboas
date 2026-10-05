@@ -18,11 +18,24 @@ reduces it, which is slower and never wrong.
 
 import polars as pl
 
-from ..query.expr import SCORE, Col, _Method, shadow
+from ..query.expr import INCLUSION, SCORE, Col, _Method, shadow, shadowed
 from ..query.frame import _resolved
 from ..query.resolve import FOLD, Resolver
 from .plan import stack
 from .planner import _names_relation, row_local
+
+
+def _inclusion(data):
+    """The chance each row had of being kept by the walk's draws, as one
+    expression, or None when nothing drew (query/frame.py, `_inclusion_of`)."""
+    columns = [name for name in data.columns
+               if (shadowed(name) or ("",))[0] == INCLUSION]
+    if not columns:
+        return None
+    pi = pl.col(columns[0]).fill_null(1.0)
+    for name in columns[1:]:
+        pi = pi * pl.col(name).fill_null(1.0)
+    return pi
 
 # What one slice's partial result becomes across slices.
 _MERGE = {"sum": "sum", "count": "sum", "min": "min", "max": "max",
@@ -64,6 +77,7 @@ def agg(grouped, exprs, named, length=None):
                              f"{sorted(FOLD)}, a callable, or None")
         return None
     seen = set()                       # grouped columns some slice had a confidence for
+    estimated = []                     # non-empty once a slice's walk had drawn
 
     def local(part):
         resolver = Resolver(part)
@@ -75,9 +89,19 @@ def agg(grouped, exprs, named, length=None):
                             expr.count().alias(f"__jb_n{index}")]
             else:
                 columns.append(getattr(expr, method)().alias(f"__jb_a{index}"))
-        if length is not None:
-            columns.append(pl.len().alias("__jb_len"))
         data = resolver.attach(part._df)
+        if length is not None:
+            pi = _inclusion(data)
+            if pi is None:
+                columns += [pl.len().alias("__jb_len"),
+                            pl.lit(0.0).alias("__jb_len_var")]
+            else:
+                # each kept row stands for 1/pi of the exact walk's rows:
+                # the group size is estimated (Horvitz-Thompson), its variance
+                # summed beside it
+                estimated.append(True)
+                columns += [(1 / pi).sum().alias("__jb_len"),
+                            ((1 - pi) / pi ** 2).sum().alias("__jb_len_var")]
         if rule is not None:
             for column in by:
                 name = shadow(SCORE, column)
@@ -110,6 +134,9 @@ def agg(grouped, exprs, named, length=None):
             out.append(pl.col(f"__jb_a{index}").alias(name))
     if length is not None:
         out.append(pl.col("__jb_len").alias(length))
+        if estimated:
+            # the estimate's standard error is the count's confidence
+            out.append(pl.col("__jb_len_var").sqrt().alias(shadow(SCORE, length)))
     if rule is not None:
         out += [_CONFIDENCE[rule][1](column).alias(shadow(SCORE, column))
                 for column in by if column in seen]

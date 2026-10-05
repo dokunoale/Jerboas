@@ -239,10 +239,13 @@ class Ranked:
         chosen = ranges(lo, counts)
         return rows, (chosen if self.order is None else self.order[chosen])
 
-    def draw(self, segments, width, seed, keys):
+    def draw(self, segments, width, seed, keys, inclusion=False):
         """(rows, index): `width` distinct edges per segment, drawn without
         replacement in proportion to the map -- or all of them, when a segment
         holds no more. Rows come out in the order of `segments`.
+
+        With `inclusion`, a third array: the chance each kept edge had of
+        being kept (`_inclusion`).
 
         A draw is a function of the seed, the segment's key and which draw it
         is (`_uniform`), never of where the segment sits in what was asked: a
@@ -266,7 +269,39 @@ class Ranked:
         rows = np.concatenate([one[0] for one in parts])
         index = np.concatenate([one[1] for one in parts])
         order = np.lexsort((index, rows))
-        return rows[order], index[order]
+        rows, index = rows[order], index[order]
+        if not inclusion:
+            return rows, index
+        return rows, index, self._inclusion(np.asarray(segments), width, rows, index)
+
+    def _inclusion(self, segments, width, rows, index):
+        """The chance each kept edge had of being kept.
+
+        A segment no wider than the budget keeps all of it: 1. Cut, a flat map
+        draws a uniform `width` out of `count`, exactly. A map draws in
+        proportion: 1 - (1 - w/W)^width, the edge's share of the segment's
+        mass drawn `width` times -- exact for one draw, and for any width
+        where the budget is small next to the segment, which is where a budget
+        earns its place. Between those it is the with-replacement reading of a
+        draw without one: an approximation, and the benchmark says how good.
+        """
+        count = self.count[segments]
+        pi = np.ones(len(index))
+        on = count[rows] > width
+        if not on.any():
+            return pi
+        if self.ranking is None:
+            pi[on] = width / count[rows[on]]
+            return pi
+        if self.cumulative is None:
+            self.cumulative = np.cumsum(self.ranking, dtype=np.float64)
+        lo = self.start[segments]
+        below = np.where(lo > 0, self.cumulative[np.maximum(lo - 1, 0)], 0.0)
+        mass = self.cumulative[lo + count - 1] - below
+        share = np.clip(self.ranking[index[on]].astype(np.float64) / mass[rows[on]],
+                        0.0, 1.0)
+        pi[on] = 1.0 - (1.0 - share) ** width
+        return pi
 
     def _by_keys(self, which, segments, width, seed, keys):
         """Every edge of these segments keyed, the `width` best keys kept."""
@@ -376,9 +411,10 @@ class Fused:
         rows, index = self.ranked.best(nodes, width)
         return rows, self._position(index, nodes[rows])
 
-    def draw(self, nodes, width, seed):
-        rows, index = self.ranked.draw(nodes, width, seed, nodes)
-        return rows, self._position(index, nodes[rows])
+    def draw(self, nodes, width, seed, inclusion=False):
+        drawn = self.ranked.draw(nodes, width, seed, nodes, inclusion=inclusion)
+        rows, index = drawn[0], drawn[1]
+        return (rows, self._position(index, nodes[rows]), *drawn[2:])
 
     def nucleus(self, nodes, share):
         rows, index = self.ranked.nucleus(nodes, share)

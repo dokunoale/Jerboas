@@ -26,8 +26,8 @@ import numpy as np
 import polars as pl
 
 from . import traverse
-from .expr import (SCORE, VIA, Col, Expr, direction, is_shadow, name_of,
-                   reverse, shadow, shadowed)
+from .expr import (INCLUSION, SCORE, VIA, Col, Expr, direction, is_shadow,
+                   name_of, reverse, shadow, shadowed)
 from ..store.keys import Key
 from ..plan.optimize import budget
 from ..plan.plan import Plan
@@ -209,11 +209,11 @@ class Frame:
         for spec, name in steps:
             if name is not None:
                 self._claim(name)
-            elif spec.measure is not None:
+            elif spec.measure is not None or spec.watched:
                 raise ValueError(
-                    "a step measuring a probability must be named: two routes "
-                    "through an unnamed step are folded into one, and the walk "
-                    "would lose the mass of the other")
+                    "a step that measures must be named: two routes through an "
+                    "unnamed step are folded into one, and the walk would lose "
+                    "what the other measured")
             spec.known(self.graph)
 
         current = budget()
@@ -256,7 +256,7 @@ class Frame:
                    else None)
 
         for spec, name in steps:
-            walked, targets, codes, weights = spec.walk(
+            walked, targets, codes, weights, pi = spec.walk(
                 graph, nodes, name, self._context(base, rows, added, variables),
                 None if toward is None else toward.reaches)
             if spec.measure is not None and carried is not None:
@@ -276,6 +276,10 @@ class Frame:
             added[name] = nodes.astype(np.int32)
             if len(weights) and not (weights == 1.0).all():
                 added[shadow(SCORE, name)] = weights
+            # a draw's own chances, on the column it landed in: the chance of
+            # the row is the product of these, which is what an estimate reads
+            if pi is not None and len(pi) and not (pi == 1.0).all():
+                added[shadow(INCLUSION, name)] = pi
             if single is None and len(codes):
                 added[shadow(VIA, name)] = self._names(codes)
             elif single is not None:
@@ -947,8 +951,19 @@ class _GroupBy:
         if self.frame._plan is not None:
             from ..plan import stream
             return stream.agg(self, (), {}, length=name)
-        grouped = self.frame._df.group_by(self.by, maintain_order=self.maintain_order)
-        return self.frame._wrap(grouped.agg(pl.len().alias(name), **self._confidence()))
+        frame = self.frame
+        grouped = frame._df.group_by(self.by, maintain_order=self.maintain_order)
+        pi = _inclusion_of(frame)
+        if pi is None:
+            return frame._wrap(grouped.agg(pl.len().alias(name), **self._confidence()))
+        # the walk these rows came from drew: each kept row stands for 1/pi of
+        # the exact walk's rows, so the group's size is estimated rather than
+        # truncated (Horvitz-Thompson) -- and the estimate's standard error is
+        # the count's confidence
+        return frame._wrap(grouped.agg(
+            (1 / pi).sum().alias(name),
+            ((1 - pi) / pi ** 2).sum().sqrt().alias(shadow(SCORE, name)),
+            **self._confidence()))
 
     def _confidence(self):
         """What the grouped columns' confidence becomes.
@@ -965,6 +980,17 @@ class _GroupBy:
         return {shadow(SCORE, column): fold(pl.col(shadow(SCORE, column)))
                 for column in self.by
                 if shadow(SCORE, column) in self.frame._df.columns}
+
+
+def _inclusion_of(frame):
+    """The chance each row had of being kept by the walk's draws, as one
+    expression -- the product of the inclusion shadows the frame carries -- or
+    None when nothing drew. Absent shadows are the 1.0 they stand for."""
+    columns = [name for name in frame._df.columns
+               if (shadowed(name) or ("",))[0] == INCLUSION]
+    if not columns:
+        return None
+    return reduce(operator.mul, (pl.col(name).fill_null(1.0) for name in columns))
 
 
 def concat(*frames, how="diagonal"):

@@ -24,7 +24,10 @@ The walk goes through a budget of playlists per song rather than all of them
 (`PLAYLISTS`). On the whole graph, measured over a thousand real playlists
 (benchmark/playlists.py), that takes the slowest requests from seven seconds to
 a third of one and costs about a point of hit rate; walking all of them is
-`playlists=0`.
+`playlists=0`. What the budget costs the count, it says rather than hides:
+`shared` is an estimate of the whole crowd's, drawn from the chance each
+sampled playlist had of being drawn, and the answer carries how far that
+estimate may be off (`error`, zero when the walk was exact).
 """
 
 import polars as pl
@@ -49,10 +52,12 @@ def walk(playlists: int = PLAYLISTS) -> tuple[jb.Step, jb.Step]:
     from a song to its playlists, and from a playlist to its songs.
 
     The draw has a seed, so the same songs are answered the same way every
-    time: approximate, and reproducible."""
+    time: approximate, and reproducible. `inclusion()` keeps the chance each
+    drawn playlist had of being drawn, so a count over the walk is an estimate
+    of the whole crowd's, not of the hundred that answered."""
     to_playlists = step(reverse("contains"))
     if playlists:
-        to_playlists = to_playlists.sample(playlists, by=1, seed=0)
+        to_playlists = to_playlists.sample(playlists, by=1, seed=0).inclusion()
     return to_playlists.probability(by=1), step("contains").probability(by=1)
 
 
@@ -78,24 +83,36 @@ def clustered(graph: jb.Graph, model: DiffusedMatrixFactorization, seeds: jb.Fra
 
 
 def candidates(graph: jb.Graph, seeds: jb.Frame, known: jb.Frame,
-               playlists: int = PLAYLISTS) -> jb.Frame:
+               playlists: int = PLAYLISTS,
+               exclude: jb.Frame | None = None) -> jb.Frame:
     """Every song the factorization knows that the walk reaches, within the
     part of the playlist each seed belongs to: how likely the walk is to end
-    there is its confidence (`v.rec.score`), and `shared` is in how many of the
-    playlists it went through.
+    there is its confidence (`v.rec.score`), and `shared` is in how many of
+    the crowd's playlists it sits -- estimated, when the walk drew its
+    playlists, from the draw's inclusion probabilities (the estimate's
+    standard error rides as `v.shared.score`).
+
+    `exclude` is a frame of artists whose songs may not come back -- the
+    input's own performers, when asked. It filters by the relation rather than
+    by a walk: `v.rec.performed_by.is_in(exclude)` is whether an edge to that
+    set exists, which the graph answers from adjacency without expanding the
+    frame.
 
     Planned (`jb.optimize`): walked in full, a handful of popular seeds reach
     tens of thousands of playlists and millions of rows, and the plan runs it a
     slice at a time. With a budget there is little left to slice."""
     to_playlists, to_songs = walk(playlists)
     with jb.optimize():
-        return (seeds
+        reached = (seeds
                 .hop(playlist=to_playlists)
                 .hop(rec=to_songs)
-                .filter(~v.rec.is_in(seeds), v.rec.is_in(known))
+                .filter(~v.rec.is_in(seeds), v.rec.is_in(known)))
+        if exclude is not None:
+            reached = reached.filter(~v.rec.performed_by.is_in(exclude))
+        return (reached
                 # the walks that end on a song, added up
                 .group_by(v.rec, v.part, confidence="sum")
-                .agg(shared=v.rec.count()))
+                .len("shared"))
 
 
 def rank(counted: jb.Frame, seeds: jb.Frame, model: DiffusedMatrixFactorization, k: int,
@@ -123,9 +140,12 @@ def rank(counted: jb.Frame, seeds: jb.Frame, model: DiffusedMatrixFactorization,
 
 def extend(graph: jb.Graph, model: DiffusedMatrixFactorization, known: jb.Frame,
            songs: list[str], k: int, concentration: float = 0.0,
-           temperature: float = 0.0,
-           playlists: int = PLAYLISTS) -> tuple[list[str], list[dict]]:
-    """(what your names resolved to, the suggestions), both readable."""
+           temperature: float = 0.0, playlists: int = PLAYLISTS,
+           exclude_artists: bool = False) -> tuple[list[str], list[dict]]:
+    """(what your names resolved to, the suggestions), both readable.
+
+    `exclude_artists` keeps the performers you named out of the answer, so the
+    suggestions say what belongs beside them rather than more of the same."""
     seeds = resolve(graph, songs)
     if seeds is None or not len(seeds):
         return [], []
@@ -134,7 +154,8 @@ def extend(graph: jb.Graph, model: DiffusedMatrixFactorization, known: jb.Frame,
              .to_series().to_list())
 
     parts = clustered(graph, model, seeds, concentration)
-    counted = (candidates(graph, parts, known, playlists)
+    counted = (candidates(graph, parts, known, playlists,
+                          exclude=found.select("artist") if exclude_artists else None)
                .attrs(rec="name")
                # another master of a song you gave me is not a suggestion
                .filter(~v.rec.name.is_in(found.pl["seed.name"].to_list())))
@@ -142,6 +163,16 @@ def extend(graph: jb.Graph, model: DiffusedMatrixFactorization, known: jb.Frame,
         return named, []
 
     ranked = describe(rank(counted, seeds, model, k, temperature), "rec")
-    return named, (
-        ranked.pl.select(song="rec.name", artist="artist.name", score="score",
-                         playlists="shared").rows(named=True))
+    # a count's estimate reads as a count -- no decimals it cannot vouch for --
+    # and, when the walk drew its playlists, the error of the estimate beside
+    # it; walked in full the count is exact and the error is none. The error
+    # rides on `shared` as its confidence, which `.raw` keeps and `.pl` hides.
+    # A draw that cut nothing allocates nothing (certainty costs no column,
+    # like a confidence of all 1.0), so its absence *is* an exact count.
+    shared = pl.col("shared").cast(pl.Float64).round(0).cast(pl.Int64)
+    error = (pl.col("__jb_score__shared").cast(pl.Float64).round(0).cast(pl.Int64)
+             if "__jb_score__shared" in ranked.raw.columns
+             else pl.lit(0, dtype=pl.Int64))
+    return named, ranked.raw.select(song="rec.name", artist="artist.name",
+                                    score="score", playlists=shared,
+                                    error=error).rows(named=True)

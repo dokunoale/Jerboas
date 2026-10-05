@@ -17,10 +17,10 @@ from recommend import PLAYLISTS, extend
 
 EXAMPLES = [
     ["Smells Like Teen Spirit\nCome As You Are\nLithium\nPoker Face\nBad Romance\nToxic",
-     5, 0.5, 0.0, PLAYLISTS],
+     5, 0.5, 0.0, PLAYLISTS, False],
     ["Wonderwall | Oasis\nChampagne Supernova | Oasis\nDon't Look Back in Anger | Oasis",
-     5, 0.0, 0.0, PLAYLISTS],
-    ["Toxic\nLose Control\nBad Romance", 5, 0.0, 0.0, 0],
+     5, 0.0, 0.0, PLAYLISTS, False],
+    ["Toxic\nLose Control\nBad Romance", 5, 0.0, 0.0, 0, False],
 ]
 
 
@@ -37,20 +37,24 @@ def build(state) -> gr.Blocks:
     the service has loaded anything."""
 
     def suggest(text: str, k: float, concentration: float, temperature: float,
-                playlists: float) -> tuple[str, list[list]]:
+                playlists: float, exclude_artists: bool) -> tuple[str, list[list]]:
         asked = names(text)
         if not asked:
             raise gr.Error("name at least one song")
         start = time.perf_counter()
         named, suggestions = extend(state.graph, state.model, state.known, asked,
-                                    int(k), concentration, temperature, int(playlists))
+                                    int(k), concentration, temperature, int(playlists),
+                                    exclude_artists)
         seconds = time.perf_counter() - start
         if not named:
             raise gr.Error("no song matched")
         walked = f"{int(playlists)} playlists per song" if playlists else "every playlist"
         found = "\n".join(f"- {one}" for one in named)
         summary = f"**Read as**\n\n{found}\n\n*{seconds:.2f} s, walking {walked}*"
-        return summary, [[one["song"], one["artist"], one["playlists"], round(one["score"], 4)]
+        return summary, [[one["song"], one["artist"],
+                          f"{one['playlists']} ± {one['error']}" if one["error"]
+                          else str(one["playlists"]),
+                          round(one["score"], 4)]
                          for one in suggestions]
 
     with gr.Blocks(title="Jerboas playlist continuation") as page:
@@ -70,12 +74,15 @@ def build(state) -> gr.Blocks:
                 playlists = gr.Slider(
                     0, 1000, value=PLAYLISTS, step=25, label="Playlists per song",
                     info="how many the walk goes through; 0 is all of them, exactly")
+                exclude_artists = gr.Checkbox(
+                    label="Exclude input artists", value=False,
+                    info="drop suggestions by the performers you named")
                 ask = gr.Button("Suggest", variant="primary")
             with gr.Column():
                 summary = gr.Markdown()
                 table = gr.Dataframe(headers=["song", "artist", "playlists", "score"],
                                      interactive=False)
-        inputs = [songs, k, concentration, temperature, playlists]
+        inputs = [songs, k, concentration, temperature, playlists, exclude_artists]
         gr.Examples(EXAMPLES, inputs=inputs)
         ask.click(suggest, inputs=inputs, outputs=[summary, table])
         songs.submit(suggest, inputs=inputs, outputs=[summary, table])

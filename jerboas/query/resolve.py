@@ -14,7 +14,7 @@ read only to decide is taken off again; what was *measured* stays.
 import numpy as np
 import polars as pl
 
-from .expr import (ATTR, NEEDLE, PROVENANCE, REL, SCORE, TYPE, Relation,
+from .expr import (ATTR, INCLUSION, NEEDLE, PROVENANCE, REL, SCORE, TYPE, Relation,
                    path_of, shadow)
 from ..search.rules import Search, default_rule
 
@@ -214,8 +214,9 @@ class Resolver:
         constant = self.frame.constants.get((kind, column))
         if constant is not None:
             return pl.repeat(constant, pl.len())
-        # nothing measured this column, so nothing is in doubt about it
-        if kind == SCORE:
+        # nothing measured this column, so nothing is in doubt about it -- and
+        # nothing cut it, so it was kept with certainty
+        if kind in (SCORE, INCLUSION):
             return pl.repeat(1.0, pl.len())
         return pl.repeat(None, pl.len(), dtype=pl.String)
 

@@ -31,6 +31,10 @@ of ending on each node.
 The trade a budget makes is the only one it makes: an answer the walk would
 have reached through an edge it did not follow is not in the frame. What a
 model then scores is a subset of the exact candidates, never a different set.
+Unless it is asked to estimate rather than truncate: `.inclusion()` on a
+sampled step keeps the chance each kept edge had of being drawn, and a count
+over the walk becomes an estimate of the exact walk's count, with a standard
+error (query/frame.py, `group_by(...).len()`).
 """
 
 import numpy as np
@@ -76,12 +80,13 @@ class Step:
     Passive, like every expression: the frame walks it, and the planner reads
     off it what the walk will cost."""
 
-    __slots__ = ("specs", "stages", "measure")
+    __slots__ = ("specs", "stages", "measure", "watched")
 
-    def __init__(self, specs, stages=(), measure=None):
+    def __init__(self, specs, stages=(), measure=None, watched=False):
         self.specs = specs              # [(relation, backwards)], None for any
         self.stages = stages            # Select, in the order they apply
         self.measure = measure          # (by,) for probability(), else None
+        self.watched = watched          # inclusion(): keep each draw's chance
 
     @classmethod
     def of(cls, spec):
@@ -98,7 +103,8 @@ class Step:
 
     def top(self, n, by=None):
         """The n edges of each row ranking highest by `by`."""
-        return Step(self.specs, self.stages + (Select(n, by),), self.measure)
+        return Step(self.specs, self.stages + (Select(n, by),), self.measure,
+                    self.watched)
 
     def sample(self, n, by=None, seed=None):
         """n distinct edges of each row, drawn without replacement in
@@ -108,13 +114,15 @@ class Step:
         With a seed the draw is a function of the node (traverse.Ranked.draw):
         the same answer every time and however the walk is sliced. Without one
         every walk draws afresh."""
-        return Step(self.specs, self.stages + (Select(n, by, True, seed),), self.measure)
+        return Step(self.specs, self.stages + (Select(n, by, True, seed),),
+                    self.measure, self.watched)
 
     def top_p(self, p, by=None):
         """The fewest best edges of each row holding `p` of its mass under
         `by` -- a nucleus, as a decoder keeps one: few edges where one
         dominates, many where none does."""
-        return Step(self.specs, self.stages + (Select(by=by, share=p),), self.measure)
+        return Step(self.specs, self.stages + (Select(by=by, share=p),),
+                    self.measure, self.watched)
 
     def probability(self, by=None):
         """What the step measured becomes the probability a random walk gets
@@ -126,7 +134,24 @@ class Step:
 
         Along several such steps the last confidence is the walk's probability,
         and `group_by(confidence="sum")` adds up the walks that end together."""
-        return Step(self.specs, self.stages, (by,))
+        return Step(self.specs, self.stages, (by,), self.watched)
+
+    def inclusion(self):
+        """Keep, beside the confidence, the chance each edge of this step's
+        draw had of being drawn: its inclusion probability, readable as
+        `v.name.inclusion` and composed across the walk's steps. It is what
+        turns `group_by(...).len()` over a sampled walk into an estimate of
+        the exact walk's count rather than a truncated one (Horvitz-Thompson):
+        each kept row stands for 1/pi of the walk's rows, and the estimate's
+        standard error is the count's confidence.
+
+        A chain with no draw keeps all it follows: every chance is 1, and a
+        column of them would call a truncated count an estimate."""
+        if not any(one.draw for one in self.stages):
+            raise ValueError(
+                "inclusion() measures a draw, and this chain has none: "
+                "sample(n) first")
+        return Step(self.specs, self.stages, self.measure, True)
 
     # -- what the planner reads off it --
 
@@ -185,25 +210,28 @@ class Step:
     # -- walking it --
 
     def walk(self, graph, nodes, name, context=None, reaches=None):
-        """(rows, targets, codes, weights), as traverse.expand returns them.
+        """(rows, targets, codes, weights, inclusion), as traverse.expand
+        returns them, plus the chance each edge had of being kept when the
+        step watches its draws (None when it does not).
 
         `context(roots, rows)` hands a map the columns it reads of the frame
         the walk leaves from, at the rows given; only a map reading beyond the
         step asks for it."""
         nodes = np.asarray(nodes, dtype=np.int64)
         stages = self.stages
+        pi = None
         if reaches is not None:
             arrays = _merge([reach.gather(nodes, normalized=True) for reach in reaches])
         elif stages and self._fusable(stages[0], name):
-            arrays = self._fused(graph, nodes, name, stages[0])
+            arrays, pi = self._fused(graph, nodes, name, stages[0])
             stages = stages[1:]
         else:
             arrays = self._expand(graph, nodes)
         for stage in stages:
-            arrays = self._select(graph, nodes, name, context, arrays, stage)
+            arrays, pi = self._select(graph, nodes, name, context, arrays, stage, pi)
         if self.measure is not None:
             arrays = self._probability(graph, nodes, name, context, arrays)
-        return arrays
+        return (*arrays, pi)
 
     def _expand(self, graph, nodes):
         if self.specs is None:
@@ -230,11 +258,15 @@ class Step:
                 graph, codes, backwards, self._ranking(graph, codes, backwards, name, stage))))
         if stage.share is not None:
             rows, positions = fused.nucleus(nodes, stage.share)
+            pi = None
         elif stage.draw:
-            rows, positions = fused.draw(nodes, stage.width, _seed(stage))
+            rows, positions, *pi = fused.draw(nodes, stage.width, _seed(stage),
+                                              inclusion=self.watched)
         else:
             rows, positions = fused.best(nodes, stage.width)
-        return traverse.gathered(graph, rows, positions, backwards, normalized=True)
+            pi = None
+        return traverse.gathered(graph, rows, positions, backwards,
+                                 normalized=True), (pi[0] if pi else None)
 
     def _ranking(self, graph, codes, backwards, name, stage):
         """The map over every edge of the relations, in store order."""
@@ -246,20 +278,31 @@ class Step:
         _check(values, stage)
         return values.astype(np.float32)
 
-    def _select(self, graph, nodes, name, context, arrays, stage):
-        """One selector over the candidates each row already has."""
+    def _select(self, graph, nodes, name, context, arrays, stage, pi=None):
+        """One selector over the candidates each row already has.
+
+        `pi` is the chance each candidate had of still being here; a draw
+        multiplies its own chances in."""
         rows, targets, codes, weights = arrays
         values = _values(stage.by, graph, name, rows, targets, weights, context)
         _check(values, stage)
         ranked = traverse.Ranked(np.bincount(rows, minlength=len(nodes)), values)
         segments = np.arange(len(nodes))
+        kept = None
         if stage.share is not None:
-            _kept, index = ranked.nucleus(segments, stage.share)
+            _rows, index = ranked.nucleus(segments, stage.share)
         elif stage.draw:
-            _kept, index = ranked.draw(segments, stage.width, _seed(stage), nodes)
+            drawn = ranked.draw(segments, stage.width, _seed(stage), nodes,
+                                inclusion=self.watched)
+            index = drawn[1]
+            kept = drawn[2] if self.watched else None
         else:
-            _kept, index = ranked.best(segments, stage.width)
-        return rows[index], targets[index], codes[index], weights[index]
+            _rows, index = ranked.best(segments, stage.width)
+        if pi is not None:
+            pi = pi[index] if kept is None else pi[index] * kept
+        else:
+            pi = kept
+        return (rows[index], targets[index], codes[index], weights[index]), pi
 
     def _probability(self, graph, nodes, name, context, arrays):
         rows, targets, codes, weights = arrays

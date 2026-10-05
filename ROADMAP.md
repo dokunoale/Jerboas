@@ -175,16 +175,20 @@ against the exact walk is the wrong yardstick. The yardsticks are:
   1000 queries, paired, a one-point difference is resolved (the table above),
   since every variant answers the same queries.
 
-A step further is to make the error part of the answer. A walk that samples
-knows each row's inclusion probability, so an aggregate over it can be
+A step further is to make the error part of the answer **(done)**. A walk that
+samples knows each row's inclusion probability, so an aggregate over it can be
 *estimated* rather than truncated: the Horvitz-Thompson estimator (1952) makes
-`group_by(...).len()` over a sampled walk an unbiased estimate of the exact
-count, with a variance. This is online aggregation (Hellerstein et al., 1997)
+`group_by(...).len()` over a sampled walk an estimate of the exact count, with
+a standard error. This is online aggregation (Hellerstein et al., 1997)
 and ripple joins (Haas & Hellerstein, 1999) carried to joins, and Wander Join
 (Li et al., 2016) is exactly that over random walks through a join graph. A hop
-*is* a join (README), so it applies as it stands. In Jerboas the probability
-would be a shadow column beside the confidence, and the estimate a confidence
-on the aggregated column.
+*is* a join (README), so it applies as it stands. In Jerboas the probability is
+a shadow column beside the confidence (`step(...).sample(...).inclusion()`,
+read as `v.x.inclusion`), and the estimate's standard error is the aggregated
+column's confidence. The chance is exact for a flat map and where the budget
+is small next to the degree; between those it is the with-replacement reading
+of the draw, and on Spotify's head that reading lands within 2 standard errors
+of the exact count 95% of the time, at a median relative error of 9%.
 
 ### 3. What a budget cannot see, and the techniques to try
 
@@ -195,7 +199,7 @@ below is a candidate selector, measured on the same grid:
 
 | technique | idea | literature | in Jerboas |
 |---|---|---|---|
-| **sample, don't prune** | a draw in proportion to the map reaches the tail sometimes, and is unbiased with the right weights | Horvitz & Thompson 1952; Wander Join (Li et al. 2016); neighbour sampling in GNNs: GraphSAGE (Hamilton et al. 2017), FastGCN (Chen et al. 2018), LADIES (Zou et al. 2019) | `sample(n, by=)`: done. The inclusion probability as a column: to do |
+| **sample, don't prune** | a draw in proportion to the map reaches the tail sometimes, and is unbiased with the right weights | Horvitz & Thompson 1952; Wander Join (Li et al. 2016); neighbour sampling in GNNs: GraphSAGE (Hamilton et al. 2017), FastGCN (Chen et al. 2018), LADIES (Zou et al. 2019) | `sample(n, by=)`: done. The inclusion probability as a column: done (`inclusion()`, I.2) |
 | **lookahead** | rank an edge by what it can still lead to, not only by itself: an upper bound on the next step's best | A* (Hart et al. 1968); beam search | a map that reads a node's degree *into a landing set* (`known`), which the planner already computes (`Reach`) |
 | **exact top-k, early stop** | when the score is a monotone sum of per-node maps, stop once no unseen candidate can enter the top k. Exact and faster | Threshold Algorithm (Fagin et al. 2003); WAND (Broder et al. 2003); Block-Max WAND (Ding & Suel 2011) | the fused order *is* TA's sorted list. The deterministic end of the spectrum, and the baseline an approximation has to beat |
 | **random-walk estimators** | estimate a personalized PageRank or a visit count by short walks with a stopping rule, not a matrix | Monte Carlo PPR (Fogaras et al. 2005; Avrachenkov et al. 2007); FAST-PPR (Lofgren et al. 2014); bidirectional PPR (Lofgren et al. 2016); Pixie (Eksombatchai et al. 2018) | `PageRank` computes the whole vector today. A walk-based `PageRank` with a budget of steps is the same Strategy at a fraction of the cost |
@@ -231,9 +235,9 @@ from. How they are stored, ordered and combined is the second half of the work.
    confidence of the node it leaves from, so the last step's confidence is the
    probability of the walk, and `group_by(confidence="sum")` is the chance of
    ending on each node. Everywhere else confidence still does not compose, as
-   the README says. The two readings coexist, one per step. What is not done
-   is the sampled walk's inclusion probability, which is what the estimator in
-   I.2 needs.
+   the README says. The two readings coexist, one per step. The sampled walk's
+   inclusion probability is done too: one shadow per sampled column, and the
+   row's chance is their product, which is what the estimator in I.2 reads.
 5. **Embedding maps behind an index.** A taste that is a dot product is a
    maximum-inner-product search: HNSW (Malkov & Yashunin 2018), FAISS (Johnson
    et al. 2019), asymmetric LSH for MIPS (Shrivastava & Li 2014). `near` already
