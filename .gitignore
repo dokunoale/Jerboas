@@ -1,16 +1,37 @@
+# Python
 __pycache__/
 *.py[cod]
-.pytest_cache/
 *.egg-info/
 build/
 dist/
 .venv/
 venv/
+.env
+
+# tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.ipynb_checkpoints/
 
 # MovieLens may not be redistributed: "The user may not redistribute the data
 # without separate permission" (GroupLens usage licence), and the IMDb-derived
-# files are non-commercial-use only. data/example/ is synthetic and ships.
-data/
+# files are non-commercial-use only. So everything under data/ stays local
+# except the synthetic example graph and the scripts that build the rest.
+data/**
+!data/**/
+!data/example/**
+!data/**/*.py
+
+# editors and OS
+.DS_Store
+._*
+.idea/
+.vscode/
+*.swp
+*~
 
 # trained model checkpoints (convention: checkpoints/<dataset>.<model>.npz)
 checkpoints/
