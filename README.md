@@ -144,11 +144,12 @@ name resolves in this order, and the order is the whole rule:
 2. **an attribute of that variable's type** — read out of the graph, on demand
 3. **a relation of the graph** — arity with `.count()`, existence with `.is_in(...)`
 
-```python
-.filter(v.movie.year >= 1990)                 # no .attrs() first: it is read
-.filter(v.movie.has_genre.count() >= 2)       # a relation's arity
-.filter(v.movie.directed_by.is_in(people))    # the edge exists, unexpanded
-```
+So `.filter(v.movie.year >= 1990)` needs no `.attrs()` first: the year is read.
+A relation's count is a fact about the graph — the same number whatever the
+query asked, which is what tells it apart from `group_by(...).agg(count)`.
+Neither form expands the frame: existence with a set walks the *given* side
+backwards and collects what reaches it, so the cost is the degree of that set.
+Pass the smaller one.
 
 A filter filters rows, not columns: what it read to decide is taken off again,
 so the frame's shape does not change under it. `.attrs(movie="year")` is how a
@@ -343,9 +344,7 @@ as `v.mid.via`.
 A **keyword** names the column the step's arrivals are kept in. A **positional**
 step is walked and not kept — and that is what lets it be *folded*: two routes
 that meet at an unnamed intermediate carry identical rows onward, and a row that
-differs only where nothing was named is not a different row. The memoized
-sub-path search the old engine needed is here a consequence of not having given
-something a name.
+differs only where nothing was named is not a different row.
 
 The last step must be named, because where the walk ends is what the frame
 holds; Python already requires positional arguments to come first, so the rule
@@ -392,7 +391,7 @@ Two consequences worth knowing:
 simply drops out. A node with eight contributes eight, so a frame grows by the
 degree of what it walks — which is why `unique` between two hops matters: two
 users who watched the same film reach the same neighbours, and carrying that row
-twice is what the old engine's memoized sub-path search existed to avoid.
+twice doubles the work of every step after it.
 
 **The walk is the cheap half.** The expensive half is `frame[rows]`, which drags
 every column the frame already has into every new row. So `select` away what the
@@ -405,8 +404,7 @@ frame.hop(rec="~has_genre").filter(v.rec.year >= 1990)
 
 The predicate reaches the Frame before it reaches polars, and everything it
 reads is about the node just reached, so it is applied to the arrays the walk
-produced rather than to the rows they would have become. This is the compiler's
-old admission mask, obtained by writing an ordinary filter — and it pays in
+produced rather than to the rows they would have become. It pays in
 proportion to what the frame is carrying: on a MovieLens hop it is **24% faster
 on a 14-column frame** and a wash on a 2-column one, which is the same cost
 model read from the other side.
@@ -600,8 +598,7 @@ MatrixFactorization(user=who).on("rec")     # one person's, for the whole frame
 TransD.load(path, g).on("rec", "seed")      # each row against its own seed
 ```
 
-Nothing is combined behind your back. Two signals used to be min-max normalized
-and averaged inside `rank(...)`; now `.norm()` is written where it happens, the
+Nothing is combined behind your back: `.norm()` is written where it happens, the
 weights are numbers you chose, and every intermediate signal is a column you can
 print and sort by on its own.
 
@@ -666,8 +663,10 @@ back to its identity rather than to a guess.
 
 ## Embeddings are strategies
 
-Fitting one needs torch, so the models are an optional extra and are imported on
-demand — a base install stays importable without it.
+The models need torch to be fitted *and* to be loaded, so they are an optional
+extra, imported on demand: a base install stays importable without it, and the
+strategies that are not trained — `PageRank`, `MatrixFactorization`,
+`Concentration`, … — run on numpy alone.
 
 ```python
 from jerboas import TransD, train               # pip install jerboas[torch]
@@ -746,29 +745,6 @@ so it has to learn something real to score it lower.
 On MovieLens (15 369 nodes, 127 k edges, of which 110 k pass the cold-start use
 case's training filter) TransD at `factors=64` is 1.97 M parameters, 7.9 MB, and
 trains in roughly a second per epoch on Apple MPS.
-
-## Breaking change in 0.2
-
-0.2 replaces the query API. `Graph` and the data format are unchanged, and so
-are the models and their checkpoints; everything between `g` and a result is
-different. `select/where/rank/top`, `Node`, `Edge`, `Path`, `Like`, `Has`, the
-`Condition`/`Ref`/`Engine` families and the pluggable engines are gone, and
-what replaces them is above. There is no compatibility layer: 0.1 queries do
-not run.
-
-| 0.1 | 0.2 |
-|---|---|
-| `g.select(rec).where(...)` | `g.nodes(rec="movie").filter(...)` |
-| `Node("movie")`, `Node()` | a column name |
-| `path == [a, Edge(), b]` | `.hop(b=())` |
-| `Like(node.name.is_in(x))` | `.filter(v.node.name.like(x))` |
-| `Has(a, "r", b)` / `~Has(...)` | `.filter(v.a.r.is_in(b))` |
-| `node.rel.count()` | `v.node.rel.count()` |
-| `rank(a, b)` | `.with_columns(score=0.6 * a.norm() + 0.4 * b.norm())` |
-| `Sum(edge.score)` | `.group_by(...).agg(score=v.x.score.sum())` |
-| `Score()` projection | the `score` column |
-| `Weight(how="min")` | `v.x.score`, and arithmetic |
-| `using(Greedy(k))` | `.top(k, by=..., over=...)` between two hops |
 
 ## A graph out of anything polars reads
 
@@ -881,7 +857,8 @@ On the whole Spotify graph (4.29 M nodes, 70.8 M edges) the first load takes
 ```bash
 pip install -e .              # numpy + polars + scipy
 pip install -e '.[torch]'     # + training
-pip install -e '.[api]'       # + the FastAPI examples
+pip install -e '.[api]'       # + the FastAPI use cases
+pip install -e '.[ui]'        # + the Gradio page of the spotify use case
 pip install -e '.[pandas]'    # + .to_pandas()
 pip install -e '.[dev]'       # + pytest
 ```
@@ -891,55 +868,8 @@ pip install -e '.[dev]'       # + pytest
 `data/example/` is a small synthetic graph — invented songs, artists and
 genres — and ships with the repo, so everything above runs immediately.
 
-`usecase/` holds the services built on the library, one directory each, and
-`run.sh` serves one of them in a container named after it — so with a local DNS
-domain registered it answers at `<usecase>.<domain>` and several can run at once
-(see [usecase/README.md](usecase/README.md)).
-
-```bash
-./run.sh coldstart              # -> http://coldstart.test:8000
-```
-
-`coldstart` is a FastAPI recommender with no user node: name people, genres or
-films you like and it expands from those. It fits TransD on first boot, reuses
-the checkpoint after, and answers with an explanation read off the columns of
-the walk that connected each result to your seeds. It needs
-`pip install -e '.[api,torch]'` and the MovieLens graph below.
-
-```
-0.898  Pulp Fiction          directed by Quentin Tarantino
-0.892  Reservoir Dogs        directed by Quentin Tarantino
-0.786  From Dusk Till Dawn   written by Quentin Tarantino
-0.725  True Romance          written by Quentin Tarantino
-0.720  Die Hard              acted in Bruce Willis
-```
-
-50 ms a request, graph and checkpoint held in memory.
-
-`spotify` is the third one, on the Million Playlist Dataset: name a few songs
-and it answers with five more that belong beside them. There is no playlist node
-for what you brought — what stands in for it is the crowd of real playlists that
-already contain your songs.
-
-```
--> ['Toxic -- Britney Spears', 'Bad Romance -- Lady Gaga']
-
-0.86  ...Baby One More Time    Britney Spears    [447 playlists]
-0.85  Poker Face               Lady Gaga         [530]
-0.85  Womanizer                Britney Spears    [433]
-0.84  Hollaback Girl           Gwen Stefani      [646]
-```
-
-Three signals, and the query says how much each counts: the **graph** finds the
-candidates, the **count** is the evidence (damped — twice as many playlists is
-not twice as good an answer), and the **model** is the taste. On its own the
-factorization is a poor recommender on this data, and the use case says why; as
-a re-ranker over songs the crowd already agrees on, it is what separates *the
-same artists* from *the same decade*. 0.2–1 s a request on the 100 000-playlist
-cut, and it needs `pip install -e '.[api]'` plus the dataset below.
-
-The MovieLens graph used by that use case and the benchmarks is **not** included:
-GroupLens' usage licence states that "the user may not redistribute the data
+The MovieLens graph used by the `coldstart` use case and the benchmarks is
+**not** included: GroupLens' usage licence states that "the user may not redistribute the data
 without separate permission", and the IMDb-derived files are non-commercial-use
 only. Fetch [ml-100k](https://grouplens.org/datasets/movielens/100k/) and the
 [IMDb non-commercial datasets](https://developer.imdb.com/non-commercial-datasets/)
@@ -985,7 +915,7 @@ node set does, so a checkpoint fitted on such a graph must key on the source id:
 
 Any graph in that shape works — nothing in the library is MovieLens-specific.
 
-`data/genome/` is the second one, and the reason weights exist. Drop the
+`data/genome/` is the second dataset, and the reason weights exist. Drop the
 [ml-latest](https://grouplens.org/datasets/movielens/latest/) export into
 `data/genome/legacy/` and run:
 
@@ -1029,8 +959,63 @@ at which an edge starts existing, and a query narrows it from there:
 80 ms on 1.7 M edges, and the tag that joined them comes back in the row rather
 than being reconstructed afterwards.
 
-`usecase/genome` serves it: give it a watchlist and it answers with films that
-belong beside it, ranked by how much of the watchlist's tag profile they carry.
+The build samples users (10 000 of 330 766) and keeps each sampled profile
+whole; `--users`, `--relevance` and `--seed` move those lines. Tag genome data
+carries its own citation requirement — Vig, Sen and Riedl, *The Tag Genome*,
+TiiS 2012.
+
+## Use cases
+
+`usecase/` holds the services built on the library, one directory each, and
+`run.sh` serves one of them in a container named after it — so with a local DNS
+domain registered it answers at `<usecase>.<domain>` and several can run at once
+(see [usecase/README.md](usecase/README.md)).
+
+```bash
+./run.sh coldstart              # -> http://coldstart.test:8000
+```
+
+`coldstart` is a FastAPI recommender with no user node: name people, genres or
+films you like and it expands from those. It fits TransD on first boot, reuses
+the checkpoint after, and answers with an explanation read off the columns of
+the walk that connected each result to your seeds. It needs
+`pip install -e '.[api,torch]'` and the MovieLens graph (see [Data](#data)).
+
+```
+0.898  Pulp Fiction          directed by Quentin Tarantino
+0.892  Reservoir Dogs        directed by Quentin Tarantino
+0.786  From Dusk Till Dawn   written by Quentin Tarantino
+0.725  True Romance          written by Quentin Tarantino
+0.720  Die Hard              acted in Bruce Willis
+```
+
+50 ms a request, graph and checkpoint held in memory.
+
+`spotify` runs on the Million Playlist Dataset: name a few songs and it
+answers with five more that belong beside them. There is no playlist node
+for what you brought — what stands in for it is the crowd of real playlists that
+already contain your songs.
+
+```
+-> ['Toxic -- Britney Spears', 'Bad Romance -- Lady Gaga']
+
+0.86  ...Baby One More Time    Britney Spears    [447 playlists]
+0.85  Poker Face               Lady Gaga         [530]
+0.85  Womanizer                Britney Spears    [433]
+0.84  Hollaback Girl           Gwen Stefani      [646]
+```
+
+Three signals, and the query says how much each counts: the **graph** finds the
+candidates, the **count** is the evidence (damped — twice as many playlists is
+not twice as good an answer), and the **model** is the taste. On its own the
+factorization is a poor recommender on this data, and the use case says why; as
+a re-ranker over songs the crowd already agrees on, it is what separates *the
+same artists* from *the same decade*. 0.2–1 s a request on the 100 000-playlist
+cut, and it needs `pip install -e '.[api]'` plus the dataset, built under
+`data/spotify/` (see [usecase/README.md](usecase/README.md)).
+
+`genome` serves the tag genome dataset (see [Data](#data)): give it a watchlist
+and it answers with films that belong beside it, ranked by how much of the watchlist's tag profile they carry.
 It trains nothing — the affinity is already in the data — and there is no ranking
 object anywhere in the file: two hops, a filter and an aggregate.
 
@@ -1049,11 +1034,6 @@ curl -X POST localhost:8000/suggest -H 'content-type: application/json' \
 
 `strength` is the request deciding how strongly a tag must apply before it
 counts — the load-time filter that is no longer a load-time filter.
-
-The build samples users (10 000 of 330 766) and keeps each sampled profile
-whole; `--users`, `--relevance` and `--seed` move those lines. Tag genome data
-carries its own citation requirement — Vig, Sen and Riedl, *The Tag Genome*,
-TiiS 2012.
 
 ## How it is put together
 
@@ -1074,28 +1054,15 @@ Everything else is a table operation, and therefore not ours: the anti-join that
 drops what a user has already seen, the `unique` that folds two routes to one
 node, the `group_by` that ranks by the whole pattern, the window in
 `top(k, by=..., over=...)` that keeps the best k per user. The k most promising
-edges out of each row — a beam, which was an engine once — is a budgeted step,
-and not a table operation: cutting after the walk would pay for the whole
-expansion first. Those used to be a backtracking search, a Python loop over result
-rows, a scope stack and a pluggable `Greedy`.
+edges out of each row is the exception — a budgeted step, not a table
+operation, because cutting after the walk would pay for the whole expansion
+first.
 
 Files are read by column, not by line. A chunk of an edge file becomes three
 parallel columns with one `replace` and one `split` — two C loops over the whole
 chunk — and the ids come from `dict.fromkeys`, which deduplicates in C and in
 first-seen order at once. What is left in Python runs once per *distinct node*
 rather than once per edge: 2.78 M edges load in ~1.1 s.
-
-### What a relation can say without being walked
-
-```python
-.filter(v.movie.has_genre.count() >= 2)     # its arity, as a fact about the graph
-.filter(v.movie.directed_by.is_in(people))  # an edge to one of these exists
-```
-
-The count is a fact about the graph — the same number whatever the query asked,
-which is what tells it apart from `group_by(...).agg(count)`. Neither expands
-the frame: existence with a set walks the *given* side backwards and collects
-what reaches it, so the cost is the degree of that set. Pass the smaller one.
 
 One directory per stage a query passes through, in the order it passes:
 
@@ -1114,6 +1081,8 @@ jerboas/
   plan/           deferring a walk so its cost has a ceiling
     optimize.py     the context, and the budget it sets
     plan.py         a walk described but not taken, and how it is run
+    planner.py      which conditions a plan may move, read off the condition
+    stream.py       top / unique / group_by taken a slice at a time
   search/         what `like` and `near` measure closeness with
     rules.py        Fuzzy / Words / Semantic
     fuzzy.py        character similarity, the measure Fuzzy is written in terms of
@@ -1133,10 +1102,34 @@ needs only the expression type from `query`, and `learn` builds on `rank` and
 ## Tests
 
 ```bash
-pytest
+pytest          # in your own environment
+./test.sh       # in a container with every extra installed
 ```
 
 The torch-dependent tests skip when the extra is not installed.
+
+## Migrating from 0.1
+
+0.2 replaces the query API. `Graph` and the data format are unchanged, and so
+are the models and their checkpoints; everything between `g` and a result is
+different. `select/where/rank/top`, `Node`, `Edge`, `Path`, `Like`, `Has`, the
+`Condition`/`Ref`/`Engine` families and the pluggable engines are gone, and
+what replaces them is above. There is no compatibility layer: 0.1 queries do
+not run.
+
+| 0.1 | 0.2 |
+|---|---|
+| `g.select(rec).where(...)` | `g.nodes(rec="movie").filter(...)` |
+| `Node("movie")`, `Node()` | a column name |
+| `path == [a, Edge(), b]` | `.hop(b=())` |
+| `Like(node.name.is_in(x))` | `.filter(v.node.name.like(x))` |
+| `Has(a, "r", b)` / `~Has(...)` | `.filter(v.a.r.is_in(b))` |
+| `node.rel.count()` | `v.node.rel.count()` |
+| `rank(a, b)` | `.with_columns(score=0.6 * a.norm() + 0.4 * b.norm())` |
+| `Sum(edge.score)` | `.group_by(...).agg(score=v.x.score.sum())` |
+| `Score()` projection | the `score` column |
+| `Weight(how="min")` | `v.x.score`, and arithmetic |
+| `using(Greedy(k))` | `.top(k, by=..., over=...)` between two hops |
 
 ## License
 

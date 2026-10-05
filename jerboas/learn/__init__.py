@@ -4,9 +4,9 @@ This is the only part of the library that needs torch, and it is optional:
 
     pip install jerboas[torch]
 
-Serving does not: training writes a checkpoint of plain arrays that a loaded
-model reads with numpy alone, so the machine that fits and the machine that
-answers need not have the same install.
+Loading one needs it too: TransD and TransE are torch modules, so the machine
+that serves a checkpoint installs the same extra as the one that fitted it. The
+checkpoint itself is plain arrays, loaded with allow_pickle=False.
 
 Training is not a pipeline verb -- it costs orders of magnitude more than a
 query can absorb -- so it is an explicit batch job, and what comes back is a
@@ -30,9 +30,7 @@ try:
 except ModuleNotFoundError as exc:      # pragma: no cover - depends on the install
     raise ModuleNotFoundError(
         "jerboas.learn needs torch, which is an optional dependency.\n"
-        "Install it with:  pip install 'jerboas[torch]'\n"
-        "Serving a model someone else trained does not need torch -- "
-        "a loaded checkpoint is read with numpy."
+        "Install it with:  pip install 'jerboas[torch]'"
     ) from exc
 
 del _torch
