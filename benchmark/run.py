@@ -6,7 +6,7 @@ from collections import defaultdict
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from jerboas import Graph
-from jerboas.strategies import MatrixFactorization
+from jerboas.rank import MatrixFactorization
 from benchmark.split import read_edges, write_edges, train_test_split
 from benchmark.metrics import precision_at_k, recall_at_k, hit_rate_at_k, ndcg_at_k
 

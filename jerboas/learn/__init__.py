@@ -12,7 +12,7 @@ Training is not a pipeline verb -- it costs orders of magnitude more than a
 query can absorb -- so it is an explicit batch job, and what comes back is a
 ranking strategy like any other:
 
-    from jerboas.models import TransD, train
+    from jerboas.learn import TransD, train
 
     model = train(TransD(factors=64), graph, epochs=50, device="mps")
     model.save("checkpoints/ml.transd.npz")
@@ -29,7 +29,7 @@ try:
     import torch as _torch
 except ModuleNotFoundError as exc:      # pragma: no cover - depends on the install
     raise ModuleNotFoundError(
-        "jerboas.models needs torch, which is an optional dependency.\n"
+        "jerboas.learn needs torch, which is an optional dependency.\n"
         "Install it with:  pip install 'jerboas[torch]'\n"
         "Serving a model someone else trained does not need torch -- "
         "a loaded checkpoint is read with numpy."

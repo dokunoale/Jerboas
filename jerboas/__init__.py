@@ -28,25 +28,25 @@ demand: fitting one needs torch, and the base install stays importable without
 it.
 """
 
-_LAZY = {"TransD": "models", "TransE": "models", "Translational": "models",
-         "train": "models"}
+_LAZY = {"TransD": "learn", "TransE": "learn", "Translational": "learn",
+         "train": "learn"}
 
 
 def __getattr__(name):
-    """Reach jerboas.models only when something in it is actually asked for."""
+    """Reach jerboas.learn only when something in it is actually asked for."""
     if name in _LAZY:
         import importlib
         return getattr(importlib.import_module(f".{_LAZY[name]}", __name__), name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
-from .core import Strategy, Signal
-from .expr import SCORE, VIA, col, norm, reverse, shadow, v
-from .frame import Frame, concat
-from .graph import Graph
-from .keys import Key
-from .optimize import optimize
-from .rules import Fuzzy, Rule, Search, Semantic, Words
-from .strategies import (
+from .store.graph import Graph
+from .store.keys import Key
+from .query.expr import SCORE, VIA, col, norm, reverse, shadow, v
+from .query.frame import Frame, concat
+from .plan.optimize import optimize
+from .search.rules import Fuzzy, Rule, Search, Semantic, Words
+from .rank.core import Strategy, Signal
+from .rank import (
     Concentration,
     Connectivity,
     DiffusedMatrixFactorization,

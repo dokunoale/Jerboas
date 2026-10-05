@@ -1,7 +1,7 @@
 """Ranking by what the data already said: the weight stored on the edge.
 
-Most of what this used to be is now a column. The weight of a traversed edge
-comes back from `hop` as `<edge>.score`, so a walk's average step is
+The weight of a single traversed edge is already a column: it comes back from
+`hop` as `<edge>.score`, so a walk's average step is
 `(v.a.score + v.b.score) / 2` and its weakest is a `min_horizontal` -- written
 out, in the frame, where it can be read.
 
@@ -12,7 +12,7 @@ edges, which `count()` cannot say and no traversal reveals.
 
 import numpy as np
 
-from ..core import Strategy
+from .core import Strategy
 
 
 class Weight(Strategy):

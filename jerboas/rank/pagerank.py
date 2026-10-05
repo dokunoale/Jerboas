@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from ..core import Strategy
+from .core import Strategy
 
 
 class PageRank(Strategy):
@@ -45,11 +45,9 @@ class PageRank(Strategy):
     def _power_iteration(self, graph, seeds):
         """Power iteration as repeated sparse matrix-vector products.
 
-        One iteration pushes every node's rank along every out-edge, which written
-        by hand is a Python loop over all E edges -- repeated `iterations` times.
-        That is exactly what a sparse matrix-vector product does, so the whole
-        inner loop lives in compiled code and only `iterations` numpy calls
-        remain at Python level."""
+        One iteration pushes every node's rank along every edge, which is one
+        sparse matrix-vector product: the inner loop lives in compiled code and
+        only `iterations` numpy calls remain at Python level."""
         n = graph.n_nodes
         if n == 0:
             return np.zeros(0)

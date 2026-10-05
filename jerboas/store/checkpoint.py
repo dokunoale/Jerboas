@@ -35,6 +35,7 @@ is executable code wearing a data extension. Nothing here is.
 from datetime import datetime, timezone
 
 import numpy as np
+import polars as pl
 
 FORMAT = 3
 # format 2 is format 3 without `alias`, which is to say with alias "id" -- the
@@ -45,7 +46,8 @@ FORMAT = 3
 READABLE = (2, 3)
 META = "meta_"
 WEIGHT = "w_"
-RELATION = "relation"
+NODE = "node"                    # a table with one row per node
+RELATION = "relation"            # a table with one row per relation
 IDENTITY = "id"                  # the alias meaning "the node's own id"
 
 
@@ -61,24 +63,52 @@ def provenance(graph, **details):
     }
 
 
-def identities(graph, alias):
+def identities(graph, alias, nodes=None):
     """What each node is called, for the purpose of rebinding: the value of
     `alias` where the node's type has that column, and its own id where it does
-    not -- so a graph of mixed types needs one alias, not one per type."""
-    if alias == IDENTITY:
-        return [str(graph.raw_id(i)) for i in range(graph.n_nodes)]
-    names = []
-    for index in range(graph.n_nodes):
-        value = graph.value(index, alias)
-        names.append(str(graph.raw_id(index)) if value is None else str(value))
+    not -- so a graph of mixed types needs one alias, not one per type.
+
+    A type block at a time rather than a node at a time: one gather per type."""
+    nodes = (np.arange(graph.n_nodes) if nodes is None
+             else np.asarray(nodes, dtype=np.int64))
+    names = np.empty(len(nodes), dtype=object)
+    tags = graph._type_tag_of[nodes]
+    for tag, type_ in enumerate(graph.types):
+        where = np.flatnonzero(tags == tag)
+        if not len(where):
+            continue
+        local = nodes[where] - int(graph.start[tag])
+        named = local.astype(str).astype(object)
+        column = None if alias == IDENTITY else graph.column(type_, alias)
+        if column is not None:
+            values = column.values[local]
+            held = (np.ones(len(local), dtype=bool) if column.present is None
+                    else np.asarray(column.present[local]))
+            if values.dtype == object:
+                held &= np.array([value is not None for value in values], dtype=bool)
+            named[held] = values[held].astype(str)
+        names[where] = named
     return names
 
 
-def save(path, model, tables, factors, graph, arrays, meta=None, alias=IDENTITY):
+def _types(graph, nodes=None):
+    types = np.asarray(graph.types, dtype="U")
+    tags = graph._type_tag_of if nodes is None else graph._type_tag_of[nodes]
+    return types[tags]
+
+
+def save(path, model, tables, factors, graph, arrays, meta=None, alias=IDENTITY,
+         nodes=None):
     """Write weights plus the identity needed to rebind them.
 
     `alias` names the attribute that identifies a node durably. It defaults to
-    the node's own id, and is stored, so a reader does not have to be told."""
+    the node's own id, and is stored, so a reader does not have to be told.
+
+    `nodes` stores only those nodes, and then a node table holds one row per
+    node in `nodes`, in that order -- a factorization has weights for two type
+    blocks and nothing for the rest, a row nobody stores loads as zero anyway,
+    and building the whole (N, factors) table only to cut it back would be the
+    largest array of the save."""
     missing = {table for table, _space in tables} - set(arrays)
     if missing:
         raise ValueError(f"{model} checkpoint is missing tables: {sorted(missing)}")
@@ -89,13 +119,19 @@ def save(path, model, tables, factors, graph, arrays, meta=None, alias=IDENTITY)
         "factors": np.asarray(factors),
         "alias": np.asarray(alias),
         "relations": np.asarray(list(graph.relations), dtype="U"),
-        "node_type": np.asarray([graph.type_of(i) for i in range(graph.n_nodes)], dtype="U"),
-        "node_id": np.asarray(identities(graph, alias), dtype="U"),
+        "node_type": _types(graph, nodes),
+        "node_id": identities(graph, alias, nodes).astype("U"),
     }
     for key, value in (meta or {}).items():
         payload[META + key] = np.asarray(value)
-    for table, _space in tables:
-        payload[WEIGHT + table] = np.asarray(arrays[table], dtype=np.float32)
+    for table, space in tables:
+        weights = np.asarray(arrays[table], dtype=np.float32)
+        expected = (len(graph.relations) if space == RELATION
+                    else graph.n_nodes if nodes is None else len(nodes))
+        if len(weights) != expected:
+            raise ValueError(f"{model} table {table!r} has {len(weights)} rows, "
+                             f"expected {expected}")
+        payload[WEIGHT + table] = weights
     np.savez_compressed(path, **payload)
     return path
 
@@ -153,14 +189,17 @@ def load(path, graph, model, tables, alias=None):
 
 def _node_rows(stored, graph, alias):
     """For each node of `graph`, the checkpoint row holding its weights, matched
-    on (type, alias); -1 where the checkpoint has none."""
-    trained = {(str(type_), str(raw)): row for row, (type_, raw)
-               in enumerate(zip(stored["node_type"].tolist(), stored["node_id"].tolist()))}
-    rows = np.full(graph.n_nodes, -1, dtype=np.int64)
-    for index, name in enumerate(identities(graph, alias)):
-        row = trained.get((graph.type_of(index), name))
-        if row is not None:
-            rows[index] = row
+    on (type, alias); -1 where the checkpoint has none. One join rather than a
+    dictionary probed once per node. Where the checkpoint names a node twice,
+    the later row wins."""
+    trained = pl.DataFrame({
+        "type": stored["node_type"].astype(str), "name": stored["node_id"].astype(str),
+        "row": np.arange(len(stored["node_id"]), dtype=np.int64),
+    }).unique(["type", "name"], keep="last")
+    here = pl.DataFrame({"type": _types(graph).astype(str),
+                         "name": identities(graph, alias).astype(str)})
+    matched = here.join(trained, on=["type", "name"], how="left", maintain_order="left")
+    rows = matched["row"].fill_null(-1).to_numpy().astype(np.int64)
     return rows, [int(i) for i in np.flatnonzero(rows < 0)]
 
 

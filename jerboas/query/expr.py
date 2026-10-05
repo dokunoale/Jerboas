@@ -22,7 +22,7 @@ like a relation, and `.expr` drops out to raw polars.
 import numpy as np
 import polars as pl
 
-from .keys import Key
+from ..store.keys import Key
 
 # the two escapes, for a type whose attribute is named like a relation
 ATTR, REL = "attr", "rel"
@@ -434,8 +434,7 @@ class _In(Expr, _Methods):
         if isinstance(target, Relation):
             return ctx.exists(target, self.values)
         # a set of nodes and a set of values are both `is_in`, and only the
-        # frame can tell which this is: resolving "Alpha" as a node key on a
-        # column of titles used to admit nothing, silently
+        # frame can tell which this is
         return ctx.membership(self.target, _expr(target, "is_in"), self.values)
 
     __hash__ = Expr.__hash__
@@ -490,20 +489,6 @@ class _Norm(Expr, _Methods):
         return norm(_expr(_side(self.target, ctx), "norm"))
 
     __hash__ = Expr.__hash__
-
-
-# the methods a name may be called as, beyond the three with their own nodes
-_NAMED = ("sum", "count", "n_unique", "mean", "min", "max", "std", "first", "last",
-          "abs", "alias", "is_null", "is_not_null", "is_between",
-          # the ones an aggregate reaches for, so a group can keep its evidence
-          # in the order the evidence deserves
-          "sort_by", "unique", "head", "tail", "cast", "fill_null", "round",
-          # the arithmetic a score is shaped with: a count is not a weight until
-          # something has flattened it
-          "log", "log1p", "exp", "sqrt", "pow", "clip", "floor", "ceil",
-          "rank", "over", "is_finite", "is_nan",
-          # the ones a per-group decision reaches for
-          "any", "all", "not_")
 
 
 _SPECIAL.update(is_in=lambda target, values: _In(target, values),

@@ -23,7 +23,7 @@ import time
 import numpy as np
 import torch
 
-from ..frame import RELATION
+from ..query.frame import RELATION
 
 
 
@@ -39,9 +39,7 @@ def examples(graph, where=None):
 
     Below a rating of 3 the edge is noise and the model should not see it. Saying
     it here rather than at load time answers the question for this run only, and
-    leaves the graph still able to say who rated a film at all -- and because the
-    filter is an ordinary frame, "which edges" is a question with a visible
-    answer rather than a marker object.
+    leaves the graph still able to say who rated a film at all.
     """
     weights = graph.weights(normalized=True)[0]
     if where is None:
@@ -94,9 +92,8 @@ def train(model, graph, epochs=50, batch_size=4096, lr=0.01, device="cpu",
         where=g.edges("has_interact").filter(v.score >= 3)   # don't learn from these
         weighted=True                                    # learn less from weak ones
 
-    `where` is the hard reading, and it is the one that used to live in the
-    loader: below a rating of 3, say, the edge is noise and the model should not
-    see it. `weighted` is the soft one -- each example scaled by its edge's
+    `where` is the hard reading: below a rating of 3, say, the edge is noise and
+    the model should not see it. `weighted` is the soft one -- each example scaled by its edge's
     normalized score, which on a graph carrying none is 1.0 everywhere and
     changes nothing.
     """

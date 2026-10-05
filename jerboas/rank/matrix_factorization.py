@@ -1,16 +1,23 @@
 """Implicit-feedback matrix factorization, and its diffused variant.
 
 Both read the user-item matrix as a block slice of the relation matrix the
-Graph already holds, rather than assembling their own CSR from the adjacency --
-or, with `where`, from a frame of the interactions they are allowed to learn
-from."""
+Graph already holds -- or, with `where`, from a frame of the interactions they
+are allowed to learn from."""
 
 import copy
 
 import numpy as np
 import scipy.sparse as sp
 
-from ..core import Strategy
+from ..store.checkpoint import (IDENTITY, NODE, load as load_checkpoint, provenance,
+                                save as save_checkpoint)
+from .core import Strategy
+
+# what a checkpoint holds: one row of factors per node of the two blocks
+TABLES = (("factors", NODE),)
+
+# how many dimensions of a diffused sum exist at once
+_DIMENSIONS = 8
 
 
 class MatrixFactorization(Strategy):
@@ -24,15 +31,23 @@ class MatrixFactorization(Strategy):
 
     Whose taste is being applied is *named*, either as a second column holding
     the user of each row or as one user for the whole frame. It is not inferred:
-    this used to fall back to the first user node the search happened to walk
-    through, which is an arbitrary person's ranking wearing the shape of an
+    a guessed user is an arbitrary person's ranking wearing the shape of an
     answer.
 
     `weighted=True` reads the interaction's stored score instead of its mere
     existence, which turns the same solver into explicit feedback: the target is
     the rating rather than a 1. Implicit stays the default because "she watched
     it" and "she rated it 2" are different claims, and only the caller knows
-    which one their edges carry."""
+    which one their edges carry.
+
+    Fitting takes minutes on a large graph, so a fitted factorization is stored
+    the way an embedding is -- rebound by name on load:
+
+        model.save("checkpoints/spotify.dmf.npz", graph, alias="uri")
+        DiffusedMatrixFactorization.load("checkpoints/spotify.dmf.npz", graph)
+    """
+
+    name = "mf"          # the key a checkpoint records
 
     def __init__(self, factors=8, iterations=20, regularization=0.05, seed=42,
                  item_type="movie", user_type="user", relation="has_interact",
@@ -48,6 +63,51 @@ class MatrixFactorization(Strategy):
         self.user = user                 # one user for the whole frame, if named
         self.where = where               # the interactions it may learn from
 
+    def config(self):
+        """The hyperparameters, as a checkpoint records them: what has to match
+        for a stored factorization to be this one."""
+        return {"factors": self.factors, "iterations": self.iterations,
+                "regularization": self.regularization, "seed": self.seed,
+                "item_type": self.item_type, "user_type": self.user_type,
+                "relation": self.relation, "weighted": self.weighted}
+
+    def save(self, path, graph, alias=IDENTITY, **details):
+        """Write the fitted factors, rebindable to any graph by name.
+
+        Only the two blocks that have factors are stored. `details` go into the
+        provenance beside the hyperparameters -- whatever narrowed `where` is
+        the caller's to record, since a frame of edges has no name."""
+        users, items, user_factors, item_factors = self.fit(graph)
+        nodes = np.concatenate([np.arange(*users), np.arange(*items)])
+        table = np.concatenate([user_factors, item_factors]).astype(np.float32)
+        meta = provenance(graph, model=self.name, **self.config(), **details)
+        return save_checkpoint(path, self.name, TABLES, self.factors, graph,
+                               {"factors": table}, meta, alias=alias, nodes=nodes)
+
+    @classmethod
+    def load(cls, path, graph, alias=None, **kwargs):
+        """A stored factorization, rebound to `graph` and ready to score.
+
+        The hyperparameters come off the file; `kwargs` are the per-query ones
+        (`to=`, `user=`). What the file recorded is `model.meta`, so a caller can
+        check it is the factorization it meant."""
+        stored = load_checkpoint(path, graph, cls.name, TABLES, alias=alias)
+        meta = stored.meta
+        model = cls(factors=stored.factors, iterations=meta["iterations"],
+                    regularization=meta["regularization"], seed=meta["seed"],
+                    item_type=meta["item_type"], user_type=meta["user_type"],
+                    relation=meta["relation"], weighted=meta["weighted"], **kwargs)
+        model.meta = meta
+        model.missing_nodes = stored.missing_nodes
+        users, items = graph.block(model.user_type), graph.block(model.item_type)
+        table = stored.tensors["factors"]
+        # copies of the two blocks, so the (N, factors) table can go
+        fitted = (users, items, table[users[0]:users[1]].copy(),
+                  table[items[0]:items[1]].copy())
+        del table, stored
+        model.cached(graph, ("factors", None), lambda: fitted)
+        return model
+
     def fit(self, graph):
         self._graph = graph
         key = ("factors", None if self.where is None else id(self.where))
@@ -56,8 +116,7 @@ class MatrixFactorization(Strategy):
 
     def _compute_factors(self, graph):
         """The user-item matrix is the interaction relation restricted to the two
-        type blocks -- a slice of a matrix the Graph already holds, where this
-        used to be a hand-built CSR with its own index arrays.
+        type blocks -- a slice of a matrix the Graph already holds.
 
         `where` narrows it to a frame of interactions, the same way `train`
         narrows what a model may learn from. It is not a nicety: a factorization
@@ -73,11 +132,17 @@ class MatrixFactorization(Strategy):
             matrix = graph.relation_matrix(self.relation, weights)[users[0]:users[1],
                                                                    items[0]:items[1]]
         matrix = matrix.tocsr()
+        # the graph keeps a multi-edge as repeated cells; one cell per pair, so
+        # that binary feedback is binary and a rating is not counted twice
+        matrix.sum_duplicates()
         if not self.weighted:
-            matrix.data.fill(1.0)  # CSR sums duplicate entries; feedback stays binary
+            matrix.data.fill(1.0)
         matrix.sort_indices()
         user_factors, item_factors = self._factorize(matrix)
-        return users, items, user_factors, item_factors
+        # solved in float64, kept in float32: a score needs seven digits, and on
+        # a large graph the factors are gigabytes
+        return (users, items, user_factors.astype(np.float32),
+                item_factors.astype(np.float32))
 
     def _from_frame(self, graph, users, items):
         """The interactions a frame of edges holds, as the same sparse matrix.
@@ -132,9 +197,8 @@ class MatrixFactorization(Strategy):
         # Who interacted with what never changes across iterations, so read it
         # straight off the sparse layout once: CSR stores row i's column indices
         # contiguously in indices[indptr[i]:indptr[i+1]], and CSC does the same
-        # per column. That is the alternative to re-scanning a boolean mask (and
-        # a strided column of it) on every pass. The values travel with them, so
-        # implicit and explicit feedback run the same loop.
+        # per column. The values travel with them, so implicit and explicit
+        # feedback run the same loop.
         csr, csc = matrix.tocsr(), matrix.tocsc()
         by_user = [_slice(csr, i) for i in range(n_users)]
         by_item = [_slice(csc, j) for j in range(n_items)]
@@ -169,6 +233,8 @@ class DiffusedMatrixFactorization(MatrixFactorization):
     The embedding table is one (n_nodes, factors) array. Nodes being integers is
     what allows that -- and with it, scoring a whole result set is one matrix
     product instead of a Python loop over rows."""
+
+    name = "dmf"
 
     def __init__(self, *args, to=None, **kwargs):
         super().__init__(*args, **kwargs)
@@ -208,12 +274,25 @@ class DiffusedMatrixFactorization(MatrixFactorization):
         # Weighted, the mean becomes a weighted mean -- normalized, because a
         # negative weight would pull an embedding to the far side of the space
         # rather than count for less.
-        incidence = graph.adjacency("norm" if self.weighted else None)[:, items[0]:items[1]]
-        represented = (item_factors != 0).any(axis=1)
-        counts = incidence @ represented.astype(np.float64)
-        embeddings = np.zeros((graph.n_nodes, self.factors))
+        #
+        # Neighbours in either direction are two products, one per direction of
+        # the store, over a vector that is zero outside the item block -- rather
+        # than a symmetric adjacency sliced to the items, which would be held
+        # whole to be multiplied once. The sum is taken a few dimensions at a
+        # time for the same reason.
+        directions = graph.matrices("norm" if self.weighted else None)
+        represented = np.zeros(graph.n_nodes, dtype=np.float32)
+        represented[items[0]:items[1]] = (item_factors != 0).any(axis=1)
+        counts = sum(direction @ represented for direction in directions)
         known = counts > 0
-        embeddings[known] = (incidence @ item_factors)[known] / counts[known, None]
+        embeddings = np.zeros((graph.n_nodes, self.factors), dtype=np.float32)
+        spread = np.zeros((graph.n_nodes, _DIMENSIONS), dtype=np.float32)
+        for low in range(0, self.factors, _DIMENSIONS):
+            high = min(low + _DIMENSIONS, self.factors)
+            spread[:, :high - low] = 0.0
+            spread[items[0]:items[1], :high - low] = item_factors[:, low:high]
+            summed = sum(direction @ spread[:, :high - low] for direction in directions)
+            embeddings[known, low:high] = summed[known] / counts[known, None]
 
         # the factorized blocks are authoritative for themselves
         embeddings[items[0]:items[1]] = item_factors

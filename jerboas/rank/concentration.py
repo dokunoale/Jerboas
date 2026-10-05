@@ -2,7 +2,10 @@
 
 import numpy as np
 
-from ..core import Strategy
+from .core import Strategy
+
+# how many dimensions of the neighbours' sum exist at once
+_DIMENSIONS = 8
 
 
 class Concentration(Strategy):
@@ -22,15 +25,19 @@ class Concentration(Strategy):
     without one, every edge does, in either direction.
 
     Two sparse products over the whole graph, memoized: it costs the same for
-    one node as for all of them, so it is worth asking of all of them."""
+    one node as for all of them, so it is worth asking of all of them. The memo
+    lives on the space when the space is a strategy, because a model outlives
+    the query that asks -- a service that writes `Concentration(model)` per
+    request pays for the products once, not once a request."""
 
     def __init__(self, space, relation=None):
         self.space = space
         self.relation = relation
 
     def fit(self, graph):
-        self._gathered = self.cached(graph, ("concentration", self.relation),
-                                     lambda: self._compute(graph))
+        holder = self.space if isinstance(self.space, Strategy) else self
+        self._gathered = holder.cached(graph, ("concentration", self.relation),
+                                       lambda: self._compute(graph))
         return self._gathered
 
     def scores(self, graph, columns):
@@ -39,8 +46,20 @@ class Concentration(Strategy):
     def _compute(self, graph):
         vectors = self._vectors(graph)
         touching = self._touching(graph)
-        resultant = np.linalg.norm(touching @ vectors, axis=1)
-        mass = touching @ np.linalg.norm(vectors, axis=1)
+        mass = np.zeros(graph.n_nodes)
+        for part in touching:
+            mass += part @ np.linalg.norm(vectors, axis=1)
+        # only the resultant's length is wanted, and a squared length is a sum
+        # over dimensions -- so the (N, d) sum of neighbours is taken a few
+        # dimensions at a time and never held whole
+        squared = np.zeros(graph.n_nodes)
+        for low in range(0, vectors.shape[1], _DIMENSIONS):
+            block = np.ascontiguousarray(vectors[:, low:low + _DIMENSIONS])
+            summed = touching[0] @ block
+            for part in touching[1:]:
+                summed += part @ block
+            squared += np.einsum("ij,ij->i", summed, summed)
+        resultant = np.sqrt(squared)
         return np.divide(resultant, mass, out=np.zeros_like(mass), where=mass > 0)
 
     def _vectors(self, graph):
@@ -53,8 +72,12 @@ class Concentration(Strategy):
 
     def _touching(self, graph):
         """Who counts as a neighbour, in either direction: a song's playlists
-        are its neighbours whichever way the edge is stored."""
+        are its neighbours whichever way the edge is stored.
+
+        The two directions as two products rather than one symmetric matrix:
+        `matrix.T` is a view, and `matrix + matrix.T` would be two more copies
+        of the relation."""
         if self.relation is None:
-            return graph.adjacency()
+            return graph.matrices()
         matrix = graph.relation_matrix(self.relation)
-        return matrix + matrix.T
+        return (matrix, matrix.T)

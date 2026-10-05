@@ -7,7 +7,7 @@ its maths, because there is nothing to pair: the class is both.
 
 That follows the library's own rule rather than working around it. `Strategy` is
 the extension point for ranking (core.py); a trained embedding is a ranker, so it
-subclasses `Strategy` exactly as `PageRank` does, and `rank(TransD.load(...))`
+subclasses `Strategy` exactly as `PageRank` does, and `TransD.load(...).on(...)`
 needs no wrapper.
 
 Two words, deliberately kept apart:
@@ -23,9 +23,9 @@ import numpy as np
 import torch
 from torch import nn
 
-from ..checkpoint import (IDENTITY, load as load_checkpoint, provenance,
+from ..store.checkpoint import (IDENTITY, load as load_checkpoint, provenance,
                           save as save_checkpoint)
-from ..core import Strategy
+from ..rank.core import Strategy
 
 NODE = "node"            # a table with one row per node
 RELATION = "relation"    # a table with one row per relation
@@ -48,7 +48,6 @@ class Translational(Strategy, nn.Module):
     read backwards, a genre by `has_genre` backwards, a user by `has_interact`
     forwards. Naming one relation (with `reverse=` for its direction) asks the
     narrower question.
-
     """
 
     name = None          # the key a checkpoint records
@@ -126,10 +125,9 @@ class Translational(Strategy, nn.Module):
 
         `weight` scales each example by how much the edge is worth (its
         normalized score), so a 5-star rating pushes harder than a 2-star one
-        and an edge weighing nothing contributes no gradient. That is the soft
-        reading of the threshold the loader used to apply: instead of deciding
-        once, for every query, that a poor edge is not an edge, the model is
-        simply told how much to believe it."""
+        and an edge weighing nothing contributes no gradient: rather than
+        deciding once, for every query, that a poor edge is not an edge, the
+        model is told how much to believe it."""
         positive = self.plausibility(head, relation, tail)
         corrupted_tail = torch.relu(self.margin - positive
                                     + self.plausibility(head, relation, corrupt_tail))
@@ -158,7 +156,7 @@ class Translational(Strategy, nn.Module):
 
     @classmethod
     def load(cls, path, graph, to=None, relation=None, reverse=False, alias=None):
-        """Read a checkpoint back as a strategy ready for rank(...).
+        """Read a checkpoint back as a strategy ready to score.
 
         The alias comes off the file; pass one only to override it."""
         stored = load_checkpoint(path, graph, cls.name, cls.tables, alias=alias)

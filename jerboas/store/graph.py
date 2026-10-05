@@ -8,8 +8,8 @@ graph whose contents depend on how it was written. From that: the universe is
 `range(N)`, so every per-node fact is a plain array; a type's block is a slice;
 and a hop is a gather over CSR slices (traverse.py) rather than a join.
 
-Relations are stored once, as an edge-labeled CSR plus its transpose, so walking
-backwards reads the transpose rather than a duplicated `_r` relation.
+Relations are stored once, as an edge-labeled CSR plus its transpose; walking
+backwards reads the transpose.
 
 Every edge carries a weight defaulting to 1.0 -- there is no unweighted edge,
 only one whose weight nobody wrote down -- and what counts as good enough is a
@@ -32,9 +32,11 @@ import numpy as np
 import polars as pl
 import scipy.sparse as sp
 
+from . import cache as stored
 from .columns import Column, build as build_column
-from .fuzzy import words_of
-from .frame import Frame, RELATION
+from ..search.fuzzy import words_of
+from ..query import traverse
+from ..query.frame import Frame, RELATION
 from .keys import Key
 
 # Every type has these two columns and they are generated, not read: `id` is the
@@ -51,9 +53,7 @@ DEFAULT_WEIGHT = 1.0
 
 # how much of an edge file becomes columns at a time. Splitting the whole file
 # at once would hold one Python string per *field* until the load finished --
-# millions of them, costing more than the graph they describe. Between 1 KB and
-# 32 MB the time is flat and only the memory moves, so the size is chosen for
-# the memory.
+# costing more than the graph they describe.
 CHUNK = 1 << 16
 
 
@@ -112,9 +112,8 @@ def _table(path, header, minimum):
 def _rectangle(block, width):
     """Columns from a chunk of equal-width lines, or None when it is not one.
 
-    Two separators and one pass: making the newline a tab as well leaves a flat
-    field list that strides into columns, where the obvious reading makes two
-    Python calls per line."""
+    Making the newline a tab as well leaves a flat field list that strides
+    into columns in one pass."""
     fields = block.replace("\n", "\t").split("\t")
     del fields[-1]                       # the chunk ends on a newline
     if not fields or len(fields) % width:
@@ -227,18 +226,52 @@ def _weights(column):
 
 
 class Graph:
-    def __init__(self, kg=None, edges=None, attrs=None, renumber=False, readable=None):
+    def __init__(self, kg=None, edges=None, attrs=None, renumber=False, readable=None,
+                 cache=None):
+        """`cache` is a directory to keep the finalized graph in: the first load
+        writes it, and every later one maps it back instead of reading the
+        files again -- for as long as the files are the ones it was built from
+        (store/cache.py)."""
         self.kg = kg
         self.edge_files = edges or []
         self.attr_files = attrs or []
         self._prepare(renumber, readable)
+        stamp = None
+        if cache is not None:
+            stamp = stored.fingerprint(self._files(), renumber, cache)
+            state = stored.load(cache, stamp)
+            if state is not None:
+                self._restore(state)
+                return
         self._load()
         self._finalize()
+        if cache is not None:
+            stored.save(self, cache, stamp)
+
+    def _files(self):
+        """Every file this graph is read from, in the order it reads them."""
+        return ([self.kg] if self.kg else []) + list(self.edge_files) + list(self.attr_files)
+
+    def _restore(self, state):
+        """Take a finalized graph as the cache saved it: nothing to parse,
+        nothing to sort, and the large arrays mapped rather than read."""
+        for name in stored._ARRAYS:
+            setattr(self, name, state[name])
+        self.types = list(state["types"])
+        self._type_pos = {type_: tag for tag, type_ in enumerate(self.types)}
+        self.relations = list(state["relations"])
+        self._relation_code = {name: code for code, name in enumerate(self.relations)}
+        self.n_nodes = int(state["n_nodes"])
+        self.columns = state["columns"]
+        self.vectors = state["vectors"]
+        self._e_src = self._e_rel = self._e_tgt = self._e_weight = None
+        self._attr_rows = self._id = self._keys = self._new_of_old = None
+        self._vector_rows = None
 
     def _prepare(self, renumber, readable):
         """The mutable state a build needs, whether it reads files or frames."""
         self.renumber = renumber         # ids are not positions: assign them here
-        # {type: column a person reads}. Declared, never inferred -- see labels()
+        # {type: column a person reads}. Declared, never inferred
         self.readable = dict(readable or {})
 
         self._cache = {}                 # name -> memoized value; safe for the graph's lifetime
@@ -261,9 +294,8 @@ class Graph:
 
         self._attr_rows = {}             # type -> (column names, {provisional id: values})
         # type -> {name: (provisional ids, matrix)}. A vector is not a column:
-        # it has no value a row can print and no order to sort by, and what a
-        # query asks of one is nearness. Kept as one (n, d) float32 block per
-        # type, so scoring a candidate set is a matmul and not a gather of lists
+        # what a query asks of one is nearness, so it is kept as one (n, d)
+        # float32 block per type and scoring a candidate set is a matmul
         self._vector_rows = {}
         # a frame build sets neither, and _load reads both as "nothing to read"
         self.kg = getattr(self, "kg", None)
@@ -553,8 +585,7 @@ class Graph:
 
         Sorting each node's slice by relation is what makes both access patterns
         cheap from a single store: a wildcard hop is the whole slice, and a
-        named relation is a searchsorted sub-range of it. Two arrays per
-        direction, versus a dict of dicts of lists holding 2x the edges.
+        named relation is a searchsorted sub-range of it.
 
         The weight rides along as a third array per direction, permuted by the
         same order: `out_weights[p]` is the weight of the edge ending at
@@ -584,7 +615,12 @@ class Graph:
             self._csr(tgt, src, rel, weight)
 
     def _csr(self, key, value, rel, weight):
-        order = np.lexsort((rel, key))               # by source, then by relation
+        # by source, then by relation, then by the other end: canonical, so the
+        # order a node's edges come back in is a fact about the graph rather
+        # than about the file -- and the two directions agree on it, which is
+        # what lets a walk taken from the far end give the same rows in the
+        # same order (see query/traverse.py, `toward`)
+        order = np.lexsort((value, rel, key))
         indptr = np.zeros(self.n_nodes + 1, dtype=np.int64)
         np.cumsum(np.bincount(key, minlength=self.n_nodes), out=indptr[1:])
         return indptr, value[order], rel[order], weight[order]
@@ -617,8 +653,7 @@ class Graph:
         Built once per column and memoized, the way a degree or a normalized
         weight is. It answers the question a search actually asks -- which rows
         hold this word -- instead of walking every value to find out, and it
-        answers it by *word*, which is the difference between `Toxic` matching
-        `Toxicity` and not.
+        answers it by *word*, so `Toxic` does not match `Toxicity`.
 
         None when the column is not text, since there is nothing to tokenize."""
         column = self.column(type_, name)
@@ -666,7 +701,7 @@ class Graph:
         return self.types[self._type_tag_of[index]]
 
     def block(self, type_):
-        """The half-open index range of a type: `keys_by_type`, as arithmetic."""
+        """The half-open index range of a type."""
         tag = self._type_pos.get(type_)
         if tag is None:
             return 0, 0
@@ -696,8 +731,7 @@ class Graph:
     def column(self, type_, name):
         """A whole typed attribute column, for building a mask in one go.
 
-        None when the type has no such column, which then simply matches nothing
-        rather than falling back to some synthetic string."""
+        None when the type has no such column, which then matches nothing."""
         table = self.columns.get(type_)
         return None if table is None else table.get(name)
 
@@ -799,10 +833,8 @@ class Graph:
         offsets: `indptr` says where each node's block starts, this says which
         node each position belongs to.
 
-        int32 because it holds node ids, and memoized because a relation's hop
-        bounds are counted from it -- on the full Spotify graph this array is
-        283 MB, and rebuilding it per relation is what that would otherwise
-        cost."""
+        int32 because it holds node ids, and memoized because every relation's
+        hop bounds are counted from it."""
         return self.cached(("sources", reverse), lambda: self._expand_sources(reverse))
 
     def _expand_sources(self, reverse):
@@ -831,8 +863,7 @@ class Graph:
         count = max(len(self.relations), 1)
         low, high = np.full(count, np.inf), np.full(count, -np.inf)
         # one masked pass per relation rather than `np.minimum.at`, which is
-        # numpy's unbuffered fallback: 3x on 2.78M edges and three relations.
-        # Relations stay few, so a handful of extra passes is the cheap side
+        # numpy's slow unbuffered path; relations are few
         for code in range(len(self.relations)):
             weights = self.out_weights[self.out_rels == code]
             if weights.size:
@@ -872,52 +903,66 @@ class Graph:
 
     # --- sparse views the strategies rank with -------------------------------
 
+    # Matrices are built from the store on every call and not memoized. The CSR
+    # already is one: a node's edges are contiguous and sorted, so a matrix
+    # over it needs no conversion, only a column of cell values. A strategy
+    # that asks for one keeps what it computed, not the matrix.
+    # Multi-edges stay as repeated cells; a product sums them, which is what
+    # "counting multi-edges" means.
+
+    def matrices(self, weights=None):
+        """The graph as two N x N CSRs, forwards and backwards: row i holds the
+        edges node i stores, and the edges stored into it.
+
+        The second is the first transposed. Both share the store's index arrays,
+        so asking for them costs a column of cell values per direction, and a
+        product over "either direction" is two products rather than a symmetric
+        matrix twice their size.
+
+        `weights` picks what fills the cells: None counts an edge as 1, "raw"
+        uses its stored score, "norm" the per-relation min-max of it."""
+        forwards, backwards = self._edge_data(weights)
+        shape = (self.n_nodes, self.n_nodes)
+        return (_csr(forwards, self.out_indices, self.out_indptr, shape),
+                _csr(backwards, self.in_indices, self.in_indptr, shape))
+
     def adjacency(self, weights=None):
         """The undirected adjacency as one N x N CSR, counting multi-edges.
 
-        Both directions, so random-walk mass flows symmetrically -- the property
-        `rv=True` used to buy by physically duplicating every edge.
-
-        `weights` picks what fills the cells: None counts an edge as 1, "raw"
-        uses its stored score, "norm" the per-relation min-max of it. A random
-        walk wants "norm" and not "raw": a negative score is not a transition."""
-        return self.cached(("adjacency", weights), lambda: self._build_matrix(weights))
-
-    def _build_matrix(self, weights):
-        sources = self.sources()
-        both_src = np.concatenate([sources, self.out_indices])
-        both_tgt = np.concatenate([self.out_indices, sources])
-        data = self._edge_data(weights)
-        return sp.csr_matrix((np.concatenate([data, data]), (both_src, both_tgt)),
-                             shape=(self.n_nodes, self.n_nodes))
+        Both directions, so random-walk mass flows symmetrically. A walk wants
+        `weights="norm"` rather than "raw": a negative score is not a
+        transition."""
+        forwards, backwards = self.matrices(weights)
+        return (forwards + backwards).tocsr()
 
     def relation_matrix(self, relation, weights=None):
         """One relation as an N x N CSR, source -> target. Block-slice it to get
         e.g. the user-item matrix: `m[u0:u1, i0:i1]`. `weights` reads as it does
-        for adjacency()."""
-        return self.cached(("relation_matrix", relation, weights),
-                           lambda: self._build_relation_matrix(relation, weights))
-
-    def _build_relation_matrix(self, relation, weights):
-        sources = self.sources()
-        if relation is None:                       # every relation
-            keep = slice(None)
-        else:
-            code = self._relation_code.get(relation)
-            # a name the graph never saw matches nothing. Reading it as "all of
-            # them" is how a typo used to become the whole graph
-            keep = (self.out_rels == code) if code is not None \
-                else np.zeros(len(sources), dtype=bool)
-        rows, cols = sources[keep], self.out_indices[keep]
-        return sp.csr_matrix((self._edge_data(weights)[keep], (rows, cols)),
-                             shape=(self.n_nodes, self.n_nodes))
+        for matrices(); `relation=None` is every relation."""
+        if relation is None:
+            return self.matrices(weights)[0]
+        code = self._relation_code.get(relation)
+        shape = (self.n_nodes, self.n_nodes)
+        if code is None:
+            # a name the graph never saw matches nothing, never every relation
+            return sp.csr_matrix(shape, dtype=np.float32)
+        # within a node, a relation's edges are one contiguous run of its slice,
+        # so the rows stay in order and only their lengths change
+        lo, hi = traverse.bounds(self, code, False)
+        indptr = np.zeros(self.n_nodes + 1, dtype=np.int64)
+        np.cumsum(hi - lo, out=indptr[1:])
+        keep = self.out_rels == code
+        return _csr(self._edge_data(weights)[0][keep], self.out_indices[keep], indptr, shape)
 
     def _edge_data(self, weights):
-        """What one stored edge contributes to a matrix cell: its existence, its
-        score, or its normalized score."""
+        """What one stored edge contributes to a matrix cell -- its existence,
+        its score, or its normalized score -- aligned with the out- and the
+        in-store."""
         if weights is None:
-            return np.ones(len(self.out_indices))
-        return self.weights(normalized=(weights == "norm"))[0]
+            ones = np.ones(len(self.out_indices), dtype=np.float32)
+            return ones, ones
+        forwards, backwards = self.weights(normalized=(weights == "norm"))
+        return forwards.astype(np.float32), backwards.astype(np.float32)
 
     # --- the frame: where a query starts -------------------------------------
 
@@ -969,8 +1014,7 @@ class Graph:
         the edges themselves asks, and what a training run is handed to say which
         of them it may learn from.
 
-        The relation rides along as an Enum: dictionary-encoded, so naming it on
-        seventy million rows costs a byte each rather than a string each."""
+        The relation rides along as an Enum, dictionary-encoded."""
         sources = self.sources()
         keep = slice(None)
         if relation is not None:
@@ -1024,3 +1068,10 @@ class Graph:
                 relations.update(self.relations[c] for c in np.unique(span).tolist())
             schema[type_] = {"columns": set(self.columns[type_]), "relations": relations}
         return schema
+
+
+def _csr(data, indices, indptr, shape):
+    """A CSR over arrays the store already holds, sorted as the store is."""
+    matrix = sp.csr_matrix((data, indices, indptr), shape=shape, copy=False)
+    matrix.has_sorted_indices = True
+    return matrix

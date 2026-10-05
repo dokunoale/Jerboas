@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from ..core import Strategy
+from .core import Strategy
 
 
 class Connectivity(Strategy):
@@ -25,9 +25,8 @@ class Connectivity(Strategy):
         # int used as a bitset: hop 2 then visits each distinct intermediate once,
         # and the final count per node is just that int's population count.
         #
-        # This stays a bitset rather than a boolean sparse product because the
-        # product needs a seeds x nodes intermediate, which is fine at 200 seeds
-        # and untenable at 15000; the bitset's per-node state is one integer.
+        # A bitset rather than a boolean sparse product: the product needs a
+        # seeds x nodes intermediate, the bitset's per-node state is one integer.
         hop1 = {}
         for i, seed in enumerate(seeds):
             bit = 1 << i

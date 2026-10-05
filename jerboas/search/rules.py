@@ -197,8 +197,7 @@ class Semantic(Rule):
     several questions and a row answers whichever it answers best.
 
     Scored as one matmul against the type's unit block rather than a distance
-    per row, which is what makes an exact search worth having before an
-    approximate one: a few hundred thousand rows are milliseconds."""
+    per row."""
 
     IDENTICAL = 1.0 - 1e-6
 

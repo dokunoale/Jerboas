@@ -934,6 +934,49 @@ def test_a_fitted_factorization_re_aims_without_refitting(small_graph):
     assert frame.pl["d"].to_list()[0] > 0                          # movie.0 against itself
 
 
+def test_a_factorization_is_stored_and_loaded_back(small_graph, tmp_path):
+    """Fitting is the expensive half, so a service loads what a previous start
+    fitted. Same scores, to float32; the hyperparameters come off the file."""
+    path = tmp_path / "ml.dmf.npz"
+    liked = small_graph.edges("has_interact").filter(v.score >= 2)
+    fitted = DiffusedMatrixFactorization(factors=2, iterations=3, where=liked)
+    fitted.fit(small_graph)
+    fitted.save(path, small_graph, support=2)
+
+    loaded = DiffusedMatrixFactorization.load(path, small_graph)
+    assert loaded.config() == fitted.config()
+    assert loaded.meta["support"] == 2 and loaded.meta["model"] == "dmf"
+    frame = small_graph.nodes(rec="movie")
+    before = frame.with_columns(s=fitted.seeded(["movie.0"]).on("rec")).pl["s"]
+    after = frame.with_columns(s=loaded.seeded(["movie.0"]).on("rec")).pl["s"]
+    np.testing.assert_allclose(after.to_numpy(), before.to_numpy(), rtol=1e-6)
+
+
+def test_a_stored_factorization_rebinds_by_name(tmp_path):
+    """Positions move when a node joins the graph; the name does not."""
+    edges = pl.DataFrame({"source": ["u.b", "u.b", "u.c", "u.c"],
+                          "target": ["i.x", "i.y", "i.y", "i.z"]})
+    first = Graph.from_frames({"likes": edges}, renumber=True)
+    model = MatrixFactorization(factors=2, iterations=3, item_type="i", user_type="u",
+                                relation="likes", user="u.b")
+    model.fit(first)
+    path = tmp_path / "m.mf.npz"
+    model.save(path, first, alias="label")
+
+    grown = pl.concat([pl.DataFrame({"source": ["u.a"], "target": ["i.w"]}), edges])
+    second = Graph.from_frames({"likes": grown}, renumber=True)   # every id shifts
+    loaded = MatrixFactorization.load(path, second, user="u.b")
+
+    def scores(graph, strategy):
+        frame = graph.nodes(item="i").labels("item").with_columns(s=strategy.on("item"))
+        return dict(zip(frame.pl["item.label"].to_list(), frame.pl["s"].to_list()))
+
+    before, after = scores(first, model), scores(second, loaded)
+    for item in ("x", "y", "z"):
+        assert after[item] == pytest.approx(before[item], rel=1e-6)
+    assert after["w"] == 0.0                       # never seen: no affinity
+
+
 def test_matrix_factorization_needs_to_be_told_whose_taste(small_graph):
     """It used to fall back to the first user the search walked through, which
     is an arbitrary person's ranking wearing the shape of an answer."""
@@ -1236,7 +1279,7 @@ def test_without_renumber_the_label_is_the_position(tmp_path):
 # --- the loader --------------------------------------------------------------
 
 def test_chunk_boundaries_are_invisible(tmp_path, monkeypatch):
-    from jerboas import graph as graph_module
+    from jerboas.store import graph as graph_module
 
     rows = [(f"user.{i}", f"movie.{i % 7}", str(1 + i % 5)) for i in range(200)]
     path = tmp_path / "chunky.has_interact"
@@ -1275,7 +1318,7 @@ def test_a_ragged_edge_file_falls_back(tmp_path):
 # --- traversal is a gather ---------------------------------------------------
 
 def test_ranges_concatenates_slices():
-    from jerboas.traverse import ranges
+    from jerboas.query.traverse import ranges
     starts = np.array([10, 0, 5])
     counts = np.array([3, 0, 2])
     assert ranges(starts, counts).tolist() == [10, 11, 12, 5, 6]
@@ -1491,9 +1534,9 @@ def test_a_condition_joins_the_walk_it_is_written_after(small_graph):
     what the condition rejects is never built at all."""
     with jb.optimize(rows=1):
         frame = small_graph.nodes(user="user").hop(rec="has_interact")
-        assert frame._plan is not None and not frame._plan.predicates
+        assert frame._plan is not None and not frame._plan.stages[-1][1]
         narrowed = frame.filter(v.rec.year >= 1999)
-        assert narrowed._plan is not None and len(narrowed._plan.predicates) == 1
+        assert narrowed._plan is not None and len(narrowed._plan.stages[-1][1]) == 1
     assert sorted(names(narrowed, "rec")) == ["movie.2", "movie.2"]
 
 
@@ -1504,12 +1547,13 @@ def test_a_condition_about_anything_else_runs_the_walk_first(small_graph):
     assert sorted(names(frame, "rec")) == ["movie.0", "movie.1"]
 
 
-def test_a_walk_inside_the_budget_is_not_deferred(small_graph):
-    """Describing a walk that would be taken whole costs a plan and saves
-    nothing -- and what it would produce is known before it is taken."""
+def test_a_walk_inside_the_budget_is_one_slice(small_graph):
+    """Planned all the same -- the planner may still walk it from the other
+    end -- but what it would produce is known before it is taken, and it fits."""
     with jb.optimize(rows=1000):
         frame = small_graph.nodes(user="user").hop(rec="has_interact")
-    assert frame._plan is None
+    assert frame._plan is not None
+    assert len(list(frame.batches())) == 1
 
 
 def test_the_budget_is_what_a_step_produces(small_graph):
@@ -1518,18 +1562,19 @@ def test_the_budget_is_what_a_step_produces(small_graph):
     users = small_graph.nodes(user="user")
     assert users._produces("has_interact") == 6
     with jb.optimize(rows=6):
-        assert users.hop(rec="has_interact")._plan is None
+        assert len(list(users.hop(rec="has_interact").batches())) == 1
     with jb.optimize(rows=5):
-        assert users.hop(rec="has_interact")._plan is not None
+        assert len(list(users.hop(rec="has_interact").batches())) == 2
 
 
 def test_slices_are_cut_where_the_walk_grows(small_graph):
     """A slice out of a hub is shorter than one out of a leaf, which is the
     reason to count what a step makes rather than what it is handed."""
     users = small_graph.nodes(user="user")
-    pieces = list(users._slices("has_interact", 2))
+    degree = users._step_degree("has_interact")
+    pieces = list(users._slices(degree, 2))
     assert [len(one) for one in pieces] == [1, 1, 1]      # two edges each
-    assert [len(one) for one in users._slices("has_interact", 4)] == [2, 1]
+    assert [len(one) for one in users._slices(degree, 4)] == [2, 1]
 
 
 def test_several_steps_are_one_plan(small_graph):
@@ -1545,7 +1590,7 @@ def test_several_steps_are_one_plan(small_graph):
 
 
 def test_the_context_puts_it_back(small_graph):
-    from jerboas.optimize import row_budget
+    from jerboas.plan.optimize import row_budget
     assert row_budget() is None
     with jb.optimize(rows=7):
         assert row_budget() == 7
@@ -1808,3 +1853,29 @@ def test_concentration_refuses_a_space_of_the_wrong_size(gathered_graph):
     with pytest.raises(ValueError, match="rows and the graph has"):
         gathered_graph.nodes(node="node").with_columns(
             g=Concentration(np.zeros((3, 2))).on("node"))
+
+
+def test_concentration_is_computed_once_per_model(gathered_graph, monkeypatch):
+    """A service writes `Concentration(model)` per request; the products over
+    the whole graph are the model's to remember, not the request's."""
+    space = gathered_graph.vector("ctx", "embedding")
+    whole = np.zeros((gathered_graph.n_nodes, space.shape[1]), dtype=np.float32)
+    low, high = gathered_graph.block("ctx")
+    whole[low:high] = space
+
+    class Model(jb.Strategy):
+        def embeddings(self, graph):
+            return whole
+
+        def scores(self, graph, columns):
+            return np.zeros(len(columns[0]))
+
+    computed = []
+    original = Concentration._compute
+    monkeypatch.setattr(Concentration, "_compute",
+                        lambda self, graph: computed.append(1) or original(self, graph))
+    model = Model()
+    for _ in range(3):
+        gathered_graph.nodes(node="node").with_columns(
+            g=Concentration(model, relation="holds").on("node"))
+    assert len(computed) == 1

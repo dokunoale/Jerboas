@@ -48,3 +48,26 @@ sudo container system dns create test     # once, per machine
 
 One runs at a time: starting a use case stops whichever was serving, so the port
 and the name both say what is up right now.
+
+## Settings
+
+A use case's settings are environment variables named after it, and `run.sh`
+forwards exactly those into the container. The Spotify service reads the
+100 000-playlist cut by default; the whole Million Playlist Dataset is one
+variable away, plus the memory it needs:
+
+```bash
+SPOTIFY_DIR=./data/spotify/graph MEMORY=6g ./run.sh spotify
+```
+
+The graph is cached beside its files (`<dir>/.cache`). The first start on a
+dataset builds that cache, which takes minutes on the whole graph. After that,
+host and container both map the same cache in under a second, because it names
+its files relative to itself. The factorization is stored the same way, in
+`checkpoints/spotify.<graph dir>.dmf.npz` (`SPOTIFY_CHECKPOINT` overrides it).
+`checkpoints/` is a bind mount, so a fit outlives the container. The first
+start fits and stores it, about five minutes on the whole graph. Later starts
+load it in seconds, as long as the hyperparameters and the support threshold it
+records are the ones the service declares; otherwise the service fits again and
+replaces the file. The service logs each startup step, so a long start does not
+look like a hang.

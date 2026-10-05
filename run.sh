@@ -22,6 +22,11 @@ DOMAIN=test
 #     MEMORY=12g ./run.sh spotify
 MEMORY="${MEMORY:-4g}"
 
+# A use case's own settings are the variables named after it, and only those
+# cross into the container -- the whole Spotify graph instead of the default cut:
+#
+#     SPOTIFY_DIR=./data/spotify/graph MEMORY=6g ./run.sh spotify
+
 available() {
     find usecase -mindepth 2 -maxdepth 2 -name app.py -exec dirname {} \; | xargs -n1 basename
 }
@@ -44,6 +49,14 @@ if ! container system dns ls | tail -n +2 | grep -qx "$DOMAIN"; then
     echo "      sudo container system dns create ${DOMAIN}"
 fi
 
+PREFIX="$(printf '%s' "$USECASE" | tr '[:lower:]' '[:upper:]')_"
+SETTINGS=()
+for name in $(compgen -e); do
+    case "$name" in
+        "$PREFIX"*) SETTINGS+=(-e "$name=${!name}") ;;
+    esac
+done
+
 # one service at a time: whoever holds the port gives it up
 for name in $(available); do
     container stop "$name" >/dev/null 2>&1 || true
@@ -61,6 +74,7 @@ exec container run --rm \
     --dns-domain "$DOMAIN" \
     -m "$MEMORY" \
     -e "USECASE=$USECASE" \
+    ${SETTINGS[@]+"${SETTINGS[@]}"} \
     -p 8000:8000 \
     -v "$PWD/data:/app/data" \
     -v "$PWD/checkpoints:/app/checkpoints" \
