@@ -9,7 +9,7 @@ minutes looks like a hang.
 import logging
 import os
 import time
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 
 import jerboas as jb
@@ -103,7 +103,7 @@ def fit(graph: jb.Graph) -> tuple[DiffusedMatrixFactorization, jb.Frame]:
     return wanted, known
 
 
-def _stored(graph: jb.Graph, expected: dict) -> DiffusedMatrixFactorization | None:
+def _stored(graph: jb.Graph, expected: dict[str, object]) -> DiffusedMatrixFactorization | None:
     """The stored factorization, when there is one and it is the one expected."""
     if not os.path.exists(CHECKPOINT):
         return None
@@ -130,7 +130,7 @@ def warm(graph: jb.Graph, model: DiffusedMatrixFactorization, known: jb.Frame) -
 
 
 @contextmanager
-def timed(what: str) -> Iterator[None]:
+def timed(what: str) -> Generator[None, None, None]:
     """Say how long a startup step took."""
     start = time.perf_counter()
     yield

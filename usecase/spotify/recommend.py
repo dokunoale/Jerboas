@@ -30,6 +30,8 @@ sampled playlist had of being drawn, and the answer carries how far that
 estimate may be off (`error`, zero when the walk was exact).
 """
 
+from typing import Any
+
 import polars as pl
 from scipy.cluster.vq import kmeans2
 
@@ -141,7 +143,7 @@ def rank(counted: jb.Frame, seeds: jb.Frame, model: DiffusedMatrixFactorization,
 def extend(graph: jb.Graph, model: DiffusedMatrixFactorization, known: jb.Frame,
            songs: list[str], k: int, concentration: float = 0.0,
            temperature: float = 0.0, playlists: int = PLAYLISTS,
-           exclude_artists: bool = False) -> tuple[list[str], list[dict]]:
+           exclude_artists: bool = False) -> tuple[list[str], list[dict[str, Any]]]:
     """(what your names resolved to, the suggestions), both readable.
 
     `exclude_artists` keeps the performers you named out of the answer, so the

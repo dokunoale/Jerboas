@@ -12,6 +12,7 @@ that costs.
 import time
 
 import gradio as gr
+from starlette.datastructures import State
 
 from recommend import PLAYLISTS, extend
 
@@ -31,13 +32,13 @@ def names(text: str) -> list[str]:
             for line in text.splitlines() if line.strip()]
 
 
-def build(state) -> gr.Blocks:
+def build(state: State) -> gr.Blocks:
     """The page, reading the service's graph and model off `state` (the app's
     state) when it is used, not when it is built -- the page is built before
     the service has loaded anything."""
 
     def suggest(text: str, k: float, concentration: float, temperature: float,
-                playlists: float, exclude_artists: bool) -> tuple[str, list[list]]:
+                playlists: float, exclude_artists: bool) -> tuple[str, list[list[str | float]]]:
         asked = names(text)
         if not asked:
             raise gr.Error("name at least one song")
