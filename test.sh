@@ -13,6 +13,8 @@ cd "$(dirname "$0")"
 IMAGE=jerboas-test
 
 container build --build-arg EXTRAS=api,torch,ui,dev,pandas -t "$IMAGE" . >/dev/null
+# the builder VM would otherwise stay up after the build, holding ~2GB of RAM
+container builder stop >/dev/null 2>&1 || true
 
 exec container run --rm \
     -v "$PWD/jerboas:/app/jerboas" \

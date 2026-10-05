@@ -39,6 +39,10 @@ if [ ! -f "usecase/${USECASE}/app.py" ]; then
 fi
 
 container build -t "$IMAGE" .
+# The builder VM outlives the build to keep its cache warm, holding ~2GB of RAM
+# the served use case could use. The cache is on disk, so stopping it only costs
+# the next build a few seconds of startup.
+container builder stop >/dev/null 2>&1 || true
 
 # The domain has to be created once, as an administrator, so this only says how.
 # Not resolving is a missing convenience rather than a failure: localhost works
