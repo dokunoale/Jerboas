@@ -97,7 +97,7 @@ def post_extend(body: ExtendRequest) -> ExtendResponse:
 
 
 @app.get("/health")
-def get_health() -> dict:
+def get_health() -> dict[str, str | int]:
     graph = app.state.graph
     sized = lambda kind: graph.block(kind)[1] - graph.block(kind)[0]
     return {"status": "ok", "playlists": sized("playlist"), "songs": sized("song"),
